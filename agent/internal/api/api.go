@@ -94,7 +94,6 @@ func (c *Client) post(ctx context.Context, leaf string, body any) error {
 // one-shot ready report — readiness is a continuously re-asserted fact.
 type Identity struct {
 	SSHHost        string
-	EditorURL      string
 	ResolvedCommit string
 	WgPubkey       string
 	SSHHostPubkey  string
@@ -126,7 +125,6 @@ func (c *Client) Heartbeat(ctx context.Context, interactiveLive bool, sshSession
 		"interactive_live": interactiveLive,
 		"ssh_sessions":     sshSessions,
 		"ssh_host":         id.SSHHost,
-		"editor_url":       id.EditorURL,
 		"resolved_commit":  id.ResolvedCommit,
 		"wg_pubkey":        id.WgPubkey,
 		"ssh_host_pubkey":  id.SSHHostPubkey,

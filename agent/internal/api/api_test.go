@@ -25,7 +25,7 @@ func TestHeartbeatShape(t *testing.T) {
 		_ = json.NewDecoder(r.Body).Decode(&got)
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 	})
-	id := Identity{SSHHost: "1.2.3.4", EditorURL: "", ResolvedCommit: "abc123",
+	id := Identity{SSHHost: "1.2.3.4", ResolvedCommit: "abc123",
 		WgPubkey: "WGPUB", SSHHostPubkey: "ssh-ed25519 HOST"}
 	if err := c.Heartbeat(context.Background(), true, 3, id); err != nil {
 		t.Fatalf("Heartbeat: %v", err)
