@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -31,9 +32,9 @@ func TestCreateSendsBodyAndAuth(t *testing.T) {
 			"fallback":        true,
 		})
 	})
-	// the repo wire value is the bare owner/name canonical (what
+	// the repo wire value is the canonical forge-qualified string (what
 	// cmd/rift's canonicalRepo produces and the api stores/returns)
-	res, err := c.Create(context.Background(), "org/app", "shared-2x", "iad", "company:c1", "refs/heads/main", "", true)
+	res, err := c.Create(context.Background(), "github:github.com/org/app", "shared-2x", "iad", "company:c1", "refs/heads/main", "", true)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -46,7 +47,7 @@ func TestCreateSendsBodyAndAuth(t *testing.T) {
 	if auth != "Bearer dev-bearer" {
 		t.Fatalf("auth: %q", auth)
 	}
-	if got["repo"] != "org/app" || got["size"] != "shared-2x" ||
+	if got["repo"] != "github:github.com/org/app" || got["size"] != "shared-2x" ||
 		got["region"] != "iad" || got["context_id"] != "company:c1" ||
 		got["ref"] != "refs/heads/main" || got["fallback_to_default"] != true {
 		t.Fatalf("body: %+v", got)
@@ -91,46 +92,83 @@ func TestCreateTypedError(t *testing.T) {
 }
 
 func TestListImages(t *testing.T) {
-	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/repos/org/app/images" || r.Method != http.MethodGet {
-			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
-		}
-		if r.URL.Query().Get("limit") != "5" {
-			t.Errorf("limit: %q", r.URL.Query().Get("limit"))
-		}
-		_ = json.NewEncoder(w).Encode([]map[string]any{
-			{"commit": "abc123", "created_at": 100, "registry_ref": "reg@sha256:x",
-				"pinned": true, "box_count": 2, "heads": []string{"refs/heads/main"}, "default": true},
-		})
-	})
-	items, err := c.ListImages(context.Background(), "org/app", 5)
-	if err != nil {
-		t.Fatalf("ListImages: %v", err)
+	const repo = "github:github.com/org/app"
+	cases := []struct {
+		name      string
+		limit     int
+		wantLimit string // "" → the limit param must be absent
+	}{
+		{"no-limit", 0, ""},
+		// A nonzero limit rides as a SECOND query param: if the "&limit="
+		// join ever regresses to "?limit=", the decoded repo below corrupts —
+		// only a with-limit row catches that.
+		{"with-limit", 5, "5"},
 	}
-	if len(items) != 1 || items[0].Commit != "abc123" || items[0].BoxCount != 2 ||
-		!items[0].Pinned || !items[0].Default || len(items[0].Heads) != 1 {
-		t.Fatalf("items: %+v", items)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cl := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/api/repos/images" || r.Method != http.MethodGet {
+					t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+				}
+				// The whole canonical string rides percent-encoded in ?repo=
+				// (its ':' and '/' must not appear raw)…
+				if !strings.Contains(r.URL.RawQuery, "repo=github%3Agithub.com%2Forg%2Fapp") {
+					t.Errorf("raw query not percent-encoded: %q", r.URL.RawQuery)
+				}
+				// …and the DECODED values are the behavioral anchor.
+				if got := r.URL.Query().Get("repo"); got != repo {
+					t.Errorf("repo: %q, want %q", got, repo)
+				}
+				if got := r.URL.Query().Get("limit"); got != c.wantLimit {
+					t.Errorf("limit: %q, want %q", got, c.wantLimit)
+				}
+				_ = json.NewEncoder(w).Encode([]map[string]any{
+					{"commit": "abc123", "created_at": 100, "registry_ref": "reg@sha256:x",
+						"pinned": true, "box_count": 2, "heads": []string{"refs/heads/main"}, "default": true},
+				})
+			})
+			items, err := cl.ListImages(context.Background(), repo, c.limit)
+			if err != nil {
+				t.Fatalf("ListImages: %v", err)
+			}
+			if len(items) != 1 || items[0].Commit != "abc123" || items[0].BoxCount != 2 ||
+				!items[0].Pinned || !items[0].Default || len(items[0].Heads) != 1 {
+				t.Fatalf("items: %+v", items)
+			}
+		})
 	}
 }
 
 func TestPinUnpinImage(t *testing.T) {
-	var paths []string
+	const repo = "github:github.com/org/app"
+	var paths, repos []string
 	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			t.Errorf("method: %s", r.Method)
 		}
+		// Same wire form as ListImages: percent-encoded raw ?repo=, decoded
+		// back to the canonical id (asserted below per captured request).
+		if !strings.Contains(r.URL.RawQuery, "repo=github%3Agithub.com%2Forg%2Fapp") {
+			t.Errorf("raw query not percent-encoded: %q", r.URL.RawQuery)
+		}
 		paths = append(paths, r.URL.Path)
+		repos = append(repos, r.URL.Query().Get("repo"))
 		_ = json.NewEncoder(w).Encode(map[string]any{"pinned": true})
 	})
-	if err := c.PinImage(context.Background(), "org/app", "deadbeef"); err != nil {
+	if err := c.PinImage(context.Background(), repo, "deadbeef"); err != nil {
 		t.Fatalf("PinImage: %v", err)
 	}
-	if err := c.UnpinImage(context.Background(), "org/app", "deadbeef"); err != nil {
+	if err := c.UnpinImage(context.Background(), repo, "deadbeef"); err != nil {
 		t.Fatalf("UnpinImage: %v", err)
 	}
-	want := []string{"/api/repos/org/app/images/deadbeef/pin", "/api/repos/org/app/images/deadbeef/unpin"}
+	want := []string{"/api/repos/images/deadbeef/pin", "/api/repos/images/deadbeef/unpin"}
 	if len(paths) != 2 || paths[0] != want[0] || paths[1] != want[1] {
 		t.Fatalf("paths: %v", paths)
+	}
+	for i, got := range repos {
+		if got != repo {
+			t.Fatalf("repo query param on %s: %q, want %q", paths[i], got, repo)
+		}
 	}
 }
 

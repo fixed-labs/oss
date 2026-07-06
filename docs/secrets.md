@@ -93,6 +93,11 @@ Your user config maps keys to **sources** and records per-repo push policy:
 - **`repos.<owner/name>.policy`** — how a push is authorized: `ask` (default —
   prompt before pushing), `auto-push`, or `off`.
 
+A repo key may be the bare `owner/name` (matches the repo on any host) or the
+host-qualified `host/owner/name` (e.g. `github.com/acme/widget`); `rift secrets
+map` writes the qualified form. A `*` matches one segment, and the
+most-specific matching key wins.
+
 ### Source forms
 
 A source is one of:

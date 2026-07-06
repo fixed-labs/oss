@@ -112,7 +112,7 @@ func usage() {
 	fmt.Fprint(os.Stderr, "rift — ephemeral developer workspaces\n\n"+
 		"usage:\n"+
 		"  rift login\n"+
-		"  rift new [--size S] [--region R] [--repo owner/name] [--context CTX] [--ref BRANCH | --image SHA]\n"+
+		"  rift new [--size S] [--region R] [--repo REPO] [--forge F] [--context CTX] [--ref BRANCH | --image SHA]\n"+
 		"  rift ls [--context CTX]\n"+
 		"  rift set-default-context [CTX]\n"+
 		"  rift sizes\n"+

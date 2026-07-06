@@ -12,7 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strings"
+	"strconv"
 	"time"
 )
 
@@ -172,12 +172,14 @@ type CreateResult struct {
 	Fallback       bool   `json:"fallback"`
 }
 
-// Create spawns a workspace. ref/image are the boot-selection overrides
-// (mutually exclusive — the caller enforces that): a full "refs/heads/..."
-// ref string, or an --image commit SHA (prefix). Either is omitted from the
-// body when empty. fallbackToDefault is always sent; it tells the api to
-// silently fall back to the default branch when an INFERRED cwd branch has no
-// built image (false for an explicit --ref, so a typo fails loudly).
+// Create spawns a workspace. repo is the canonical forge-qualified id
+// ("github:github.com/owner/name"), carried verbatim in the JSON body.
+// ref/image are the boot-selection overrides (mutually exclusive — the caller
+// enforces that): a full "refs/heads/..." ref string, or an --image commit
+// SHA (prefix). Either is omitted from the body when empty. fallbackToDefault
+// is always sent; it tells the api to silently fall back to the default
+// branch when an INFERRED cwd branch has no built image (false for an
+// explicit --ref, so a typo fails loudly).
 func (c *Client) Create(ctx context.Context, repo, size, region, contextID, ref, image string, fallbackToDefault bool) (*CreateResult, error) {
 	var out CreateResult
 	body := map[string]any{
@@ -203,7 +205,7 @@ func (c *Client) Create(ctx context.Context, repo, size, region, contextID, ref,
 	return &out, nil
 }
 
-// --- Image operations (GET /api/repos/{repo}/images + pin/unpin) ---
+// --- Image operations (GET /api/repos/images?repo=… + pin/unpin) ---
 
 // ImageItem mirrors one entry of the server's image-list response: a
 // live (bootable) base image keyed by commit. Heads are the refs this commit
@@ -220,12 +222,14 @@ type ImageItem struct {
 }
 
 // ListImages reads the live base images for a repo, newest-first. repo is the
-// canonical "owner/name"; it rides in the path as two segments (the router
-// reconstructs owner/name), so each segment is path-escaped separately.
+// canonical forge-qualified id ("github:github.com/owner/name"); it rides as
+// a percent-encoded ?repo= query parameter — never path segments, because the
+// canonical id contains ':' and '/' and an encoded %2F path segment is
+// rejected by the server's URI compliance before routing.
 func (c *Client) ListImages(ctx context.Context, repo string, limit int) ([]ImageItem, error) {
-	path := "/api/repos/" + escapeRepo(repo) + "/images"
+	path := "/api/repos/images?repo=" + url.QueryEscape(repo)
 	if limit > 0 {
-		path += "?limit=" + url.QueryEscape(fmt.Sprintf("%d", limit))
+		path += "&limit=" + strconv.Itoa(limit)
 	}
 	var out []ImageItem
 	if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
@@ -244,18 +248,9 @@ func (c *Client) UnpinImage(ctx context.Context, repo, commit string) error {
 }
 
 func (c *Client) imagePin(ctx context.Context, repo, commit, leaf string) error {
-	path := "/api/repos/" + escapeRepo(repo) + "/images/" + url.PathEscape(commit) + "/" + leaf
+	path := "/api/repos/images/" + url.PathEscape(commit) + "/" + leaf +
+		"?repo=" + url.QueryEscape(repo)
 	return c.do(ctx, http.MethodPost, path, nil, nil)
-}
-
-// escapeRepo path-escapes a canonical "owner/name" segment-by-segment, leaving
-// the separating slash intact (the router splits the path on "/").
-func escapeRepo(repo string) string {
-	owner, name, found := strings.Cut(repo, "/")
-	if !found {
-		return url.PathEscape(repo)
-	}
-	return url.PathEscape(owner) + "/" + url.PathEscape(name)
 }
 
 // List does a single absolute read (no cursor → snapshot).

@@ -12,7 +12,8 @@ import (
 
 // cmdImage is the `devbox image` command group: inspect and pin the per-repo
 // base images CI builds (boot-selection's catalog). All subcommands resolve
-// the repo from the cwd git remote (the canonical owner/name).
+// the repo from the cwd git remote (the canonical forge:host/owner/name id,
+// via the shared flow-1 resolution — see resolveRepo in commands.go).
 //
 //	image ls           newest-first table: COMMIT REFS AGE BOXES FLAGS
 //	image pin <sha>    mark an image never-reap
@@ -36,7 +37,8 @@ func cmdImage(ctx context.Context, args []string) error {
 
 func imageLs(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("image ls", flag.ContinueOnError)
-	repo := fs.String("repo", "", "repo (owner/name); inferred from cwd if absent")
+	repo := fs.String("repo", "", "repo (owner/name, a clone URL, or forge:host/owner/name); inferred from cwd if absent")
+	forge := fs.String("forge", "", "forge type of the repo's host (only github this phase)")
 	limit := fs.Int("limit", 0, "max images to list (0 = server default)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -45,7 +47,7 @@ func imageLs(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	r, err := resolveRepo(*repo)
+	r, err := resolveRepo(*repo, *forge)
 	if err != nil {
 		return err
 	}
@@ -77,7 +79,8 @@ func imageLs(ctx context.Context, args []string) error {
 
 func imagePin(ctx context.Context, args []string, pin bool) error {
 	fs := flag.NewFlagSet("image pin", flag.ContinueOnError)
-	repo := fs.String("repo", "", "repo (owner/name); inferred from cwd if absent")
+	repo := fs.String("repo", "", "repo (owner/name, a clone URL, or forge:host/owner/name); inferred from cwd if absent")
+	forge := fs.String("forge", "", "forge type of the repo's host (only github this phase)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -93,7 +96,7 @@ func imagePin(ctx context.Context, args []string, pin bool) error {
 	if err != nil {
 		return err
 	}
-	r, err := resolveRepo(*repo)
+	r, err := resolveRepo(*repo, *forge)
 	if err != nil {
 		return err
 	}
@@ -109,15 +112,6 @@ func imagePin(ctx context.Context, args []string, pin bool) error {
 	}
 	fmt.Printf("%s: %sned\n", commit, verb)
 	return nil
-}
-
-// resolveRepo returns the canonical repo: the --repo flag if set (normalized),
-// else inferred from the cwd git remote.
-func resolveRepo(flagRepo string) (string, error) {
-	if flagRepo != "" {
-		return canonicalRepo(flagRepo)
-	}
-	return inferRepo()
 }
 
 // imageFlags renders the FLAGS column: default / pinned, comma-joined (an image

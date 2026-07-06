@@ -52,10 +52,16 @@ From inside a git repository you want to work on:
 rift new
 ```
 
-`rift new` creates a workspace (a devbox) for the current repository. The service
-picks a base image built for your repo, boots a VM, and returns a workspace id.
-Useful flags:
+`rift new` creates a workspace (a devbox) for the current repository, inferring
+the repo from the `origin` git remote. The service picks a base image built for
+your repo, boots a VM, and returns a workspace id. Useful flags:
 
+- `rift new --repo <repo>` — name the repo explicitly instead of inferring it.
+  Accepts `owner/name` (assumed to live on github.com), a clone URL
+  (`https://…` or `git@…`), or the full canonical form
+  `github:github.com/owner/name`. Only GitHub.com repositories are supported
+  today; `--forge` declares the forge type for a host the service doesn't
+  recognize (only `github` exists so far).
 - `rift new --size <id>` — choose a VM size (see `rift new --help`; the offered
   sizes come from the service).
 - `rift new --region <fly-region>` — pick a compute region.

@@ -113,6 +113,7 @@ func reconcileSecrets(ctx context.Context, host, port, khFile, repoID string) bo
 	if repoID == "" {
 		return false
 	}
+	repoID = secretsRepoID(repoID)
 	ex := &sshExecer{host: host, port: port, khFile: khFile, user: loginUser()}
 	res, err := secrets.Reconcile(ctx, ex, repoID, secrets.Options{
 		In:          os.Stdin,
@@ -136,8 +137,9 @@ func reconcileSecrets(ctx context.Context, host, port, khFile, repoID string) bo
 // startBrokerHandler brings up the laptop-side secret-broker handler on the
 // tunnel's overlay listener and serves it for the session. It loads the same
 // user config
-// the connect-time reconcile uses and resolves named secrets against repoID (the
-// workspace's canonical repo). Returns a stop func that closes the listener (also
+// the connect-time reconcile uses and resolves named secrets against repoID
+// (the workspace's canonical repo, reduced to the secrets host/owner/name form
+// at this seam). Returns a stop func that closes the listener (also
 // closed when ctx is cancelled). Best-effort: a load or listen failure warns and
 // returns a no-op stop — the shell still works; `devbox run` on the box then gets
 // an unreachable-handler error, which it reports as "the laptop session is down."
@@ -146,6 +148,7 @@ func startBrokerHandler(ctx context.Context, t *tunnel.Tunnel, repoID string) (s
 	if repoID == "" {
 		return noop // no repo → no per-repo source mapping to resolve against
 	}
+	repoID = secretsRepoID(repoID)
 	uc, err := secrets.LoadUserConfig("")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "rift: secret broker disabled: %v\n", err)
@@ -202,14 +205,14 @@ func cmdSecrets(ctx context.Context, args []string) error {
 // secretsStatus previews the resolution against the LOCAL .rift/secrets.json
 // (no box needed) — what would be pushed, and which keys still need a source.
 func secretsStatus(_ context.Context, args []string) error {
-	repoFlag, pos, err := splitRepoFlag(args)
+	repoFlag, forgeFlag, pos, err := splitRepoFlag(args)
 	if err != nil {
 		return err
 	}
 	if len(pos) != 0 {
-		return fmt.Errorf("usage: rift secrets status [--repo owner/name]")
+		return fmt.Errorf("usage: rift secrets status [--repo REPO] [--forge F]")
 	}
-	repo, err := resolveRepoArg(repoFlag)
+	repo, err := resolveRepoArg(repoFlag, forgeFlag)
 	if err != nil {
 		return err
 	}
@@ -277,12 +280,12 @@ func secretsStatus(_ context.Context, args []string) error {
 
 // secretsMap writes a key→source mapping into the user config.
 func secretsMap(_ context.Context, args []string) error {
-	repo, pos, err := splitRepoFlag(args)
+	repoFlag, forgeFlag, pos, err := splitRepoFlag(args)
 	if err != nil {
 		return err
 	}
 	if len(pos) != 2 {
-		return fmt.Errorf("usage: rift secrets map <key> <source> [--repo owner/name]\n" +
+		return fmt.Errorf("usage: rift secrets map <key> <source> [--repo REPO] [--forge F]\n" +
 			"  <source> is a path, the literal `forward`, or `cmd:<command>`")
 	}
 	key, err := secrets.ParseKey(pos[0])
@@ -300,7 +303,8 @@ func secretsMap(_ context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if repo, err = resolveRepoArg(repo); err != nil {
+	repo, err := resolveRepoArg(repoFlag, forgeFlag)
+	if err != nil {
 		return err
 	}
 	qualified := secrets.QualifiedRepoID(repo)
@@ -317,64 +321,70 @@ func secretsMap(_ context.Context, args []string) error {
 	return nil
 }
 
-// splitRepoFlag pulls --repo/-repo (space- or =-separated) out of args and
-// returns it plus the remaining positionals. Go's flag package stops at the
-// first positional, so the documented `map <key> <source> --repo R` order
-// would otherwise silently ignore --repo.
-func splitRepoFlag(args []string) (repo string, pos []string, err error) {
+// splitRepoFlag pulls --repo/-repo and --forge/-forge (space- or =-separated)
+// out of args and returns them plus the remaining positionals. Go's flag
+// package stops at the first positional, so the documented
+// `map <key> <source> --repo R` order would otherwise silently ignore --repo.
+func splitRepoFlag(args []string) (repo, forge string, pos []string, err error) {
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
 		case a == "--": // end of flags: the rest are positionals (e.g. a -dash source)
 			pos = append(pos, args[i+1:]...)
-			return repo, pos, nil
+			return repo, forge, pos, nil
 		case a == "--repo" || a == "-repo":
 			if i+1 >= len(args) {
-				return "", nil, fmt.Errorf("--repo needs a value")
+				return "", "", nil, fmt.Errorf("--repo needs a value")
 			}
 			repo = args[i+1]
 			i++
 		case strings.HasPrefix(a, "--repo=") || strings.HasPrefix(a, "-repo="):
 			repo = a[strings.IndexByte(a, '=')+1:]
 			if repo == "" {
-				return "", nil, fmt.Errorf("--repo needs a non-empty value")
+				return "", "", nil, fmt.Errorf("--repo needs a non-empty value")
+			}
+		case a == "--forge" || a == "-forge":
+			if i+1 >= len(args) {
+				return "", "", nil, fmt.Errorf("--forge needs a value")
+			}
+			forge = args[i+1]
+			i++
+		case strings.HasPrefix(a, "--forge=") || strings.HasPrefix(a, "-forge="):
+			forge = a[strings.IndexByte(a, '=')+1:]
+			if forge == "" {
+				return "", "", nil, fmt.Errorf("--forge needs a non-empty value")
 			}
 		case strings.HasPrefix(a, "-"):
-			return "", nil, fmt.Errorf("unknown flag %q (only --repo; use -- before a source that starts with -)", a)
+			return "", "", nil, fmt.Errorf("unknown flag %q (only --repo/--forge; use -- before a source that starts with -)", a)
 		default:
 			pos = append(pos, a)
 		}
 	}
-	return repo, pos, nil
+	return repo, forge, pos, nil
 }
 
-// resolveRepoArg returns the repo to use: the inferred cwd repo when flag is
-// empty, else the explicit value (accepting a forge-qualified host/owner/name,
-// which the secrets layer supports but canonicalRepo does not).
-func resolveRepoArg(flag string) (string, error) {
-	if flag == "" {
-		return inferRepo()
+// secretsRepoID reduces a canonical "forge:host/owner/name" repo id to the
+// secrets layer's qualified "host/owner/name" form by dropping the "<forge>:"
+// prefix — the one-seam conversion at the secrets boundary (the secrets
+// config-key grammar itself is unchanged and knows no forge). Strings without
+// a forge-enum prefix pass through untouched.
+func secretsRepoID(repo string) string {
+	if i := strings.IndexByte(repo, ':'); i > 0 && forgeEnum[strings.ToLower(repo[:i])] {
+		return repo[i+1:]
 	}
-	in := strings.TrimSpace(flag)
-	// Accept the `github:owner/name` back-compat label, as canonicalRepo does;
-	// reject any other `prefix:` so it can't be mis-keyed into a dead mapping.
-	if i := strings.IndexByte(in, ':'); i >= 0 {
-		if !strings.EqualFold(in[:i], "github") {
-			return "", fmt.Errorf("unsupported repo prefix in %q (use owner/name or host/owner/name)", flag)
-		}
-		in = in[i+1:]
+	return repo
+}
+
+// resolveRepoArg returns the repo id the secrets layer keys on: the inferred
+// cwd repo when the flag is empty, else the explicit value — both resolved
+// through the same flow-1 + canonicalizer as every other repo ingress, then
+// reduced to the secrets-qualified host/owner/name form.
+func resolveRepoArg(flag, forgeFlag string) (string, error) {
+	canonical, err := resolveRepo(flag, forgeFlag)
+	if err != nil {
+		return "", err
 	}
-	r := strings.ToLower(strings.TrimSuffix(strings.Trim(in, "/"), ".git"))
-	segs := strings.Split(r, "/")
-	if len(segs) != 2 && len(segs) != 3 {
-		return "", fmt.Errorf("repo must be owner/name or host/owner/name, got %q", flag)
-	}
-	for _, seg := range segs {
-		if seg == "" {
-			return "", fmt.Errorf("repo %q has an empty segment", flag)
-		}
-	}
-	return r, nil
+	return secretsRepoID(canonical), nil
 }
 
 func parseSourceArg(s string) (secrets.Source, error) {

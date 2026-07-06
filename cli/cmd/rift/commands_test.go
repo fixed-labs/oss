@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -15,72 +16,132 @@ import (
 	"github.com/fixed-labs/oss/cli/internal/config"
 )
 
-func TestCanonicalRepo(t *testing.T) {
-	cases := []struct {
-		in   string
-		want string
-	}{
-		// the canonical is the bare lowercase owner/name pair, matching the
-		// server and CI; "github:" is
-		// accepted as input only.
-		{"org/name", "org/name"},
-		{"Org/Name.git", "org/name"},
-		{"github:org/name", "org/name"},
-		{"github:Acme-Corp/Widget", "acme-corp/widget"},
-		{"GitHub:Org/Name", "org/name"},
-		{"github:org/name.git", "org/name"},
-		{"github:org/name/", "org/name"},
-		{"github:org/name.git/", "org/name"},
-		{"github:org/name//", "org/name"},
-		{"  github:org/name  ", "org/name"},
+// TestCanonicalRepoFixtures drives canonicalRepo through the checked-in
+// fixtures shared with the server's Clojure canonicalizer — the executable
+// contract for the grammar. Each row carries the raw input, the pre-resolved
+// forge arg, the default-host arg (applied only to host-less bare pairs), and
+// the expected canonical string (null → expected reject).
+func TestCanonicalRepoFixtures(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("testdata", "canonical-repo-vectors.json"))
+	if err != nil {
+		t.Fatalf("read fixtures: %v", err)
 	}
-	for _, c := range cases {
-		got, err := canonicalRepo(c.in)
-		if err != nil {
-			t.Errorf("canonicalRepo(%q): %v", c.in, err)
+	var rows []struct {
+		Input     string  `json:"input"`
+		Forge     string  `json:"forge"`
+		Host      string  `json:"host"`
+		Canonical *string `json:"canonical"`
+	}
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		t.Fatalf("decode fixtures: %v", err)
+	}
+	if len(rows) == 0 {
+		t.Fatal("fixtures file decoded to zero rows")
+	}
+	for _, row := range rows {
+		got, err := canonicalRepo(row.Input, row.Forge, row.Host)
+		if row.Canonical == nil {
+			if err == nil {
+				t.Errorf("canonicalRepo(%q, %q, %q) = %q, want reject", row.Input, row.Forge, row.Host, got)
+			}
 			continue
 		}
-		if got != c.want {
-			t.Errorf("canonicalRepo(%q) = %q, want %q", c.in, got, c.want)
-		}
-	}
-}
-
-func TestCanonicalRepoRejectsMalformed(t *testing.T) {
-	for _, in := range []string{"", "github:", "github:org", "github:org/", "github:/name", "github:org/name/extra"} {
-		if got, err := canonicalRepo(in); err == nil {
-			t.Errorf("canonicalRepo(%q) = %q, want error", in, got)
-		}
-	}
-}
-
-func TestRepoFromRemote(t *testing.T) {
-	cases := []struct {
-		in   string
-		want string
-	}{
-		{"git@github.com:org/name.git", "org/name"},
-		{"git@GitHub.com:Acme-Corp/Widget.git", "acme-corp/widget"},
-		{"https://github.com/org/name", "org/name"},
-		{"https://github.com/org/name.git", "org/name"},
-		{"https://github.com/Org/Name/", "org/name"},
-		{"https://GITHUB.COM/Org/Name", "org/name"},
-	}
-	for _, c := range cases {
-		got, err := repoFromRemote(c.in)
 		if err != nil {
-			t.Errorf("repoFromRemote(%q): %v", c.in, err)
+			t.Errorf("canonicalRepo(%q, %q, %q): %v, want %q", row.Input, row.Forge, row.Host, err, *row.Canonical)
 			continue
 		}
-		if got != c.want {
-			t.Errorf("repoFromRemote(%q) = %q, want %q", c.in, got, c.want)
+		if got != *row.Canonical {
+			t.Errorf("canonicalRepo(%q, %q, %q) = %q, want %q", row.Input, row.Forge, row.Host, got, *row.Canonical)
+			continue
+		}
+		// Fixed point: every canonical string the CLI emits must survive a
+		// round trip unchanged — a non-fixed-point output is exactly the
+		// string the server ingress would 400.
+		again, err := canonicalRepo(*row.Canonical, row.Forge, row.Host)
+		if err != nil {
+			t.Errorf("canonicalRepo(%q, %q, %q) (fixed point): %v", *row.Canonical, row.Forge, row.Host, err)
+			continue
+		}
+		if again != *row.Canonical {
+			t.Errorf("canonicalRepo(%q, %q, %q) = %q, want the fixed point %q", *row.Canonical, row.Forge, row.Host, again, *row.Canonical)
 		}
 	}
 }
 
-func TestRepoFromRemoteRejectsNonGitHub(t *testing.T) {
-	if got, err := repoFromRemote("https://gitlab.com/org/name"); err == nil {
-		t.Fatalf("want error for non-github remote, got %q", got)
+// The rejection message is pinned by the design (the CLI surfaces every
+// canonicalizer reject with this exact wording).
+func TestCanonicalRepoRejectionMessage(t *testing.T) {
+	_, err := canonicalRepo("widget", "github", "github.com")
+	want := "invalid repo — use owner/repo or the full forge:host/owner/repo form"
+	if err == nil || err.Error() != want {
+		t.Fatalf("error = %v, want %q", err, want)
+	}
+}
+
+// --- flow-1 forge/host resolution (offline; INV-5) ---
+//
+// The forge comes from exactly one explicit source: (a) the built-in SaaS
+// table (github.com only this phase) — a conflicting --forge is an error;
+// (b) an explicit --forge; else (c) an error naming the host. Never a guess.
+func TestResolveRepoIdentityFlow1(t *testing.T) {
+	canonical := "github:github.com/acme/widget"
+	cases := []struct {
+		name    string
+		in      string
+		forge   string
+		want    string // "" → expect error
+		wantErr string // substring the error must carry
+	}{
+		// (a) SaaS-table hits, across decomposition forms, no --forge needed.
+		{"saas-bare", "Acme/Widget", "", canonical, ""},
+		{"saas-url", "https://github.com/Acme/Widget.git", "", canonical, ""},
+		{"saas-scp", "git@github.com:Acme/Widget.git", "", canonical, ""},
+		{"saas-already-canonical", "github:github.com/acme/widget", "", canonical, ""},
+		// Case-skewed HOSTS still hit the SaaS table — the lookup happens on
+		// the canonicalized host, not the raw authority.
+		{"saas-scp-case-skewed-host", "git@GitHub.com:Acme/Widget.git", "", canonical, ""},
+		{"saas-url-upper-host", "https://GITHUB.COM/Org/Name", "", "github:github.com/org/name", ""},
+		// --forge agreeing with the SaaS table is not a conflict.
+		{"forge-agrees", "acme/widget", "github", canonical, ""},
+		{"forge-agrees-case", "acme/widget", "GitHub", canonical, ""},
+		// (a) beats (b): a --forge conflicting with a known SaaS host errors.
+		{"forge-conflict-url", "https://github.com/acme/widget", "gitlab", "", "conflicts"},
+		{"forge-conflict-bare", "acme/widget", "gitlab", "", "conflicts"},
+		// (c) unknown host, no --forge → the pinned register-the-instance error.
+		{"unknown-host", "https://git.corp.net/o/r", "",
+			"", "unknown/unsupported forge for host git.corp.net — pass --forge or register the instance"},
+		{"unknown-host-gitlab-saas", "git@gitlab.com:group/proj", "",
+			"", "unknown/unsupported forge for host gitlab.com"},
+		// (b) --forge github on a non-github.com host resolves the forge but
+		// still errors in canonicalRepo (GHES is deferred).
+		{"forge-github-nongithub-host", "https://ghes.corp.net/acme/widget", "github", "", "invalid repo"},
+		// (b) an unsupported --forge ("this phase accepts only :github")
+		// gets the pinned register-the-instance error, not a misleading
+		// repo-shape error — in-enum and out-of-enum values alike.
+		{"forge-unsupported-inenum", "https://gitlab.corp.net/g/p", "gitlab",
+			"", "unknown/unsupported forge for host gitlab.corp.net — pass --forge or register the instance"},
+		{"forge-unsupported-bogus", "https://git.corp.net/o/r", "bogus",
+			"", "unknown/unsupported forge for host git.corp.net — pass --forge or register the instance"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := resolveRepoIdentity(c.in, c.forge)
+			if c.want == "" {
+				if err == nil {
+					t.Fatalf("resolveRepoIdentity(%q, %q) = %q, want error", c.in, c.forge, got)
+				}
+				if !strings.Contains(err.Error(), c.wantErr) {
+					t.Fatalf("error = %v, want it to contain %q", err, c.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveRepoIdentity(%q, %q): %v", c.in, c.forge, err)
+			}
+			if got != c.want {
+				t.Fatalf("resolveRepoIdentity(%q, %q) = %q, want %q", c.in, c.forge, got, c.want)
+			}
+		})
 	}
 }
 
@@ -474,6 +535,67 @@ func TestCmdNewNoContextErrorsBeforeCreate(t *testing.T) {
 	}
 	if createHit {
 		t.Fatal("Create must NOT be called when no context resolves")
+	}
+}
+
+// --- cmdNew --forge plumbing (command level) ---
+//
+// Unit tables pin resolveRepoIdentity itself; these drive cmdNew's actual
+// flagset so a --forge mis-registration ("flag provided but not defined") or
+// a dropped pass-through into resolveRepo cannot hide. Same harness as the
+// context tests: --repo avoids the git-remote inference, --ref the branch
+// shell-out, and the connect-time Get answers "failed" so cmdNew unwinds.
+
+func TestCmdNewForgeFlagResolvesCanonicalRepo(t *testing.T) {
+	var createHit bool
+	var gotRepo string
+	srv := hermeticEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/api/workspaces" {
+			createHit = true
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			gotRepo, _ = body["repo"].(string)
+			_ = json.NewEncoder(w).Encode(map[string]any{"workspace_id": "ws-new"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"workspace": map[string]any{"workspace_id": "ws-new", "status": "failed", "error_message": "test-stop"},
+		})
+	})
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "company:c1"})
+
+	_ = captureStdout(t, func() {
+		_ = cmdNew(context.Background(), []string{"--repo", "acme/widget", "--forge", "github", "--ref", "main"})
+	})
+	if !createHit {
+		t.Fatal("Create was not called")
+	}
+	if gotRepo != "github:github.com/acme/widget" {
+		t.Fatalf("body repo = %q, want the canonical github:github.com/acme/widget", gotRepo)
+	}
+}
+
+func TestCmdNewForgeConflictSurfacesThroughCommand(t *testing.T) {
+	var createHit bool
+	srv := hermeticEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/api/workspaces" {
+			createHit = true
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{})
+	})
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "company:c1"})
+
+	// --forge gitlab against a github.com --repo → the flow-1 conflict error
+	// must surface through the command, before any Create.
+	err := cmdNew(context.Background(), []string{"--repo", "https://github.com/acme/widget", "--forge", "gitlab"})
+	if err == nil {
+		t.Fatal("a --forge conflicting with a SaaS host must error through the command")
+	}
+	if !strings.Contains(err.Error(), "conflicts") {
+		t.Fatalf("want the flow-1 conflict error, got %v", err)
+	}
+	if createHit {
+		t.Fatal("Create must NOT be called on a forge conflict")
 	}
 }
 

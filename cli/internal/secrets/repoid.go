@@ -5,11 +5,13 @@ import (
 	"strings"
 )
 
-// normalizeRepoID returns the forge-qualified (host/owner/name) and bare
-// (owner/name) forms of a repo id. The image pipeline keys repos by bare
-// owner/name (GitHub-only today); the secrets layer is forge-qualified now so
-// user configs written today survive repo ids gaining a forge component. A bare
-// owner/name is assumed to live on github.com until that lands.
+// normalizeRepoID returns the host-qualified (host/owner/name) and bare
+// (owner/name) forms of a secrets-config repo key. The platform's repo
+// identity is the canonical "forge:host/owner/name" string; callers strip
+// the "<forge>:" prefix before handing a repo to this layer (see
+// secretsRepoID in cmd/rift), so this grammar stays host/owner/name and
+// user configs keep matching. A bare owner/name is assumed to live on
+// github.com.
 func normalizeRepoID(repo string) (qualified, bare string) {
 	r := strings.ToLower(strings.Trim(strings.TrimSpace(repo), "/"))
 	segs := strings.Split(r, "/")

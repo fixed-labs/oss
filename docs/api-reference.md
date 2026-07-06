@@ -30,7 +30,7 @@ A *workspace* is a devbox. `Workspace` / `ListItem` are the read shapes;
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/api/workspaces` | Create a workspace. Body carries `repo`, `context_id`, `fallback_to_default`, and optional `size`, `region`, `ref`, or `image` (`ref`/`image` are mutually exclusive boot-selection overrides). Returns the new `workspace_id` and the resolved ref/commit. |
+| `POST` | `/api/workspaces` | Create a workspace. Body carries `repo` (the canonical repo id — see [Repo ids](#repo-ids)), `context_id`, `fallback_to_default`, and optional `size`, `region`, `ref`, or `image` (`ref`/`image` are mutually exclusive boot-selection overrides). Returns the new `workspace_id` and the resolved ref/commit. |
 | `GET`  | `/api/workspaces` | List your workspaces (a single snapshot read). Returns `{ "workspaces": [ … ] }`. |
 | `GET`  | `/api/workspaces/:id` | Read one workspace. A bare read is a snapshot; passing `?cursor=<c>` turns it into a **long poll** that holds until the workspace changes and returns a new cursor — the primitive `rift connect` watches with. A hold-timeout answers `304` (no change; re-poll with the same cursor). |
 | `DELETE` | `/api/workspaces/:id` | Destroy a workspace. |
@@ -61,18 +61,28 @@ All are `POST /api/workspaces/:id/<action>`:
 |---|---|---|
 | `GET` | `/api/contexts` | The contexts the caller may act in (e.g. a personal vs. an organization account). Returns `{ "contexts": [ { "form_value": "<stable-id>", "label": "<human label>" } ] }`. The `form_value` is what `rift new --context`/`rift ls --context`/`rift set-default-context` pass. |
 
+## Repo ids
+
+Everywhere this API carries a repository, it carries the **canonical
+forge-qualified repo id**: `forge:host/owner/name`, all lowercase — e.g.
+`github:github.com/acme/widget`. Only forge `github` on host `github.com` is
+accepted today; the server validates the id at ingress and rejects anything
+non-canonical with a `400`. The `rift` CLI derives this id for you from a git
+remote, an `owner/name` pair, or a clone URL.
+
 ## Images
 
 The base images a repo's boxes can boot from, keyed by commit.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET`  | `/api/repos/:owner/:name/images` | List the live (bootable) base images for a repo, newest-first. Optional `?limit=<n>`. Each entry carries the commit, creation time, registry ref, pin state, box count, the refs the commit heads, and whether it is the default-branch head. |
-| `POST` | `/api/repos/:owner/:name/images/:commit/pin` | Pin a `(repo, commit)` image so it is never reaped. |
-| `POST` | `/api/repos/:owner/:name/images/:commit/unpin` | Clear the pin. |
+| `GET`  | `/api/repos/images?repo=<repo>` | List the live (bootable) base images for a repo, newest-first. Optional `&limit=<n>`. Each entry carries the commit, creation time, registry ref, pin state, box count, the refs the commit heads, and whether it is the default-branch head. |
+| `POST` | `/api/repos/images/:commit/pin?repo=<repo>` | Pin a `(repo, commit)` image so it is never reaped. |
+| `POST` | `/api/repos/images/:commit/unpin?repo=<repo>` | Clear the pin. |
 
-The `owner` and `name` are the two segments of the canonical `owner/name` repo id;
-each is path-escaped separately.
+`repo` is the canonical repo id (see [Repo ids](#repo-ids)), percent-encoded as
+a whole. It rides as a **query parameter**, not path segments, because the
+canonical id contains `:` and `/`.
 
 ## Device-flow login
 

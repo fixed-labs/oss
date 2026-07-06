@@ -1,0 +1,236 @@
+[
+  {
+    "input": "acme/Widget",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": "github:github.com/acme/widget"
+  },
+  {
+    "input": "  acme/Widget  ",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": "github:github.com/acme/widget"
+  },
+  {
+    "input": "https://github.com/Acme/Widget",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": "github:github.com/acme/widget"
+  },
+  {
+    "input": "http://github.com/acme/widget",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": "github:github.com/acme/widget"
+  },
+  {
+    "input": "https://github.com/acme/widget.git",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": "github:github.com/acme/widget"
+  },
+  {
+    "input": "https://github.com/acme/widget/",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": "github:github.com/acme/widget"
+  },
+  {
+    "input": "https://github.com/acme/widget.git/",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": "github:github.com/acme/widget"
+  },
+  {
+    "input": "https://alice:s3cret@github.com/acme/widget",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": "github:github.com/acme/widget"
+  },
+  {
+    "input": "https://github.com:443/acme/widget",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": "github:github.com/acme/widget"
+  },
+  {
+    "input": "ssh://git@github.com/acme/widget.git",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": "github:github.com/acme/widget"
+  },
+  {
+    "input": "git@github.com:Acme/Widget.git",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": "github:github.com/acme/widget"
+  },
+  {
+    "input": "git@github.com:2021/widget",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": "github:github.com/2021/widget"
+  },
+  {
+    "input": "github:github.com/acme/widget",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": "github:github.com/acme/widget"
+  },
+  {
+    "input": "GitHub:GitHub.com/Acme/Widget",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": "github:github.com/acme/widget"
+  },
+  {
+    "input": "github:github.com:443/acme/widget",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": "github:github.com/acme/widget"
+  },
+  {
+    "input": "acme/Wid.get",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": "github:github.com/acme/wid.get"
+  },
+  {
+    "input": "ac-me-x/widget",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": "github:github.com/ac-me-x/widget"
+  },
+  {
+    "input": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/widget",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": "github:github.com/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/widget"
+  },
+  {
+    "input": "acme/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": "github:github.com/acme/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  {
+    "input": "",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": null
+  },
+  {
+    "input": "widget",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": null
+  },
+  {
+    "input": "owner/repo/extra",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": null
+  },
+  {
+    "input": "https://github.com/x/owner/repo",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": null
+  },
+  {
+    "input": "acme//widget",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": null
+  },
+  {
+    "input": "-acme/widget",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": null
+  },
+  {
+    "input": "acme-/widget",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": null
+  },
+  {
+    "input": "ac--me/widget",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": null
+  },
+  {
+    "input": "ac_me/widget",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": null
+  },
+  {
+    "input": "acme/.",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": null
+  },
+  {
+    "input": "acme/..",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": null
+  },
+  {
+    "input": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/widget",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": null
+  },
+  {
+    "input": "acme/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": null
+  },
+  {
+    "input": "acme/wid get",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": null
+  },
+  {
+    "input": "github:owner/repo",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": null
+  },
+  {
+    "input": "https://ghes.corp.net/acme/widget",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": null
+  },
+  {
+    "input": "gitlab:gitlab.com/group/sub/proj",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": null
+  },
+  {
+    "input": "mercurial:github.com/acme/widget",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": null
+  },
+  {
+    "input": "git@gitlab.com:group/proj",
+    "forge": "github",
+    "host": "github.com",
+    "canonical": null
+  },
+  {
+    "input": "group/proj",
+    "forge": "gitlab",
+    "host": "gitlab.com",
+    "canonical": null
+  }
+]
