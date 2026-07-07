@@ -35,6 +35,9 @@ import (
 	"github.com/fixed-labs/oss/cli/internal/diag"
 )
 
+// version is overridden at release build via -ldflags "-X main.version=<tag>".
+var version = "dev"
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -97,6 +100,9 @@ func main() {
 	case "-h", "--help", "help":
 		usage()
 		return
+	case "version", "--version":
+		fmt.Println(version)
+		return
 	default:
 		fmt.Fprintf(os.Stderr, "rift: unknown command %q\n", cmd)
 		usage()
@@ -124,7 +130,8 @@ func usage() {
 		"  rift secrets status|map <key> <source>\n"+
 		"  rift run --secret NAME [--secret NAME...] -- CMD   (in-VM: inject a secret)\n"+
 		"  rift run --shell --secret NAME ...                 (subshell with secrets)\n"+
-		"  rift run --secret NAME --materialize-to PATH       (write secret to a file)\n\n"+
+		"  rift run --secret NAME --materialize-to PATH       (write secret to a file)\n"+
+		"  rift version\n\n"+
 		"The API URL + bearer come from `rift login` (~/.config/rift/config.json).\n"+
 		"In-VM the provisioner injects a machine token via RIFT_API_URL/RIFT_TOKEN/\n"+
 		"RIFT_WORKSPACE_ID; there only suspend/resize/keepalive are available, acting\n"+

@@ -1,0 +1,44 @@
+version: 2
+project_name: rift
+
+builds:
+  - id: rift
+    dir: cli                      # go build runs in cli/ at the mirror root (oss/cli in the monorepo)
+    main: ./cmd/rift
+    binary: rift
+    env:
+      - CGO_ENABLED=0             # pure-Go; static binary, trivial cross-compile
+    goos: [darwin, linux]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Version }}   # {{.Version}} is the tag without the leading v
+
+archives:
+  - id: rift
+    formats: [tar.gz]
+    name_template: '{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}'
+
+checksum:
+  name_template: 'checksums.txt'
+
+brews:
+  - name: rift
+    repository:
+      owner: fixed-labs
+      name: homebrew-tap
+      branch: main
+      token: '{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}'
+    directory: Formula
+    homepage: 'https://github.com/fixed-labs/oss'
+    description: 'Rift — ephemeral developer workspaces CLI'
+    license: 'Apache-2.0'
+    install: |
+      bin.install "rift"
+    test: |
+      system "#{bin}/rift", "version"
+
+release:
+  github:
+    owner: fixed-labs
+    name: oss

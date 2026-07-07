@@ -5,7 +5,17 @@ This walks you from nothing to a shell inside a running Rift devbox: install the
 
 ## 1. Install the `rift` CLI
 
-The CLI lives in the `cli/` Go module. Build it from source:
+The recommended way to install `rift` is with [Homebrew](https://brew.sh):
+
+```sh
+brew install fixed-labs/tap/rift
+```
+
+Once you have tapped it with `brew tap fixed-labs/tap`, a bare `brew install rift`
+also works, and `brew upgrade rift` updates it later. (The `tap` shorthand resolves
+to the `fixed-labs/homebrew-tap` repo — Homebrew strips the `homebrew-` prefix.)
+
+Or build it from source. The CLI lives in the `cli/` Go module:
 
 ```sh
 cd cli
