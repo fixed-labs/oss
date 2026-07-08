@@ -18,26 +18,33 @@ import (
 	"github.com/fixed-labs/oss/cli/internal/config"
 )
 
+// resolveLoginAPIURL picks the control-plane base URL for `rift login`.
+// Precedence: the explicit --api / RIFT_API_URL value (passed in as flagVal),
+// then a previously-saved config, then the hosted production default — so a
+// first login on a laptop needs no flag while returning users keep whatever
+// endpoint they last logged into.
+func resolveLoginAPIURL(flagVal string) string {
+	if flagVal != "" {
+		return flagVal
+	}
+	if prev, _ := config.Load(); prev != nil && prev.APIBaseURL != "" {
+		return prev.APIBaseURL
+	}
+	return config.DefaultAPIBaseURL
+}
+
 // cmdLogin runs the device flow and persists the minted bearer. The session
 // proves identity only; the acting context is resolved per command and its
 // per-device default is set separately by `rift set-default-context`.
 func cmdLogin(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("login", flag.ContinueOnError)
-	apiURL := fs.String("api", os.Getenv("RIFT_API_URL"), "rift API base URL")
+	apiFlag := fs.String("api", os.Getenv("RIFT_API_URL"), "rift API base URL")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *apiURL == "" {
-		// Reuse a previously-saved API URL if the flag/env is absent.
-		if prev, _ := config.Load(); prev != nil && prev.APIBaseURL != "" {
-			*apiURL = prev.APIBaseURL
-		}
-	}
-	if *apiURL == "" {
-		return fmt.Errorf("--api <url> is required for the first login")
-	}
+	apiURL := resolveLoginAPIURL(*apiFlag)
 
-	c := client.New(*apiURL, "")
+	c := client.New(apiURL, "")
 	startCtx, cancel := ctxTimeout(ctx, 30*time.Second)
 	defer cancel()
 	start, err := c.DeviceStart(startCtx)
@@ -57,7 +64,7 @@ func cmdLogin(ctx context.Context, args []string) error {
 	if cfg == nil {
 		cfg = &config.Config{}
 	}
-	cfg.APIBaseURL = *apiURL
+	cfg.APIBaseURL = apiURL
 	cfg.Token = tok.Token
 	if err := cfg.Save(); err != nil {
 		return err

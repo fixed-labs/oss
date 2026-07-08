@@ -702,3 +702,29 @@ func TestCmdLoginPreservesDefaultContext(t *testing.T) {
 		t.Fatalf("login must PRESERVE DefaultContext, got %q", got.DefaultContext)
 	}
 }
+
+// resolveLoginAPIURL's fallback chain: explicit flag/env > saved config >
+// hosted production default. hermeticEnv clears RIFT_API_URL and points config
+// at an empty temp dir, so the no-flag/no-config case must land on the default.
+func TestResolveLoginAPIURL(t *testing.T) {
+	t.Run("explicit flag wins", func(t *testing.T) {
+		_ = hermeticEnv(t, func(http.ResponseWriter, *http.Request) {})
+		seedConfig(t, &config.Config{APIBaseURL: "https://saved.example", Token: "t"})
+		if got := resolveLoginAPIURL("https://flag.example"); got != "https://flag.example" {
+			t.Fatalf("flag must win, got %q", got)
+		}
+	})
+	t.Run("saved config used when flag empty", func(t *testing.T) {
+		_ = hermeticEnv(t, func(http.ResponseWriter, *http.Request) {})
+		seedConfig(t, &config.Config{APIBaseURL: "https://saved.example", Token: "t"})
+		if got := resolveLoginAPIURL(""); got != "https://saved.example" {
+			t.Fatalf("saved config must be reused, got %q", got)
+		}
+	})
+	t.Run("prod default when neither flag nor config", func(t *testing.T) {
+		_ = hermeticEnv(t, func(http.ResponseWriter, *http.Request) {})
+		if got := resolveLoginAPIURL(""); got != config.DefaultAPIBaseURL {
+			t.Fatalf("first login must default to %q, got %q", config.DefaultAPIBaseURL, got)
+		}
+	})
+}

@@ -23,6 +23,11 @@ import (
 	"path/filepath"
 )
 
+// DefaultAPIBaseURL is the hosted production control plane. `rift login`
+// falls back to it when neither --api / RIFT_API_URL nor a previously-saved
+// config supplies a URL, so a first-time login on a laptop needs no flag.
+const DefaultAPIBaseURL = "https://fixedlabs.dev"
+
 type Config struct {
 	APIBaseURL string `json:"api_base_url"`
 	Token      string `json:"token"`
