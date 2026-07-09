@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -148,6 +149,32 @@ type SizeCatalog struct {
 	Sizes            []Size  `json:"sizes"`
 }
 
+// RegionItem is one selectable (or the caller's pinned-but-deprecated) region
+// as returned by GET /api/regions. Slug is the stable logical id the CLI sends
+// on `rift new` / `rift set-default-region` (never a cloud code). Status is one
+// of "preview" | "available" | "deprecated" | "retired". AvailableNow is the
+// advisory health signal — true iff the region's preferred placement has ready
+// relay capacity right now (spawnability is decided authoritatively at spawn).
+type RegionItem struct {
+	Slug         string `json:"slug"`
+	DisplayName  string `json:"display_name"`
+	Description  string `json:"description"`
+	Status       string `json:"status"`
+	AvailableNow bool   `json:"available_now"`
+}
+
+// RegionsResult is the GET /api/regions response. EffectiveDefault is the slug
+// a blank `rift new` resolves to for this caller (chain over user/org/system);
+// JSON null (decoding to nil) when nothing is selectable. PinnedDefault is the
+// caller's OWN stored user preference (null when unset); it may be
+// non-selectable (e.g. since deprecated) and differ from EffectiveDefault —
+// that difference is the "your pin is stale, migrate" signal.
+type RegionsResult struct {
+	EffectiveDefault *string      `json:"effective_default"`
+	PinnedDefault    *string      `json:"pinned_default"`
+	Regions          []RegionItem `json:"regions"`
+}
+
 // AttachBundle is the attach response relayed by the api — everything the
 // CLI needs to bring up the tunnel and dial the box.
 type AttachBundle struct {
@@ -165,11 +192,18 @@ type AttachBundle struct {
 // new workspace id: which ref/commit the boot-selection resolved to, and
 // whether it fell back to the default branch (an inferred cwd branch with no
 // built image). ResolvedRef is empty for an --image <sha> spawn (no ref).
+//
+// Region/Source echo the region the server RESOLVED the spawn to (a region
+// SLUG, not a cloud code) and how it was chosen ("explicit" | "user" | "org" |
+// "system"); both are empty on an older server that doesn't echo them, so
+// cmdNew only prints the resolved-region line when Region is non-empty.
 type CreateResult struct {
 	WorkspaceID    string `json:"workspace_id"`
 	ResolvedRef    string `json:"resolved_ref"`
 	ResolvedCommit string `json:"resolved_commit"`
 	Fallback       bool   `json:"fallback"`
+	Region         string `json:"region"`
+	Source         string `json:"source"`
 }
 
 // Create spawns a workspace. repo is the canonical forge-qualified id
@@ -287,6 +321,66 @@ func (c *Client) Sizes(ctx context.Context) (*SizeCatalog, error) {
 		return nil, err
 	}
 	return &out, nil
+}
+
+// Regions reads the selectable region catalog from the developer surface
+// (GET /api/regions — bearer-authenticated, same as List). contextID is the
+// caller's acting context form-value (the stored `rift set-default-context`);
+// when non-empty it rides as ?context_id= so the defaults reflect the caller's
+// org. Absent ⇒ the server uses the bearer's Personal context.
+func (c *Client) Regions(ctx context.Context, contextID string) (*RegionsResult, error) {
+	path := "/api/regions"
+	if contextID != "" {
+		path += "?context_id=" + url.QueryEscape(contextID)
+	}
+	var out RegionsResult
+	if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// SetDefaultRegion sets (or, with an empty slug, clears) the caller's
+// server-side default region (POST /api/user/default-region). The slug is a
+// logical region id validated authoritatively server-side; a non-selectable
+// slug returns a 4xx whose body message is surfaced verbatim. An empty slug
+// sends {"region": ""}, which the server treats as a clear.
+func (c *Client) SetDefaultRegion(ctx context.Context, slug string) error {
+	if err := c.do(ctx, http.MethodPost, "/api/user/default-region", map[string]string{"region": slug}, nil); err != nil {
+		var ae *APIError
+		if errors.As(err, &ae) && ae.Status >= 400 && ae.Status < 500 {
+			// Surface the server's 4xx message (it carries the reason + the
+			// selectable list for a non-selectable slug) rather than the raw
+			// "HTTP 4xx: {…json…}" APIError string.
+			return errors.New(defaultRegionErrMsg(ae.Body))
+		}
+		return err
+	}
+	return nil
+}
+
+// defaultRegionErrMsg pulls the human message out of the POST
+// /api/user/default-region 4xx body ({"error":"<code>","detail":"<human>",
+// "selectable":[…]}); it prefers the human `detail` over the machine `error`
+// code, appends the selectable list when present, and on an undecodable body
+// falls back to the raw body so no information is lost.
+func defaultRegionErrMsg(body string) string {
+	var b struct {
+		Error      string   `json:"error"`
+		Detail     string   `json:"detail"`
+		Selectable []string `json:"selectable"`
+	}
+	if json.Unmarshal([]byte(body), &b) == nil && (b.Detail != "" || b.Error != "") {
+		msg := b.Detail
+		if msg == "" {
+			msg = b.Error
+		}
+		if len(b.Selectable) > 0 {
+			msg += " (available: " + strings.Join(b.Selectable, ", ") + ")"
+		}
+		return msg
+	}
+	return body
 }
 
 // Get reads one workspace (snapshot when cursor is empty; long-poll otherwise,

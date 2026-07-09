@@ -373,7 +373,7 @@ func inferRepo(forgeFlag string) (string, error) {
 func cmdNew(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("new", flag.ContinueOnError)
 	size := fs.String("size", "", "guest size (e.g. shared-2x)")
-	region := fs.String("region", "", "Fly region")
+	region := fs.String("region", "", "Region (see 'rift regions')")
 	repo := fs.String("repo", "", "repo (owner/name, a clone URL, or forge:host/owner/name); inferred from cwd if absent")
 	forge := fs.String("forge", "", "forge type of the repo's host (only github this phase); required when the host isn't a known SaaS forge")
 	contextID := fs.String("context", "", "acting context (personal:<id> | company:<id>); defaults to your `rift set-default-context`")
@@ -427,7 +427,93 @@ func cmdNew(ctx context.Context, args []string) error {
 		return explainCreate(err, *repo)
 	}
 	fmt.Printf("Created %s (%s, %s). Connecting…\n", res.WorkspaceID, *repo, describeResolved(res))
+	if line := describeRegion(res); line != "" {
+		fmt.Println(line)
+	}
 	return connect(ctx, c, res.WorkspaceID, connectOpts{})
+}
+
+// describeRegion renders the server's resolved-region echo for the `new`
+// success output: "Using region <slug> (<how>)", where <how> explains the
+// resolution source ("explicit" → "you chose it", user/org/system → the
+// default it fell back to). Empty when the server echoes no region (an older
+// server, or a response without the field) — the caller then prints nothing.
+func describeRegion(r *client.CreateResult) string {
+	if r.Region == "" {
+		return ""
+	}
+	var how string
+	switch r.Source {
+	case "explicit":
+		how = "you chose it"
+	case "user":
+		how = "your default"
+	case "org":
+		how = "your org default"
+	case "system":
+		how = "the system default"
+	default:
+		how = r.Source
+	}
+	if how == "" {
+		return fmt.Sprintf("Using region %s", r.Region)
+	}
+	return fmt.Sprintf("Using region %s (%s)", r.Region, how)
+}
+
+// cmdSetDefaultRegion sets the caller's SERVER-side default region (unlike
+// set-default-context, which writes the local config): the region default is
+// server-side so it stays consistent across the CLI and web UI on every device.
+// With an argument (a region slug) it does an ADVISORY pre-flight — checks the
+// slug appears in GET /api/regions and warns if not — then POSTs it; the
+// AUTHORITATIVE selectability gate runs server-side at that POST. An empty
+// argument or --clear clears the default (server-side).
+func cmdSetDefaultRegion(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("set-default-region", flag.ContinueOnError)
+	clear := fs.Bool("clear", false, "clear your default region")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	c, _, err := authedClient()
+	if err != nil {
+		return err
+	}
+	rctx, cancel := ctxTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	// Clear: an explicit --clear, or no slug argument.
+	if *clear || fs.NArg() < 1 {
+		if err := c.SetDefaultRegion(rctx, ""); err != nil {
+			return err
+		}
+		fmt.Println("Default region cleared.")
+		return nil
+	}
+
+	slug := fs.Arg(0)
+	// Advisory pre-flight (UX only): warn early if the slug isn't in the
+	// selectable list, catching a typo before the POST. The authoritative
+	// region-selectable? gate runs server-side at the POST regardless — an
+	// unlisted slug is still sent and the server's 4xx is surfaced verbatim.
+	res, rerr := c.Regions(rctx, "")
+	if rerr == nil {
+		found := false
+		for _, r := range res.Regions {
+			if r.Slug == slug {
+				found = true
+				break
+			}
+		}
+		if !found {
+			fmt.Fprintf(os.Stderr, "warning: %q is not in `rift regions` — sending anyway; the server will validate it.\n", slug)
+		}
+	}
+
+	if err := c.SetDefaultRegion(rctx, slug); err != nil {
+		return err
+	}
+	fmt.Printf("Default region set to %s.\n", slug)
+	return nil
 }
 
 // describeResolved renders the api's resolved-selection echo for the `new`

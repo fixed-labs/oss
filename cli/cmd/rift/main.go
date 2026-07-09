@@ -75,8 +75,12 @@ func main() {
 		err = cmdList(ctx, args)
 	case "set-default-context":
 		err = cmdSetDefaultContext(ctx, args)
+	case "set-default-region":
+		err = cmdSetDefaultRegion(ctx, args)
 	case "sizes":
 		err = cmdSizes(ctx, args)
+	case "regions":
+		err = cmdRegions(ctx, args)
 	case "new":
 		err = cmdNew(ctx, args)
 	case "connect":
@@ -121,7 +125,9 @@ func usage() {
 		"  rift new [--size S] [--region R] [--repo REPO] [--forge F] [--context CTX] [--ref BRANCH | --image SHA]\n"+
 		"  rift ls [--context CTX]\n"+
 		"  rift set-default-context [CTX]\n"+
+		"  rift set-default-region [SLUG | --clear]\n"+
 		"  rift sizes\n"+
+		"  rift regions\n"+
 		"  rift connect [--new] [--session NAME] <id>\n"+
 		"  rift suspend|resume|rm <id>\n"+
 		"  rift resize <id> --size S\n"+

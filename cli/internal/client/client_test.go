@@ -765,3 +765,175 @@ func TestPostSecretAccessNilExitEncodesNull(t *testing.T) {
 		t.Fatalf("exit_code should be null, got %v (%T)", v, v)
 	}
 }
+
+// --- Regions (GET /api/regions) ---
+
+// TestRegions decodes the full read-surface: the *string effective/pinned
+// pointers (both present), and the regions slice with every field. It also
+// pins the request path is /api/regions and that a non-empty contextID rides
+// as ?context_id=<url-escaped> (a form-value like "company:c1" has a ':' that
+// must be percent-encoded).
+func TestRegions(t *testing.T) {
+	eff, pin := "us-east", "eu-west"
+	var gotPath, gotRawQuery, gotMethod, gotAuth string
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotRawQuery, gotMethod = r.URL.Path, r.URL.RawQuery, r.Method
+		gotAuth = r.Header.Get("Authorization")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"effective_default": eff,
+			"pinned_default":    pin,
+			"regions": []map[string]any{
+				{"slug": "us-east", "display_name": "US East", "description": "Virginia",
+					"status": "available", "available_now": true},
+				{"slug": "eu-west", "display_name": "EU West", "description": "Paris",
+					"status": "deprecated", "available_now": false},
+			},
+		})
+	})
+	res, err := c.Regions(context.Background(), "company:c1")
+	if err != nil {
+		t.Fatalf("Regions: %v", err)
+	}
+	if gotMethod != http.MethodGet || gotPath != "/api/regions" {
+		t.Fatalf("endpoint: %s %s", gotMethod, gotPath)
+	}
+	if gotAuth != "Bearer dev-bearer" {
+		t.Fatalf("regions must carry the bearer: %q", gotAuth)
+	}
+	// contextID rides percent-encoded (":" must not appear raw).
+	if gotRawQuery != "context_id=company%3Ac1" {
+		t.Fatalf("context_id query: %q, want context_id=company%%3Ac1", gotRawQuery)
+	}
+	if res.EffectiveDefault == nil || *res.EffectiveDefault != eff {
+		t.Fatalf("effective_default: %v", res.EffectiveDefault)
+	}
+	if res.PinnedDefault == nil || *res.PinnedDefault != pin {
+		t.Fatalf("pinned_default: %v", res.PinnedDefault)
+	}
+	if len(res.Regions) != 2 {
+		t.Fatalf("regions: %+v", res.Regions)
+	}
+	r0 := res.Regions[0]
+	if r0.Slug != "us-east" || r0.DisplayName != "US East" || r0.Description != "Virginia" ||
+		r0.Status != "available" || !r0.AvailableNow {
+		t.Fatalf("regions[0]: %+v", r0)
+	}
+	r1 := res.Regions[1]
+	if r1.Slug != "eu-west" || r1.Status != "deprecated" || r1.AvailableNow {
+		t.Fatalf("regions[1]: %+v", r1)
+	}
+}
+
+// TestRegionsNullDefaultsAndEmptyContext covers the null cases: the handler
+// returns effective_default:null + pinned_default:null when nothing is
+// selectable / the caller has no pin — both *string must decode to nil, not "".
+// It also pins that an EMPTY contextID omits the query entirely (no bare "?").
+func TestRegionsNullDefaultsAndEmptyContext(t *testing.T) {
+	var gotRawQuery string
+	sawQuery := false
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotRawQuery = r.URL.RawQuery
+		sawQuery = r.URL.RawQuery != ""
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"effective_default": nil,
+			"pinned_default":    nil,
+			"regions":           []map[string]any{},
+		})
+	})
+	res, err := c.Regions(context.Background(), "")
+	if err != nil {
+		t.Fatalf("Regions: %v", err)
+	}
+	if sawQuery {
+		t.Fatalf("empty contextID must omit the query entirely, got %q", gotRawQuery)
+	}
+	if res.EffectiveDefault != nil {
+		t.Fatalf("null effective_default must decode nil, got %q", *res.EffectiveDefault)
+	}
+	if res.PinnedDefault != nil {
+		t.Fatalf("null pinned_default must decode nil, got %q", *res.PinnedDefault)
+	}
+	if len(res.Regions) != 0 {
+		t.Fatalf("expected no regions, got %+v", res.Regions)
+	}
+}
+
+// --- SetDefaultRegion (POST /api/user/default-region) ---
+
+// TestSetDefaultRegion pins the happy path: a POST to /api/user/default-region
+// with body {"region": slug}, carrying the bearer.
+func TestSetDefaultRegion(t *testing.T) {
+	var gotPath, gotMethod, gotAuth string
+	var gotBody map[string]any
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotMethod, gotAuth = r.URL.Path, r.Method, r.Header.Get("Authorization")
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusNoContent)
+	})
+	if err := c.SetDefaultRegion(context.Background(), "us-east"); err != nil {
+		t.Fatalf("SetDefaultRegion: %v", err)
+	}
+	if gotMethod != http.MethodPost || gotPath != "/api/user/default-region" {
+		t.Fatalf("endpoint: %s %s", gotMethod, gotPath)
+	}
+	if gotAuth != "Bearer dev-bearer" {
+		t.Fatalf("auth: %q", gotAuth)
+	}
+	if gotBody["region"] != "us-east" {
+		t.Fatalf("body region: %v, want us-east", gotBody["region"])
+	}
+}
+
+// TestSetDefaultRegionEmptyStillPosts confirms an empty slug (the clear path)
+// still POSTs {"region": ""} — the server treats an empty region as a clear, so
+// the request must go out (not be short-circuited client-side).
+func TestSetDefaultRegionEmptyStillPosts(t *testing.T) {
+	hit := false
+	var gotBody map[string]any
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		hit = true
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusNoContent)
+	})
+	if err := c.SetDefaultRegion(context.Background(), ""); err != nil {
+		t.Fatalf("SetDefaultRegion(clear): %v", err)
+	}
+	if !hit {
+		t.Fatal("an empty slug (clear) must still POST")
+	}
+	v, present := gotBody["region"]
+	if !present || v != "" {
+		t.Fatalf("clear must send region:\"\", got %v (present=%v)", v, present)
+	}
+}
+
+// TestSetDefaultRegionErrorSurfacesDetail pins that a 4xx with the structured
+// body {"error":"<code>","detail":"<human>","selectable":[…]} surfaces the
+// HUMAN detail plus the selectable list — NOT the raw machine "error" code and
+// NOT the raw "HTTP 4xx: {…}" APIError string.
+func TestSetDefaultRegionErrorSurfacesDetail(t *testing.T) {
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error":      "region-not-available",
+			"detail":     "region not available",
+			"selectable": []string{"us-east", "eu-west"},
+		})
+	})
+	err := c.SetDefaultRegion(context.Background(), "atlantis")
+	if err == nil {
+		t.Fatal("a non-selectable slug must error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "region not available") {
+		t.Fatalf("error must surface the human detail, got %q", msg)
+	}
+	// the raw machine code must NOT be what the user sees (detail is preferred).
+	if strings.Contains(msg, "region-not-available") {
+		t.Fatalf("error must prefer the human detail over the raw code, got %q", msg)
+	}
+	// the selectable list is appended so the user can pick a valid one.
+	if !strings.Contains(msg, "us-east") || !strings.Contains(msg, "eu-west") {
+		t.Fatalf("error must append the selectable list, got %q", msg)
+	}
+}
