@@ -101,6 +101,8 @@ func main() {
 		err = cmdImage(ctx, args)
 	case "run":
 		err = cmdRun(ctx, args)
+	case "init":
+		err = cmdInit(ctx, args)
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -137,6 +139,7 @@ func usage() {
 		"  rift run --secret NAME [--secret NAME...] -- CMD   (in-VM: inject a secret)\n"+
 		"  rift run --shell --secret NAME ...                 (subshell with secrets)\n"+
 		"  rift run --secret NAME --materialize-to PATH       (write secret to a file)\n"+
+		"  rift init | rift init emit --packages LIST [--option k=v ...]\n"+
 		"  rift version\n\n"+
 		"The API URL + bearer come from `rift login` (~/.config/rift/config.json).\n"+
 		"In-VM the provisioner injects a machine token via RIFT_API_URL/RIFT_TOKEN/\n"+

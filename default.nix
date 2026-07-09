@@ -13,12 +13,7 @@
 #                                  hostSystem arg; content is always x86_64).
 #   - packagesFor <system>       : the `rift` + `agent` derivations for a system.
 { nixpkgs }:
-{
-  # The devboxes-base substrate module — what a client repo imports to build
-  # its own devbox image; `mkDevimage` is the packer that turns a system built
-  # on it into the Fly-bootable OCI.
-  nixosModules.devboxes-base = ./nix/devboxes-base/module.nix;
-
+let
   # mkDevimage packs a system built on devboxes-base into the Fly-bootable OCI:
   # the entrypoint runs the overlay-root recipe (image = RO lower, volume upper
   # at /persist; pivot_root; systemd as PID 1 of a child pid namespace — Fly's
@@ -27,7 +22,11 @@
   # machine env), and forwards `fly machine stop`'s SIGTERM as SIGRTMIN+3 to
   # ns-systemd for a clean shutdown. TARGETS x86_64-linux (Fly's arch); on an
   # aarch64 host the system closure builds under binfmt emulation.
-  lib.mkDevimage =
+  #
+  # Hoisted into this `let` (rather than defined inline as `lib.mkDevimage`) so
+  # the sibling `lib.mkRift` below can call it by bare name — attrset values
+  # don't see each other's keys without `rec`.
+  mkDevimage =
     {
       extraModules ? [ ],
       # An optional repo checkout to bake into the login user's home so a
@@ -280,4 +279,43 @@
         ];
       };
     };
+in
+{
+  # The devboxes-base substrate module — what a client repo imports to build
+  # its own devbox image; `mkDevimage` is the packer that turns a system built
+  # on it into the Fly-bootable OCI.
+  nixosModules.devboxes-base = ./nix/devboxes-base/module.nix;
+
+  # The image packer a client calls to build its own devbox image (the
+  # low-level primitive). Its argument pattern is CLOSED — it rejects unknown
+  # args, which is the validation path mkRift delegates to.
+  lib.mkDevimage = mkDevimage;
+
+  # mkRift — the versioned `fixed-labs.rift` contract helper (the shape the
+  # managed builder reads). It wraps mkDevimage: produces the `{ version = 1;
+  # image = … }` envelope so a consumer never writes the version, and defaults
+  # `repoSrc = self` / `imageCommit = self.rev or null` so a consumer's checkout
+  # is baked without restating it. Open pattern (`...@args`) — every non-`self`
+  # arg is forwarded to mkDevimage, whose closed pattern rejects typos.
+  #
+  # Two subtleties in the body:
+  #   - `removeAttrs args [ "self" ]` is REQUIRED: mkDevimage has no `self`
+  #     parameter, and its closed pattern would reject it.
+  #   - re-injecting `// { inherit repoSrc imageCommit; }` is REQUIRED: Nix's
+  #     `@args` binds only the *passed* attrs, NOT the defaulted ones, so
+  #     dropping this would send mkDevimage no repoSrc (its own default is null)
+  #     and silently bake nothing.
+  lib.mkRift =
+    {
+      self,
+      repoSrc ? self,
+      imageCommit ? (self.rev or null),
+      ...
+    }@args:
+    {
+      version = 1;
+      image = mkDevimage ((removeAttrs args [ "self" ]) // { inherit repoSrc imageCommit; });
+    };
+
+  inherit packagesFor;
 }

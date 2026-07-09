@@ -35,7 +35,13 @@
       # The base image NixOS module a client repo imports and extends.
       nixosModules.devboxes-base = oss.nixosModules.devboxes-base;
 
-      # The image packer a client calls to build its own devbox image.
+      # The image packer a client calls to build its own devbox image (the
+      # low-level primitive).
       lib.mkDevimage = oss.lib.mkDevimage;
+
+      # The versioned `fixed-labs.rift` contract helper a consumer calls: wraps
+      # mkDevimage into the `{ version = 1; image = … }` envelope the managed
+      # builder reads, defaulting repoSrc/imageCommit from the consumer's `self`.
+      lib.mkRift = oss.lib.mkRift;
     };
 }

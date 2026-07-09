@@ -1,0 +1,12 @@
+# Minimal Python repo marker for the (b) fixture of the rift-init eval spine
+# test. The audit step would infer a Python runtime plus a system library
+# (zlib, a C dependency of many wheels) from a repo like this; the test feeds
+# the canned --packages python3,zlib (and one --option) to renderEmit.
+[project]
+name = "rift-init-fixture-python-syslib"
+version = "0.0.0"
+requires-python = ">=3.11"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"

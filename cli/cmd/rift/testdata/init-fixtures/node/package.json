@@ -1,0 +1,9 @@
+{
+  "name": "rift-init-fixture-node",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Minimal Node repo marker for the (a) fixture of the rift-init eval spine test. The audit step would infer a Node runtime from this file; the test feeds the canned --packages nodejs to renderEmit.",
+  "engines": {
+    "node": ">=20"
+  }
+}
