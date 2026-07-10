@@ -7,12 +7,15 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/term"
 
 	"github.com/fixed-labs/oss/cli/internal/client"
 	"github.com/fixed-labs/oss/cli/internal/config"
@@ -39,26 +42,46 @@ func resolveLoginAPIURL(flagVal string) string {
 func cmdLogin(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("login", flag.ContinueOnError)
 	apiFlag := fs.String("api", os.Getenv("RIFT_API_URL"), "rift API base URL")
+	noBrowser := fs.Bool("no-browser", false, "do not auto-open the verification URL in a browser")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	apiURL := resolveLoginAPIURL(*apiFlag)
 
 	c := client.New(apiURL, "")
-	startCtx, cancel := ctxTimeout(ctx, 30*time.Second)
-	defer cancel()
+	startCtx, cancelStart := ctxTimeout(ctx, 30*time.Second)
+	defer cancelStart()
 	start, err := c.DeviceStart(startCtx)
 	if err != nil {
 		return fmt.Errorf("starting login: %w", err)
 	}
-	fmt.Printf("To log in, open:\n\n    %s\n\nand enter the code:  %s\n\nWaiting for approval…\n",
-		start.VerificationURL, start.UserCode)
+	url := start.VerificationURL
 
-	pollCtx, cancel2 := ctxTimeout(ctx, 10*time.Minute)
-	defer cancel2()
-	tok, err := c.PollUntilToken(pollCtx, start)
+	// Printed before raw mode (ordinary \n); the always-present fallback.
+	fmt.Printf("To log in, open:\n\n    %s\n\nand enter the code:  %s\n\nWaiting for approval…\n",
+		url, start.UserCode)
+
+	interactive := term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd()))
+	if shouldAutoOpen(os.Getenv, interactive, *noBrowser) {
+		if err := openBrowser(url); err != nil {
+			slog.Warn("rift login: could not open browser", "err", err) // → diag logfile
+		}
+	}
+
+	pollCtx, cancelPoll := ctxTimeout(ctx, 10*time.Minute)
+	defer cancelPoll()
+
+	var tok *client.DeviceToken
+	if interactive {
+		tok, err = pollInteractive(pollCtx, cancelPoll, c, start, url)
+	} else {
+		tok, err = c.PollUntilToken(pollCtx, start) // today's behavior exactly
+	}
 	if err != nil {
-		return fmt.Errorf("login: %w", err)
+		if errors.Is(err, errLoginCanceled) {
+			return err // main renders "rift: login canceled", exit 1
+		}
+		return fmt.Errorf("login: %w", err) // keep today's wrap for timeout/network errors
 	}
 	cfg, _ := config.Load()
 	if cfg == nil {

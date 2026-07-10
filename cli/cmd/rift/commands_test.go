@@ -686,7 +686,7 @@ func TestCmdLoginPreservesDefaultContext(t *testing.T) {
 	// Pre-seed a SENTINEL default the login path must not touch.
 	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "old", DefaultContext: "company:sentinel"})
 
-	_ = captureStdout(t, func() {
+	out := captureStdout(t, func() {
 		if err := cmdLogin(context.Background(), []string{"--api", srv.URL}); err != nil {
 			t.Fatalf("cmdLogin: %v", err)
 		}
@@ -700,6 +700,150 @@ func TestCmdLoginPreservesDefaultContext(t *testing.T) {
 	}
 	if got.DefaultContext != "company:sentinel" {
 		t.Fatalf("login must PRESERVE DefaultContext, got %q", got.DefaultContext)
+	}
+
+	// Printed-URL fallback: the always-present invariant. The captured stdout
+	// must carry the server's ACTUAL verification_url (whatever the hermetic
+	// handler returns above) plus the "Waiting for approval" line — the printed
+	// URL is the guaranteed way to log in regardless of auto-open. Reference the
+	// handler's value; do NOT hardcode a prod URL.
+	const wantURL = "https://api/activate"
+	if !strings.Contains(out, wantURL) {
+		t.Fatalf("stdout must print the server's verification_url %q, got:\n%s", wantURL, out)
+	}
+	if !strings.Contains(out, "Waiting for approval") {
+		t.Fatalf("stdout must print the Waiting-for-approval fallback line, got:\n%s", out)
+	}
+}
+
+// loginHappyHandler is the happy-path device flow: start returns a fixed
+// verification_url + user_code, poll immediately mints a token. Shared by the
+// auto-open-suppression sibling below.
+func loginHappyHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/login/device/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"device_code": "DC", "user_code": "ABCD-1234",
+				"verification_url": "https://api/activate", "interval": 1,
+			})
+		case "/api/login/device/poll":
+			_ = json.NewEncoder(w).Encode(map[string]any{"token": "minted"})
+		default:
+			http.NotFound(w, r)
+		}
+	}
+}
+
+// --- cmdLogin never auto-opens the browser in a non-TTY ---
+//
+// The test captures stdout, so os.Stdout is a pipe → term.IsTerminal is false →
+// cmdLogin's `interactive` is false, and shouldAutoOpen short-circuits at
+// !interactive BEFORE it ever consults --no-browser. So the openBrowser var is
+// guaranteed un-invoked by the interactive gate alone.
+//
+// Honest scope (per the plan): this exercises only the SUPPRESSED direction. Its
+// real signal is a regression guard against someone hoisting the openBrowser
+// call ABOVE the interactive gate; the --no-browser repeat's only added signal
+// is that a known flag parses without error. It is NOT proof that --no-browser
+// suppresses the browser — that decision is covered non-vacuously by
+// TestShouldAutoOpen. No t.Parallel: this swaps the openBrowser package var.
+func TestCmdLoginNoAutoOpenInNonTTY(t *testing.T) {
+	// Swap the openBrowser package var for a recorder; restore on cleanup.
+	var opened int
+	orig := openBrowser
+	openBrowser = func(string) error { opened++; return nil }
+	t.Cleanup(func() { openBrowser = orig })
+
+	run := func(name string, args []string) {
+		opened = 0
+		srv := hermeticEnv(t, loginHappyHandler())
+		full := append([]string{"--api", srv.URL}, args...)
+		_ = captureStdout(t, func() {
+			if err := cmdLogin(context.Background(), full); err != nil {
+				t.Fatalf("%s: cmdLogin: %v", name, err)
+			}
+		})
+		if opened != 0 {
+			t.Fatalf("%s: openBrowser must NOT fire in a non-TTY (called %d times)", name, opened)
+		}
+	}
+
+	// Default (no flag) and with --no-browser: both parse and neither fires.
+	run("default", nil)
+	run("no-browser", []string{"--no-browser"})
+}
+
+// --- cmdLogin: a fatal poll error is wrapped and writes no config ---
+//
+// A 400 on /api/login/device/poll is terminal in DevicePoll (any non-2xx that
+// isn't 204/202 → *APIError), surfaced through PollUntilToken to cmdLogin, which
+// wraps it as fmt.Errorf("login: %w", err). cmdLogin only Load()s/Save()s config
+// AFTER a successful poll, so on this error the pre-seeded config must be left
+// byte-for-byte untouched — no partial write.
+func TestCmdLoginFatalPollErrorNoConfigWrite(t *testing.T) {
+	srv := hermeticEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/login/device/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"device_code": "DC", "user_code": "ABCD-1234",
+				"verification_url": "https://api/activate", "interval": 1,
+			})
+		case "/api/login/device/poll":
+			// Terminal: 400 with an error body → DevicePoll returns a terminal
+			// *APIError (not ErrAuthPending), which is fatal for PollUntilToken.
+			http.Error(w, `{"error":"expired_token"}`, http.StatusBadRequest)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	// Pre-seed a full session the failed login must not touch.
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "preseeded-tok", DefaultContext: "company:pre"})
+
+	var err error
+	_ = captureStdout(t, func() {
+		err = cmdLogin(context.Background(), []string{"--api", srv.URL})
+	})
+	if err == nil {
+		t.Fatal("a fatal poll error must surface as a non-nil error")
+	}
+	// The fmt.Errorf("login: %w", ...) wrap — a regression that drops it makes
+	// main mis-render the failure.
+	if !strings.Contains(err.Error(), "login:") {
+		t.Fatalf("error must carry the login: wrap, got %v", err)
+	}
+	// No partial write: the pre-seeded token + DefaultContext survive untouched.
+	got := loadConfig(t)
+	if got.Token != "preseeded-tok" {
+		t.Fatalf("failed login must NOT overwrite the token, got %q", got.Token)
+	}
+	if got.DefaultContext != "company:pre" {
+		t.Fatalf("failed login must NOT touch DefaultContext, got %q", got.DefaultContext)
+	}
+}
+
+// --- cmdLogin: an unknown flag is a parse error and mints nothing ---
+//
+// The flagset uses ContinueOnError, so an undefined flag fails at fs.Parse
+// before any device call. The hermetic env isolates config; nothing may be
+// written.
+func TestCmdLoginUnknownFlagParseError(t *testing.T) {
+	_ = hermeticEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		// Any request would be a bug: parsing fails before the device flow.
+		t.Errorf("no request expected on a parse error, got %s %s", r.Method, r.URL.Path)
+		http.NotFound(w, r)
+	})
+
+	var err error
+	_ = captureStdout(t, func() {
+		err = cmdLogin(context.Background(), []string{"--nope"})
+	})
+	if err == nil {
+		t.Fatal("an unknown flag must be a parse error")
+	}
+	// No token minted: config stays empty (no seed, no write).
+	if got := loadConfig(t).Token; got != "" {
+		t.Fatalf("a parse error must mint no token, got %q", got)
 	}
 }
 
