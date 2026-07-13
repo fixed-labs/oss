@@ -151,59 +151,62 @@ func TestCmdRegionsEmptyList(t *testing.T) {
 	}
 }
 
-// --- describeRegion pure-helper mapping (the `new` resolved-region echo) ---
+// --- describeSpawnDefaults pure-helper mapping (the `new` resolution echo) ---
 //
-// describeRegion maps the server's (region, source) echo to the friendly
-// "Using region <slug> (<how>)" line: explicit → "you chose it", user →
-// "your default", org → "your org default", system → "the system default";
-// an unknown source falls through verbatim; an empty region → no output.
-func TestDescribeRegion(t *testing.T) {
+// describeSpawnDefaults renders BOTH resolved dimensions with their
+// PER-DIMENSION sources ("Using region <slug> (<how>) · size <id> (<how>)"):
+// explicit → "explicit", repo → "repo default", context-wide → "account
+// default"; an unknown source falls through verbatim; a dimension the server
+// didn't echo is omitted; neither echoed → no output.
+func TestDescribeSpawnDefaults(t *testing.T) {
 	cases := []struct {
 		name string
 		in   client.CreateResult
 		want string
 	}{
 		{
-			name: "empty-region-no-output",
-			in:   client.CreateResult{Region: "", Source: "explicit"},
+			name: "neither-dimension-no-output",
+			in:   client.CreateResult{},
 			want: "",
 		},
 		{
-			name: "explicit",
-			in:   client.CreateResult{Region: "us-east", Source: "explicit"},
-			want: "Using region us-east (you chose it)",
+			name: "both-dimensions-mixed-sources",
+			in: client.CreateResult{Region: "iad", RegionSource: "context-wide",
+				Size: "shared-4x", SizeSource: "repo"},
+			want: "Using region iad (account default) · size shared-4x (repo default)",
 		},
 		{
-			name: "user",
-			in:   client.CreateResult{Region: "us-east", Source: "user"},
-			want: "Using region us-east (your default)",
+			name: "both-explicit",
+			in: client.CreateResult{Region: "iad", RegionSource: "explicit",
+				Size: "shared-2x", SizeSource: "explicit"},
+			want: "Using region iad (explicit) · size shared-2x (explicit)",
 		},
 		{
-			name: "org",
-			in:   client.CreateResult{Region: "us-east", Source: "org"},
-			want: "Using region us-east (your org default)",
+			name: "region-only-older-server",
+			in:   client.CreateResult{Region: "us-east", RegionSource: "context-wide"},
+			want: "Using region us-east (account default)",
 		},
 		{
-			name: "system",
-			in:   client.CreateResult{Region: "us-east", Source: "system"},
-			want: "Using region us-east (the system default)",
+			name: "size-only",
+			in:   client.CreateResult{Size: "shared-8x", SizeSource: "repo"},
+			want: "Using size shared-8x (repo default)",
 		},
 		{
 			name: "unknown-source-falls-through",
-			in:   client.CreateResult{Region: "us-east", Source: "weird"},
+			in:   client.CreateResult{Region: "us-east", RegionSource: "weird"},
 			want: "Using region us-east (weird)",
 		},
 		{
 			name: "empty-source-no-parenthetical",
-			in:   client.CreateResult{Region: "us-east", Source: ""},
+			in:   client.CreateResult{Region: "us-east"},
 			want: "Using region us-east",
 		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			r := c.in
-			if got := describeRegion(&r); got != c.want {
-				t.Fatalf("describeRegion(%+v) = %q, want %q", c.in, got, c.want)
+			if got := describeSpawnDefaults(&r); got != c.want {
+				t.Fatalf("describeSpawnDefaults(%+v) = %q, want %q", c.in, got, c.want)
 			}
 		})
 	}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -343,14 +344,19 @@ func withStdin(t *testing.T, input string) {
 
 // captureStdout runs fn with os.Stdout redirected to a pipe and returns whatever
 // fn printed (these callers observe rendered output rather than an internal value).
-func captureStdout(t *testing.T, fn func()) string {
+// captureStderr does the same for os.Stderr (advisory pre-flight warnings print
+// there, so they never mix with parseable stdout).
+func captureStdout(t *testing.T, fn func()) string { return captureFile(t, &os.Stdout, fn) }
+func captureStderr(t *testing.T, fn func()) string { return captureFile(t, &os.Stderr, fn) }
+
+func captureFile(t *testing.T, f **os.File, fn func()) string {
 	t.Helper()
-	old := os.Stdout
+	old := *f
 	r, w, err := os.Pipe()
 	if err != nil {
 		t.Fatalf("pipe: %v", err)
 	}
-	os.Stdout = w
+	*f = w
 	done := make(chan string, 1)
 	go func() {
 		var buf bytes.Buffer
@@ -359,7 +365,7 @@ func captureStdout(t *testing.T, fn func()) string {
 	}()
 	fn()
 	_ = w.Close()
-	os.Stdout = old
+	*f = old
 	return <-done
 }
 
@@ -844,6 +850,771 @@ func TestCmdLoginUnknownFlagParseError(t *testing.T) {
 	// No token minted: config stays empty (no seed, no write).
 	if got := loadConfig(t).Token; got != "" {
 		t.Fatalf("a parse error must mint no token, got %q", got)
+	}
+}
+
+// --- cmdNew force-select (region-required / size-required) ---
+//
+// The server never substitutes a missing region/size — it 400s
+// {"error":"<dim>-required","selectable":[…]}. On a TTY cmdNew runs a
+// numbered picker over the selectable list and re-issues the create; non-TTY
+// it lists the values and exits non-zero.
+
+// forceTTY forces cmdNew's interactive gate for the duration of the test. The
+// harness's stdin/stdout are files/pipes — never real terminals — so the true
+// term.IsTerminal gate cannot fire here; the gate's decision fn is the
+// package var isTTY, and the picker itself is unit-tested over an injected
+// reader (TestPickerPrompt*). No t.Parallel in tests using this: it swaps a
+// package var.
+func forceTTY(t *testing.T, v bool) {
+	t.Helper()
+	orig := isTTY
+	isTTY = func() bool { return v }
+	t.Cleanup(func() { isTTY = orig })
+}
+
+// forceSelectHandler 400s a create missing region (then size) with the
+// force-select codes, succeeds once both are present (echoing them back as
+// explicit), and answers the connect-time Get with a terminal "failed"
+// workspace so cmdNew unwinds without a live box (the newCaptureHandler
+// pattern).
+func forceSelectHandler(bodies *[]map[string]any) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/api/workspaces" {
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			*bodies = append(*bodies, body)
+			if _, ok := body["region"]; !ok {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"error": "region-required", "detail": "no default region for this context",
+					"selectable": []string{"iad", "ewr"}})
+				return
+			}
+			if _, ok := body["size"]; !ok {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"error": "size-required", "detail": "no default size for this context",
+					"selectable": []string{"shared-2x", "shared-4x"}})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"workspace_id": "ws-new",
+				"region":       body["region"], "region_source": "explicit",
+				"size": body["size"], "size_source": "explicit",
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"workspace": map[string]any{"workspace_id": "ws-new", "status": "failed", "error_message": "test-stop"},
+		})
+	}
+}
+
+// Both dimensions missing → two picker rounds, each re-issuing the create
+// with the pick filled in (3 attempts total), then the success line echoes
+// both resolved dimensions. The stdin carries a garbage first entry to prove
+// the picker re-prompts, and one shared reader must survive both rounds.
+func TestCmdNewForceSelectPickerLoop(t *testing.T) {
+	var bodies []map[string]any
+	srv := hermeticEnv(t, forceSelectHandler(&bodies))
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "company:c1"})
+	forceTTY(t, true)
+	// Region picker: "abc" (re-prompt) then "2" → ewr; size picker: "1" →
+	// shared-2x.
+	withStdin(t, "abc\n2\n1\n")
+
+	out := captureStdout(t, func() {
+		_ = cmdNew(context.Background(), []string{"--repo", "org/app", "--ref", "main"})
+	})
+	if len(bodies) != 3 {
+		t.Fatalf("want 3 create attempts (blank, +region, +size), got %d", len(bodies))
+	}
+	if _, ok := bodies[0]["region"]; ok {
+		t.Fatalf("attempt 1 must omit region: %+v", bodies[0])
+	}
+	if bodies[1]["region"] != "ewr" {
+		t.Fatalf("attempt 2 must carry the picked region (ewr): %+v", bodies[1])
+	}
+	if _, ok := bodies[1]["size"]; ok {
+		t.Fatalf("attempt 2 must still omit size: %+v", bodies[1])
+	}
+	if bodies[2]["region"] != "ewr" || bodies[2]["size"] != "shared-2x" {
+		t.Fatalf("attempt 3 must carry BOTH picks: %+v", bodies[2])
+	}
+	// The picker rendered the numbered selectable list…
+	if !strings.Contains(out, "1) iad") || !strings.Contains(out, "2) ewr") {
+		t.Fatalf("picker must render the numbered selectable list, got:\n%s", out)
+	}
+	// …and a success line echoes both dimensions with their sources. Only
+	// presence is asserted — the exact copy is pinned ONCE, in
+	// TestDescribeSpawnDefaults. The picker lists above also print the bare
+	// values (one per numbered line), so the assertion must find a SINGLE
+	// line carrying both values plus a source wording for each.
+	echoed := false
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "ewr") && strings.Contains(line, "shared-2x") &&
+			strings.Count(line, "explicit") >= 2 {
+			echoed = true
+			break
+		}
+	}
+	if !echoed {
+		t.Fatalf("success output must echo both dimensions with their sources on one line, got:\n%s", out)
+	}
+}
+
+// An empty line (or EOF) at the picker aborts without re-issuing the create.
+func TestCmdNewForceSelectAbortsOnEmptyStdin(t *testing.T) {
+	var bodies []map[string]any
+	srv := hermeticEnv(t, forceSelectHandler(&bodies))
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "company:c1"})
+	forceTTY(t, true)
+	withStdin(t, "\n")
+
+	var err error
+	_ = captureStdout(t, func() {
+		err = cmdNew(context.Background(), []string{"--repo", "org/app", "--ref", "main"})
+	})
+	if err == nil || !strings.Contains(err.Error(), "no region selected") {
+		t.Fatalf("empty picker input must abort, got %v", err)
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("an aborted picker must not re-issue the create, got %d attempts", len(bodies))
+	}
+}
+
+// Non-TTY (CI): no picker — the detail + selectable list surface in the error
+// (main prints it to stderr, exit non-zero) and the create is never retried.
+// The value is NEVER substituted.
+func TestCmdNewForceSelectNonTTYListsAndFails(t *testing.T) {
+	var bodies []map[string]any
+	srv := hermeticEnv(t, forceSelectHandler(&bodies))
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "company:c1"})
+	forceTTY(t, false)
+
+	err := cmdNew(context.Background(), []string{"--repo", "org/app", "--ref", "main"})
+	if err == nil {
+		t.Fatal("non-TTY force-select must fail (never substitute)")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "no default region for this context") ||
+		!strings.Contains(msg, "iad") || !strings.Contains(msg, "ewr") {
+		t.Fatalf("non-TTY error must carry the detail + selectable list, got %q", msg)
+	}
+	if !strings.Contains(msg, "--region") {
+		t.Fatalf("non-TTY error should name the flag to re-run with, got %q", msg)
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("non-TTY must not retry the create, got %d attempts", len(bodies))
+	}
+}
+
+// A <dim>-required 400 whose selectable list is EMPTY never opens a picker —
+// there is nothing to pick — even on a TTY: the server's detail surfaces as
+// the listing error (non-zero exit), the create is never re-issued, and the
+// value is never substituted. The empty-list gate is dimension-agnostic
+// (one code path for both); region stands in for both dimensions.
+func TestCmdNewForceSelectEmptySelectableFailsEvenOnTTY(t *testing.T) {
+	createCalls := 0
+	srv := hermeticEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/api/workspaces" {
+			createCalls++
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": "region-required", "detail": "no default region for this context",
+				"selectable": []string{}})
+			return
+		}
+		http.NotFound(w, r)
+	})
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "company:c1"})
+	forceTTY(t, true)   // even interactively…
+	withStdin(t, "1\n") // …an empty list must never reach a picker read
+
+	var err error
+	out := captureStdout(t, func() {
+		err = cmdNew(context.Background(), []string{"--repo", "org/app", "--ref", "main"})
+	})
+	if err == nil {
+		t.Fatal("an empty selectable list must fail even on a TTY (nothing to pick)")
+	}
+	if !strings.Contains(err.Error(), "no default region for this context") {
+		t.Fatalf("error must carry the server's detail, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "--region") {
+		t.Fatalf("error should name the flag to re-run with, got %v", err)
+	}
+	if createCalls != 1 {
+		t.Fatalf("an empty list must never re-issue the create, got %d attempts", createCalls)
+	}
+	// No numbered picker rendered — there was nothing to pick from.
+	if strings.Contains(out, "1)") || strings.Contains(out, "Select a") {
+		t.Fatalf("no picker may render on an empty selectable list, got:\n%s", out)
+	}
+}
+
+// An EXPLICIT --size the server rejects (…-not-available) keeps the
+// fail-with-list behavior — no picker even on a TTY, no re-issue, never a
+// substitution.
+func TestCmdNewExplicitNotAvailableFailsWithList(t *testing.T) {
+	createCalls := 0
+	srv := hermeticEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/api/workspaces" {
+			createCalls++
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": "size-not-available", "detail": "size not available",
+				"selectable": []string{"shared-2x", "shared-4x"}})
+			return
+		}
+		http.NotFound(w, r)
+	})
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "company:c1"})
+	forceTTY(t, true)   // even interactively…
+	withStdin(t, "1\n") // …an explicit-invalid must NOT consume a picker entry
+
+	var err error
+	_ = captureStdout(t, func() {
+		err = cmdNew(context.Background(), []string{"--repo", "org/app", "--ref", "main", "--size", "mega-999x"})
+	})
+	if err == nil {
+		t.Fatal("an explicit invalid --size must fail")
+	}
+	if !strings.Contains(err.Error(), "size not available") || !strings.Contains(err.Error(), "shared-4x") {
+		t.Fatalf("error must carry the detail + selectable list, got %v", err)
+	}
+	if createCalls != 1 {
+		t.Fatalf("explicit-invalid must never re-issue, got %d attempts", createCalls)
+	}
+}
+
+// The infinite-loop guard: a server that keeps 400ing <dim>-required for a
+// dimension the picker already filled in is surfaced as an error after ONE
+// re-issue, not looped forever.
+func TestCmdNewForceSelectGuardsRepeatedRequired(t *testing.T) {
+	createCalls := 0
+	srv := hermeticEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/api/workspaces" {
+			createCalls++
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": "region-required", "detail": "no default region for this context",
+				"selectable": []string{"iad"}})
+			return
+		}
+		http.NotFound(w, r)
+	})
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "company:c1"})
+	forceTTY(t, true)
+	withStdin(t, "1\n1\n1\n1\n") // more input than the guard should ever consume
+
+	var err error
+	_ = captureStdout(t, func() {
+		err = cmdNew(context.Background(), []string{"--repo", "org/app", "--ref", "main"})
+	})
+	if err == nil {
+		t.Fatal("a re-reported required dimension must surface an error")
+	}
+	if createCalls != 2 {
+		t.Fatalf("guard must stop after one re-issue, got %d attempts", createCalls)
+	}
+}
+
+// --- pickerPrompt (the numbered force-select picker, unit level) ---
+//
+// Driven over an injected bufio.Reader — no TTY needed (the TTY gate is the
+// caller's isTTY check, exercised above via forceTTY). Garbage (a non-number
+// or out-of-range entry) re-prompts; an empty line or EOF aborts.
+
+func TestPickerPromptRepromptsOnGarbageThenPicks(t *testing.T) {
+	se := client.SelectableError{Detail: "pick one", Selectable: []string{"iad", "ewr"}}
+	in := bufio.NewReader(strings.NewReader("abc\n99\n0\n2\n"))
+	var choice string
+	var err error
+	out := captureStdout(t, func() { choice, err = pickerPrompt(in, "region", se) })
+	if err != nil || choice != "ewr" {
+		t.Fatalf("choice=%q err=%v, want ewr", choice, err)
+	}
+	if !strings.Contains(out, "pick one") || !strings.Contains(out, "1) iad") || !strings.Contains(out, "2) ewr") {
+		t.Fatalf("picker must render detail + numbered list, got:\n%s", out)
+	}
+	// Three invalid entries → three re-prompts after the initial prompt.
+	if got := strings.Count(out, "Select a region"); got != 4 {
+		t.Fatalf("want 4 prompts (1 + 3 re-prompts), got %d:\n%s", got, out)
+	}
+}
+
+func TestPickerPromptAborts(t *testing.T) {
+	cases := map[string]string{
+		"empty-line":       "\n",
+		"immediate-eof":    "",
+		"garbage-then-eof": "abc", // no trailing newline; the re-prompt hits EOF
+	}
+	for name, input := range cases {
+		t.Run(name, func(t *testing.T) {
+			se := client.SelectableError{Detail: "pick one", Selectable: []string{"iad"}}
+			in := bufio.NewReader(strings.NewReader(input))
+			var err error
+			_ = captureStdout(t, func() { _, err = pickerPrompt(in, "region", se) })
+			if err == nil {
+				t.Fatalf("input %q must abort the picker", input)
+			}
+		})
+	}
+}
+
+// --- set-default-region / set-default-size / set-repo-builder-size ---
+
+// settingsHits counts the advisory pre-flight catalog reads
+// settingsCaptureHandler serves: GET /api/regions (the region dimension) and
+// GET /api/workspaces/sizes (the size dimension).
+type settingsHits struct {
+	regions int
+	sizes   int
+}
+
+// settingsCaptureHandler captures POST /api/devbox-settings and POST
+// /api/repos/builder-size bodies into byPath, answers the two advisory
+// pre-flight catalog reads (GET /api/regions with slug "iad", GET
+// /api/workspaces/sizes with id "shared-4x"), and counts those reads in hits.
+func settingsCaptureHandler(byPath map[string]map[string]any, hits *settingsHits) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost &&
+			(r.URL.Path == "/api/devbox-settings" || r.URL.Path == "/api/repos/builder-size"):
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			byPath[r.URL.Path] = body
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/regions":
+			hits.regions++
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"effective_default": nil, "pinned_default": nil,
+				"regions": []map[string]any{
+					{"slug": "iad", "display_name": "Ashburn", "status": "available", "available_now": true},
+				},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/workspaces/sizes":
+			hits.sizes++
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"effective_default": nil,
+				"sizes": []map[string]any{
+					{"id": "shared-4x", "display_name": "Shared 4x", "cpu": 4, "memory_mb": 8192, "price": "—"},
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}
+}
+
+// A --repo write canonicalizes the repo, scopes the body to the config's
+// default context, and keeps the region advisory pre-flight.
+func TestCmdSetDefaultRegionRepoScopedBody(t *testing.T) {
+	byPath := map[string]map[string]any{}
+	var hits settingsHits
+	srv := hermeticEnv(t, settingsCaptureHandler(byPath, &hits))
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "company:seeded"})
+
+	out := captureStdout(t, func() {
+		if err := cmdSetDefaultRegion(context.Background(), []string{"--repo", "Acme/Widget", "iad"}); err != nil {
+			t.Fatalf("cmdSetDefaultRegion: %v", err)
+		}
+	})
+	body := byPath["/api/devbox-settings"]
+	if body == nil {
+		t.Fatal("no POST /api/devbox-settings captured")
+	}
+	if body["context_id"] != "company:seeded" || body["repo"] != "github:github.com/acme/widget" ||
+		body["setting"] != "default-region" || body["value"] != "iad" {
+		t.Fatalf("body: %+v", body)
+	}
+	if _, present := body["clear"]; present {
+		t.Fatalf("a plain set must not send clear: %+v", body)
+	}
+	if hits.regions != 1 {
+		t.Fatalf("region set keeps the advisory pre-flight (1 GET /api/regions), got %d", hits.regions)
+	}
+	if hits.sizes != 0 {
+		t.Fatalf("region set must not read /api/workspaces/sizes, got %d", hits.sizes)
+	}
+	if !strings.Contains(out, "Default region set to iad") {
+		t.Fatalf("confirmation output, got:\n%s", out)
+	}
+}
+
+// --context beats the config default (the same resolution cmdNew uses), and
+// no --repo means the context-wide scope (no repo key at all).
+func TestCmdSetDefaultRegionContextFlagWinsAndContextWide(t *testing.T) {
+	byPath := map[string]map[string]any{}
+	var hits settingsHits
+	srv := hermeticEnv(t, settingsCaptureHandler(byPath, &hits))
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "company:seeded"})
+
+	_ = captureStdout(t, func() {
+		if err := cmdSetDefaultRegion(context.Background(), []string{"--context", "personal:u9", "iad"}); err != nil {
+			t.Fatalf("cmdSetDefaultRegion: %v", err)
+		}
+	})
+	body := byPath["/api/devbox-settings"]
+	if body["context_id"] != "personal:u9" {
+		t.Fatalf("--context must beat the config default: %+v", body)
+	}
+	if _, present := body["repo"]; present {
+		t.Fatalf("no --repo → context-wide (no repo key): %+v", body)
+	}
+}
+
+// --clear (or no value argument) sends clear:true and omits value.
+func TestCmdSetDefaultRegionClear(t *testing.T) {
+	for name, args := range map[string][]string{
+		"explicit-clear": {"--clear"},
+		"no-arg":         {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			byPath := map[string]map[string]any{}
+			var hits settingsHits
+			srv := hermeticEnv(t, settingsCaptureHandler(byPath, &hits))
+			seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "company:c1"})
+
+			out := captureStdout(t, func() {
+				if err := cmdSetDefaultRegion(context.Background(), args); err != nil {
+					t.Fatalf("cmdSetDefaultRegion: %v", err)
+				}
+			})
+			body := byPath["/api/devbox-settings"]
+			if v, present := body["clear"]; !present || v != true {
+				t.Fatalf("clear must send clear:true: %+v", body)
+			}
+			if _, present := body["value"]; present {
+				t.Fatalf("clear must omit value: %+v", body)
+			}
+			if !strings.Contains(out, "cleared") {
+				t.Fatalf("confirmation output, got:\n%s", out)
+			}
+		})
+	}
+}
+
+// set-default-size posts setting "default-size" with its own advisory
+// pre-flight (GET /api/workspaces/sizes) — and never the region one.
+func TestCmdSetDefaultSizeBody(t *testing.T) {
+	byPath := map[string]map[string]any{}
+	var hits settingsHits
+	srv := hermeticEnv(t, settingsCaptureHandler(byPath, &hits))
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "personal:u1"})
+
+	out := captureStdout(t, func() {
+		if err := cmdSetDefaultSize(context.Background(), []string{"shared-4x"}); err != nil {
+			t.Fatalf("cmdSetDefaultSize: %v", err)
+		}
+	})
+	body := byPath["/api/devbox-settings"]
+	if body["context_id"] != "personal:u1" || body["setting"] != "default-size" || body["value"] != "shared-4x" {
+		t.Fatalf("body: %+v", body)
+	}
+	if hits.sizes != 1 {
+		t.Fatalf("size set keeps the advisory pre-flight (1 GET /api/workspaces/sizes), got %d", hits.sizes)
+	}
+	if hits.regions != 0 {
+		t.Fatalf("size set must not read /api/regions, got %d", hits.regions)
+	}
+	if !strings.Contains(out, "Default size set to shared-4x") {
+		t.Fatalf("confirmation output, got:\n%s", out)
+	}
+}
+
+// The size pre-flight is ADVISORY: an id absent from the catalog warns on
+// stderr but the POST is still sent — the server stays authoritative.
+func TestCmdSetDefaultSizeUnknownIDWarnsButPosts(t *testing.T) {
+	byPath := map[string]map[string]any{}
+	var hits settingsHits
+	srv := hermeticEnv(t, settingsCaptureHandler(byPath, &hits))
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "personal:u1"})
+
+	var stderr string
+	out := captureStdout(t, func() {
+		stderr = captureStderr(t, func() {
+			if err := cmdSetDefaultSize(context.Background(), []string{"mega-999"}); err != nil {
+				t.Errorf("cmdSetDefaultSize: %v", err)
+			}
+		})
+	})
+	if !strings.Contains(stderr, `"mega-999" is not in `+"`rift sizes`") {
+		t.Fatalf("unknown id must warn on stderr, got:\n%s", stderr)
+	}
+	body := byPath["/api/devbox-settings"]
+	if body == nil || body["value"] != "mega-999" {
+		t.Fatalf("the warning must not block the POST: %+v", body)
+	}
+	if !strings.Contains(out, "Default size set to mega-999") {
+		t.Fatalf("confirmation output, got:\n%s", out)
+	}
+}
+
+// A failed pre-flight catalog read is silently skipped — it never blocks the
+// POST (same error tolerance as the region dimension).
+func TestCmdSetDefaultSizePreflightFailureDoesNotBlockPost(t *testing.T) {
+	byPath := map[string]map[string]any{}
+	srv := hermeticEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/devbox-settings":
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			byPath[r.URL.Path] = body
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/workspaces/sizes":
+			http.Error(w, "boom", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "personal:u1"})
+
+	out := captureStdout(t, func() {
+		if err := cmdSetDefaultSize(context.Background(), []string{"shared-4x"}); err != nil {
+			t.Errorf("a failed pre-flight must not fail the command: %v", err)
+		}
+	})
+	body := byPath["/api/devbox-settings"]
+	if body == nil || body["value"] != "shared-4x" || body["setting"] != "default-size" {
+		t.Fatalf("the POST must still be sent: %+v", body)
+	}
+	if !strings.Contains(out, "Default size set to shared-4x") {
+		t.Fatalf("confirmation output, got:\n%s", out)
+	}
+}
+
+// No acting context resolvable → the same error cmdNew raises, before any POST.
+func TestCmdSetDefaultSettingNoContextErrors(t *testing.T) {
+	byPath := map[string]map[string]any{}
+	var hits settingsHits
+	srv := hermeticEnv(t, settingsCaptureHandler(byPath, &hits))
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok"}) // no DefaultContext
+
+	err := cmdSetDefaultSize(context.Background(), []string{"shared-4x"})
+	if err == nil {
+		t.Fatal("no context set must error")
+	}
+	want := "no context set — run `rift set-default-context` or pass --context <ctx>"
+	if err.Error() != want {
+		t.Fatalf("error = %q, want %q", err.Error(), want)
+	}
+	if len(byPath) != 0 {
+		t.Fatalf("nothing may be POSTed without a context: %+v", byPath)
+	}
+}
+
+// set-repo-builder-size posts {repo, size} to /api/repos/builder-size (no
+// context — builds carry none), canonicalizing the repo argument.
+func TestCmdSetRepoBuilderSizeBody(t *testing.T) {
+	byPath := map[string]map[string]any{}
+	var hits settingsHits
+	srv := hermeticEnv(t, settingsCaptureHandler(byPath, &hits))
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok"})
+
+	out := captureStdout(t, func() {
+		if err := cmdSetRepoBuilderSize(context.Background(), []string{"Acme/Widget", "shared-8x-16g"}); err != nil {
+			t.Fatalf("cmdSetRepoBuilderSize: %v", err)
+		}
+	})
+	body := byPath["/api/repos/builder-size"]
+	if body == nil {
+		t.Fatal("no POST /api/repos/builder-size captured")
+	}
+	if body["repo"] != "github:github.com/acme/widget" || body["size"] != "shared-8x-16g" {
+		t.Fatalf("body: %+v", body)
+	}
+	if _, present := body["clear"]; present {
+		t.Fatalf("a plain set must not send clear: %+v", body)
+	}
+	if _, present := body["context_id"]; present {
+		t.Fatalf("builder-size is repo-scoped only (no context_id): %+v", body)
+	}
+	if !strings.Contains(out, "set to shared-8x-16g") {
+		t.Fatalf("confirmation output, got:\n%s", out)
+	}
+}
+
+// --clear (or a missing SIZE) reverts to the global default: {repo, clear:true},
+// no size key.
+func TestCmdSetRepoBuilderSizeClear(t *testing.T) {
+	for name, args := range map[string][]string{
+		"explicit-clear": {"--clear", "acme/widget"},
+		"no-size":        {"acme/widget"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			byPath := map[string]map[string]any{}
+			var hits settingsHits
+			srv := hermeticEnv(t, settingsCaptureHandler(byPath, &hits))
+			seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok"})
+
+			out := captureStdout(t, func() {
+				if err := cmdSetRepoBuilderSize(context.Background(), args); err != nil {
+					t.Fatalf("cmdSetRepoBuilderSize: %v", err)
+				}
+			})
+			body := byPath["/api/repos/builder-size"]
+			if body["repo"] != "github:github.com/acme/widget" {
+				t.Fatalf("body: %+v", body)
+			}
+			if v, present := body["clear"]; !present || v != true {
+				t.Fatalf("clear must send clear:true: %+v", body)
+			}
+			if _, present := body["size"]; present {
+				t.Fatalf("clear must omit size: %+v", body)
+			}
+			if !strings.Contains(out, "cleared") {
+				t.Fatalf("confirmation output, got:\n%s", out)
+			}
+		})
+	}
+}
+
+// No repo argument → usage error before any POST.
+func TestCmdSetRepoBuilderSizeUsage(t *testing.T) {
+	byPath := map[string]map[string]any{}
+	var hits settingsHits
+	_ = hermeticEnv(t, settingsCaptureHandler(byPath, &hits))
+
+	err := cmdSetRepoBuilderSize(context.Background(), nil)
+	if err == nil || !strings.Contains(err.Error(), "usage:") {
+		t.Fatalf("missing repo must be a usage error, got %v", err)
+	}
+	if len(byPath) != 0 {
+		t.Fatalf("a usage error must not POST: %+v", byPath)
+	}
+}
+
+// Flags parse wherever they appear — before, between, or after positionals —
+// matching the documented grammar (`rift set-repo-builder-size <REPO>
+// [--clear] <SIZE>`, `rift set-default-region [--repo R] [--clear] <VALUE>`).
+// Each spelling must land the same POST as its flags-first equivalent.
+func TestSetCommandsAcceptInterleavedFlags(t *testing.T) {
+	type tc struct {
+		run      func(context.Context, []string) error
+		args     []string
+		path     string // captured POST path
+		wantBody map[string]any
+		absent   []string // keys the body must NOT contain
+		wantOut  string
+	}
+	cases := map[string]tc{
+		"builder-size trailing --clear (docs verbatim)": {
+			run:      cmdSetRepoBuilderSize,
+			args:     []string{"acme/widget", "--clear"},
+			path:     "/api/repos/builder-size",
+			wantBody: map[string]any{"repo": "github:github.com/acme/widget", "clear": true},
+			absent:   []string{"size"},
+			wantOut:  "cleared",
+		},
+		"builder-size repo then size": {
+			run:      cmdSetRepoBuilderSize,
+			args:     []string{"acme/widget", "shared-8x-16g"},
+			path:     "/api/repos/builder-size",
+			wantBody: map[string]any{"repo": "github:github.com/acme/widget", "size": "shared-8x-16g"},
+			absent:   []string{"clear"},
+			wantOut:  "set to shared-8x-16g",
+		},
+		"builder-size flags-first still works": {
+			run:      cmdSetRepoBuilderSize,
+			args:     []string{"--clear", "acme/widget"},
+			path:     "/api/repos/builder-size",
+			wantBody: map[string]any{"repo": "github:github.com/acme/widget", "clear": true},
+			absent:   []string{"size"},
+			wantOut:  "cleared",
+		},
+		"region value then trailing --repo": {
+			run:  cmdSetDefaultRegion,
+			args: []string{"iad", "--repo", "acme/widget"},
+			path: "/api/devbox-settings",
+			wantBody: map[string]any{
+				"context_id": "company:c1", "repo": "github:github.com/acme/widget",
+				"setting": "default-region", "value": "iad",
+			},
+			absent:  []string{"clear"},
+			wantOut: "Default region set to iad",
+		},
+		"region --repo then trailing --clear": {
+			run:  cmdSetDefaultRegion,
+			args: []string{"--repo", "acme/widget", "--clear"},
+			path: "/api/devbox-settings",
+			wantBody: map[string]any{
+				"context_id": "company:c1", "repo": "github:github.com/acme/widget",
+				"setting": "default-region", "clear": true,
+			},
+			absent:  []string{"value"},
+			wantOut: "cleared",
+		},
+		"size value then trailing --context": {
+			run:  cmdSetDefaultSize,
+			args: []string{"shared-4x", "--context", "personal:u9"},
+			path: "/api/devbox-settings",
+			wantBody: map[string]any{
+				"context_id": "personal:u9", "setting": "default-size", "value": "shared-4x",
+			},
+			absent:  []string{"repo", "clear"},
+			wantOut: "Default size set to shared-4x",
+		},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			byPath := map[string]map[string]any{}
+			var hits settingsHits
+			srv := hermeticEnv(t, settingsCaptureHandler(byPath, &hits))
+			seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "company:c1"})
+
+			out := captureStdout(t, func() {
+				if err := c.run(context.Background(), c.args); err != nil {
+					t.Fatalf("%v: %v", c.args, err)
+				}
+			})
+			body := byPath[c.path]
+			if body == nil {
+				t.Fatalf("no POST %s captured (all: %+v)", c.path, byPath)
+			}
+			for k, want := range c.wantBody {
+				if body[k] != want {
+					t.Fatalf("body[%q] = %v, want %v (body: %+v)", k, body[k], want, body)
+				}
+			}
+			for _, k := range c.absent {
+				if _, present := body[k]; present {
+					t.Fatalf("body must omit %q: %+v", k, body)
+				}
+			}
+			if !strings.Contains(out, c.wantOut) {
+				t.Fatalf("output must contain %q, got:\n%s", c.wantOut, out)
+			}
+		})
+	}
+}
+
+// An UNKNOWN flag still errors loudly wherever it sits — the stdlib Parse
+// rejects it on the pass that reaches it — and nothing is POSTed.
+func TestSetCommandsUnknownFlagAnywhereErrors(t *testing.T) {
+	byPath := map[string]map[string]any{}
+	var hits settingsHits
+	srv := hermeticEnv(t, settingsCaptureHandler(byPath, &hits))
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "company:c1"})
+
+	_ = captureStderr(t, func() { // fs.Parse prints its own usage on error
+		if err := cmdSetDefaultRegion(context.Background(), []string{"iad", "--bogus"}); err == nil ||
+			!strings.Contains(err.Error(), "-bogus") {
+			t.Errorf("trailing unknown flag must error loudly, got %v", err)
+		}
+		if err := cmdSetRepoBuilderSize(context.Background(), []string{"acme/widget", "--bogus"}); err == nil ||
+			!strings.Contains(err.Error(), "-bogus") {
+			t.Errorf("trailing unknown flag must error loudly, got %v", err)
+		}
+		if err := cmdSetRepoBuilderSize(context.Background(), []string{"--bogus", "acme/widget"}); err == nil ||
+			!strings.Contains(err.Error(), "-bogus") {
+			t.Errorf("leading unknown flag must error loudly, got %v", err)
+		}
+	})
+	if len(byPath) != 0 {
+		t.Fatalf("an unknown flag must not POST: %+v", byPath)
 	}
 }
 

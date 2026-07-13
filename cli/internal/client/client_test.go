@@ -858,60 +858,124 @@ func TestRegionsNullDefaultsAndEmptyContext(t *testing.T) {
 	}
 }
 
-// --- SetDefaultRegion (POST /api/user/default-region) ---
+// --- Create decodes the per-dimension resolution echo ---
 
-// TestSetDefaultRegion pins the happy path: a POST to /api/user/default-region
-// with body {"region": slug}, carrying the bearer.
-func TestSetDefaultRegion(t *testing.T) {
+// The create success body echoes region/region_source/size/size_source (the
+// old single `source` key is GONE — per-dimension resolution means region and
+// size may come from different scopes). All four must decode; absent keys
+// (an older server) decode empty.
+func TestCreateDecodesResolutionEcho(t *testing.T) {
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"workspace_id":  "ws-new",
+			"region":        "iad",
+			"region_source": "context-wide",
+			"size":          "shared-4x",
+			"size_source":   "repo",
+		})
+	})
+	res, err := c.Create(context.Background(), "r", "", "", "company:c1", "", "", false)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if res.Region != "iad" || res.RegionSource != "context-wide" {
+		t.Fatalf("region echo: %+v", res)
+	}
+	if res.Size != "shared-4x" || res.SizeSource != "repo" {
+		t.Fatalf("size echo: %+v", res)
+	}
+
+	// Older server: none of the echo keys → all four decode empty.
+	c2 := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"workspace_id": "ws-old"})
+	})
+	res2, err := c2.Create(context.Background(), "r", "", "", "company:c1", "", "", false)
+	if err != nil {
+		t.Fatalf("Create (older server): %v", err)
+	}
+	if res2.Region != "" || res2.RegionSource != "" || res2.Size != "" || res2.SizeSource != "" {
+		t.Fatalf("absent echo keys must decode empty: %+v", res2)
+	}
+}
+
+// --- SetDevboxSetting (POST /api/devbox-settings) ---
+
+// TestSetDevboxSettingRepoScoped pins the happy path: a POST to
+// /api/devbox-settings carrying the bearer with body {context_id, repo,
+// setting, value} — and NO clear key on a plain set.
+func TestSetDevboxSettingRepoScoped(t *testing.T) {
 	var gotPath, gotMethod, gotAuth string
 	var gotBody map[string]any
 	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
 		gotPath, gotMethod, gotAuth = r.URL.Path, r.Method, r.Header.Get("Authorization")
 		_ = json.NewDecoder(r.Body).Decode(&gotBody)
-		w.WriteHeader(http.StatusNoContent)
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 	})
-	if err := c.SetDefaultRegion(context.Background(), "us-east"); err != nil {
-		t.Fatalf("SetDefaultRegion: %v", err)
+	err := c.SetDevboxSetting(context.Background(), "company:c1",
+		"github:github.com/org/app", "default-region", "us-east", false)
+	if err != nil {
+		t.Fatalf("SetDevboxSetting: %v", err)
 	}
-	if gotMethod != http.MethodPost || gotPath != "/api/user/default-region" {
+	if gotMethod != http.MethodPost || gotPath != "/api/devbox-settings" {
 		t.Fatalf("endpoint: %s %s", gotMethod, gotPath)
 	}
 	if gotAuth != "Bearer dev-bearer" {
 		t.Fatalf("auth: %q", gotAuth)
 	}
-	if gotBody["region"] != "us-east" {
-		t.Fatalf("body region: %v, want us-east", gotBody["region"])
+	if gotBody["context_id"] != "company:c1" || gotBody["repo"] != "github:github.com/org/app" ||
+		gotBody["setting"] != "default-region" || gotBody["value"] != "us-east" {
+		t.Fatalf("body: %+v", gotBody)
+	}
+	if _, present := gotBody["clear"]; present {
+		t.Fatalf("a plain set must not send clear: %+v", gotBody)
 	}
 }
 
-// TestSetDefaultRegionEmptyStillPosts confirms an empty slug (the clear path)
-// still POSTs {"region": ""} — the server treats an empty region as a clear, so
-// the request must go out (not be short-circuited client-side).
-func TestSetDefaultRegionEmptyStillPosts(t *testing.T) {
-	hit := false
+// A context-wide write (empty repo) omits the repo key entirely; a size write
+// carries setting "default-size".
+func TestSetDevboxSettingContextWideOmitsRepo(t *testing.T) {
 	var gotBody map[string]any
 	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
-		hit = true
 		_ = json.NewDecoder(r.Body).Decode(&gotBody)
-		w.WriteHeader(http.StatusNoContent)
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 	})
-	if err := c.SetDefaultRegion(context.Background(), ""); err != nil {
-		t.Fatalf("SetDefaultRegion(clear): %v", err)
+	err := c.SetDevboxSetting(context.Background(), "personal:u1", "", "default-size", "shared-4x", false)
+	if err != nil {
+		t.Fatalf("SetDevboxSetting: %v", err)
 	}
-	if !hit {
-		t.Fatal("an empty slug (clear) must still POST")
+	if _, present := gotBody["repo"]; present {
+		t.Fatalf("context-wide write must omit repo: %+v", gotBody)
 	}
-	v, present := gotBody["region"]
-	if !present || v != "" {
-		t.Fatalf("clear must send region:\"\", got %v (present=%v)", v, present)
+	if gotBody["context_id"] != "personal:u1" || gotBody["setting"] != "default-size" ||
+		gotBody["value"] != "shared-4x" {
+		t.Fatalf("body: %+v", gotBody)
 	}
 }
 
-// TestSetDefaultRegionErrorSurfacesDetail pins that a 4xx with the structured
+// Clear sends {clear:true} and omits value.
+func TestSetDevboxSettingClear(t *testing.T) {
+	var gotBody map[string]any
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	})
+	err := c.SetDevboxSetting(context.Background(), "company:c1", "", "default-region", "", true)
+	if err != nil {
+		t.Fatalf("SetDevboxSetting(clear): %v", err)
+	}
+	if v, present := gotBody["clear"]; !present || v != true {
+		t.Fatalf("clear must send clear:true, got %+v", gotBody)
+	}
+	if _, present := gotBody["value"]; present {
+		t.Fatalf("clear must omit value: %+v", gotBody)
+	}
+}
+
+// TestSetDevboxSettingErrorSurfacesDetail pins that a 4xx with the structured
 // body {"error":"<code>","detail":"<human>","selectable":[…]} surfaces the
 // HUMAN detail plus the selectable list — NOT the raw machine "error" code and
 // NOT the raw "HTTP 4xx: {…}" APIError string.
-func TestSetDefaultRegionErrorSurfacesDetail(t *testing.T) {
+func TestSetDevboxSettingErrorSurfacesDetail(t *testing.T) {
 	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -920,7 +984,7 @@ func TestSetDefaultRegionErrorSurfacesDetail(t *testing.T) {
 			"selectable": []string{"us-east", "eu-west"},
 		})
 	})
-	err := c.SetDefaultRegion(context.Background(), "atlantis")
+	err := c.SetDevboxSetting(context.Background(), "company:c1", "", "default-region", "atlantis", false)
 	if err == nil {
 		t.Fatal("a non-selectable slug must error")
 	}
@@ -935,5 +999,118 @@ func TestSetDefaultRegionErrorSurfacesDetail(t *testing.T) {
 	// the selectable list is appended so the user can pick a valid one.
 	if !strings.Contains(msg, "us-east") || !strings.Contains(msg, "eu-west") {
 		t.Fatalf("error must append the selectable list, got %q", msg)
+	}
+}
+
+// TestSetDevboxSettingUnstructured4xxSurfacesBodyVerbatim pins the OTHER arm
+// of the shared settingsPost error path (docs/plans/devbox-spawn-settings-
+// tests.md §10): a 4xx whose body is NOT the SelectableError shape surfaces
+// that body verbatim — never the raw "HTTP 4xx: …" APIError string. One
+// write method suffices: both SetDevboxSetting and SetRepoBuilderSize share
+// settingsPost, mirroring the plan's shared-helper reasoning.
+func TestSetDevboxSettingUnstructured4xxSurfacesBodyVerbatim(t *testing.T) {
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte("plain nope"))
+	})
+	err := c.SetDevboxSetting(context.Background(), "company:c1", "", "default-region", "iad", false)
+	if err == nil {
+		t.Fatal("a 4xx must error")
+	}
+	msg := err.Error()
+	if msg != "plain nope" {
+		t.Fatalf("an unstructured 4xx body must surface verbatim, got %q", msg)
+	}
+	if strings.Contains(msg, "HTTP 4") {
+		t.Fatalf("the raw APIError string must never reach the user, got %q", msg)
+	}
+}
+
+// --- SetRepoBuilderSize (POST /api/repos/builder-size) ---
+
+// The set path sends {repo, size} (no clear); the clear path sends
+// {repo, clear:true} and omits size. Both carry the bearer.
+func TestSetRepoBuilderSize(t *testing.T) {
+	const repo = "github:github.com/org/app"
+	var gotPath, gotMethod, gotAuth string
+	var gotBody map[string]any
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotMethod, gotAuth = r.URL.Path, r.Method, r.Header.Get("Authorization")
+		gotBody = nil
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	})
+	if err := c.SetRepoBuilderSize(context.Background(), repo, "shared-8x-16g", false); err != nil {
+		t.Fatalf("SetRepoBuilderSize: %v", err)
+	}
+	if gotMethod != http.MethodPost || gotPath != "/api/repos/builder-size" {
+		t.Fatalf("endpoint: %s %s", gotMethod, gotPath)
+	}
+	if gotAuth != "Bearer dev-bearer" {
+		t.Fatalf("auth: %q", gotAuth)
+	}
+	if gotBody["repo"] != repo || gotBody["size"] != "shared-8x-16g" {
+		t.Fatalf("body: %+v", gotBody)
+	}
+	if _, present := gotBody["clear"]; present {
+		t.Fatalf("a plain set must not send clear: %+v", gotBody)
+	}
+
+	if err := c.SetRepoBuilderSize(context.Background(), repo, "", true); err != nil {
+		t.Fatalf("SetRepoBuilderSize(clear): %v", err)
+	}
+	if v, present := gotBody["clear"]; !present || v != true {
+		t.Fatalf("clear must send clear:true, got %+v", gotBody)
+	}
+	if _, present := gotBody["size"]; present {
+		t.Fatalf("clear must omit size: %+v", gotBody)
+	}
+	if gotBody["repo"] != repo {
+		t.Fatalf("clear must still name the repo: %+v", gotBody)
+	}
+}
+
+// A builder-size 4xx surfaces through the same structured decode.
+func TestSetRepoBuilderSizeErrorSurfacesDetail(t *testing.T) {
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error":      "size-not-available",
+			"detail":     "unknown size",
+			"selectable": []string{"shared-8x", "shared-8x-16g"},
+		})
+	})
+	err := c.SetRepoBuilderSize(context.Background(), "github:github.com/org/app", "mega-999x", false)
+	if err == nil {
+		t.Fatal("an unknown size must error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "unknown size") || !strings.Contains(msg, "shared-8x-16g") {
+		t.Fatalf("error must carry the detail + selectable list, got %q", msg)
+	}
+}
+
+// --- DecodeSelectableError / Message (the shared structured-4xx decode) ---
+
+func TestDecodeSelectableError(t *testing.T) {
+	// Structured body → decoded, Message prefers detail + appends the list.
+	se, ok := DecodeSelectableError(`{"error":"size-required","detail":"pick a size","selectable":["a","b"]}`)
+	if !ok || se.Code != "size-required" || se.Detail != "pick a size" || len(se.Selectable) != 2 {
+		t.Fatalf("decode: %+v ok=%v", se, ok)
+	}
+	if got := se.Message(); got != "pick a size (available: a, b)" {
+		t.Fatalf("Message: %q", got)
+	}
+	// No detail → the code is the message.
+	se2, ok := DecodeSelectableError(`{"error":"region-required"}`)
+	if !ok || se2.Message() != "region-required" {
+		t.Fatalf("code-only: %+v (%q)", se2, se2.Message())
+	}
+	// Undecodable / empty bodies → not ok (callers fall back to the raw body).
+	if _, ok := DecodeSelectableError("not json"); ok {
+		t.Fatal("garbage must not decode")
+	}
+	if _, ok := DecodeSelectableError(`{"unrelated":true}`); ok {
+		t.Fatal("a body with neither code nor detail must not decode")
 	}
 }

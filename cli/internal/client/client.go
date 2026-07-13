@@ -193,17 +193,22 @@ type AttachBundle struct {
 // whether it fell back to the default branch (an inferred cwd branch with no
 // built image). ResolvedRef is empty for an --image <sha> spawn (no ref).
 //
-// Region/Source echo the region the server RESOLVED the spawn to (a region
-// SLUG, not a cloud code) and how it was chosen ("explicit" | "user" | "org" |
-// "system"); both are empty on an older server that doesn't echo them, so
-// cmdNew only prints the resolved-region line when Region is non-empty.
+// Region/Size echo the dimensions the server RESOLVED the spawn to (region is
+// a SLUG, not a cloud code); RegionSource/SizeSource say how each was chosen,
+// PER DIMENSION — "explicit" (the flag) | "repo" (the (context, repo)
+// refinement) | "context-wide" (the context's account-wide default). Region
+// and size resolve independently, so their sources may differ. A dimension an
+// older server doesn't echo decodes empty, and cmdNew omits it from the
+// resolved-defaults line.
 type CreateResult struct {
 	WorkspaceID    string `json:"workspace_id"`
 	ResolvedRef    string `json:"resolved_ref"`
 	ResolvedCommit string `json:"resolved_commit"`
 	Fallback       bool   `json:"fallback"`
 	Region         string `json:"region"`
-	Source         string `json:"source"`
+	RegionSource   string `json:"region_source"`
+	Size           string `json:"size"`
+	SizeSource     string `json:"size_source"`
 }
 
 // Create spawns a workspace. repo is the canonical forge-qualified id
@@ -340,47 +345,93 @@ func (c *Client) Regions(ctx context.Context, contextID string) (*RegionsResult,
 	return &out, nil
 }
 
-// SetDefaultRegion sets (or, with an empty slug, clears) the caller's
-// server-side default region (POST /api/user/default-region). The slug is a
-// logical region id validated authoritatively server-side; a non-selectable
-// slug returns a 4xx whose body message is surfaced verbatim. An empty slug
-// sends {"region": ""}, which the server treats as a clear.
-func (c *Client) SetDefaultRegion(ctx context.Context, slug string) error {
-	if err := c.do(ctx, http.MethodPost, "/api/user/default-region", map[string]string{"region": slug}, nil); err != nil {
+// SelectableError is the decoded structured 4xx body the settings writes and
+// the create edge share: {"error":"<code>","detail":"<human>",
+// "selectable":[…]} — a machine code, a human message, and the values the
+// caller could have picked (region slugs or size ids).
+type SelectableError struct {
+	Code       string   `json:"error"`
+	Detail     string   `json:"detail"`
+	Selectable []string `json:"selectable"`
+}
+
+// DecodeSelectableError decodes a 4xx body into a SelectableError. ok is
+// false when the body isn't this shape (undecodable, or carries neither a
+// code nor a detail) — the caller should then surface the raw body/error so
+// no information is lost.
+func DecodeSelectableError(body string) (SelectableError, bool) {
+	var e SelectableError
+	if json.Unmarshal([]byte(body), &e) == nil && (e.Code != "" || e.Detail != "") {
+		return e, true
+	}
+	return SelectableError{}, false
+}
+
+// Message renders the human message: the `detail` (falling back to the
+// machine code when the server sent none), with the selectable list appended
+// so the user can pick a valid value.
+func (e SelectableError) Message() string {
+	msg := e.Detail
+	if msg == "" {
+		msg = e.Code
+	}
+	if len(e.Selectable) > 0 {
+		msg += " (available: " + strings.Join(e.Selectable, ", ") + ")"
+	}
+	return msg
+}
+
+// settingsPost POSTs a settings write and surfaces a structured 4xx
+// (SelectableError shape) as its human message rather than the raw
+// "HTTP 4xx: {…json…}" APIError string; an unstructured 4xx body is surfaced
+// verbatim.
+func (c *Client) settingsPost(ctx context.Context, path string, body any) error {
+	if err := c.do(ctx, http.MethodPost, path, body, nil); err != nil {
 		var ae *APIError
 		if errors.As(err, &ae) && ae.Status >= 400 && ae.Status < 500 {
-			// Surface the server's 4xx message (it carries the reason + the
-			// selectable list for a non-selectable slug) rather than the raw
-			// "HTTP 4xx: {…json…}" APIError string.
-			return errors.New(defaultRegionErrMsg(ae.Body))
+			if se, ok := DecodeSelectableError(ae.Body); ok {
+				return errors.New(se.Message())
+			}
+			return errors.New(ae.Body)
 		}
 		return err
 	}
 	return nil
 }
 
-// defaultRegionErrMsg pulls the human message out of the POST
-// /api/user/default-region 4xx body ({"error":"<code>","detail":"<human>",
-// "selectable":[…]}); it prefers the human `detail` over the machine `error`
-// code, appends the selectable list when present, and on an undecodable body
-// falls back to the raw body so no information is lost.
-func defaultRegionErrMsg(body string) string {
-	var b struct {
-		Error      string   `json:"error"`
-		Detail     string   `json:"detail"`
-		Selectable []string `json:"selectable"`
+// SetDevboxSetting writes (or, with clear, clears) one context-anchored spawn
+// default via POST /api/devbox-settings. contextID is the acting context's
+// form-value ("personal:<id>" | "company:<id>"); repo optionally refines the
+// scope to a (context, repo) pair — empty means the context-wide scope;
+// setting is "default-region" | "default-size". Validity is authoritative
+// server-side (a structured 4xx surfaces its detail + selectable list; a
+// company write by a non-admin is a 403).
+func (c *Client) SetDevboxSetting(ctx context.Context, contextID, repo, setting, value string, clear bool) error {
+	body := map[string]any{"context_id": contextID, "setting": setting}
+	if repo != "" {
+		body["repo"] = repo
 	}
-	if json.Unmarshal([]byte(body), &b) == nil && (b.Detail != "" || b.Error != "") {
-		msg := b.Detail
-		if msg == "" {
-			msg = b.Error
-		}
-		if len(b.Selectable) > 0 {
-			msg += " (available: " + strings.Join(b.Selectable, ", ") + ")"
-		}
-		return msg
+	if clear {
+		body["clear"] = true
+	} else {
+		body["value"] = value
 	}
-	return body
+	return c.settingsPost(ctx, "/api/devbox-settings", body)
+}
+
+// SetRepoBuilderSize sets (or, with clear, clears) the per-repo BUILDER size
+// via POST /api/repos/builder-size — the guest managed image builds for the
+// repo run on. Builds carry no context, so this is repo-scoped only; a
+// cleared repo reverts to the server's global default. Validity is
+// authoritative server-side (same structured-4xx surface as SetDevboxSetting).
+func (c *Client) SetRepoBuilderSize(ctx context.Context, repo, size string, clear bool) error {
+	body := map[string]any{"repo": repo}
+	if clear {
+		body["clear"] = true
+	} else {
+		body["size"] = size
+	}
+	return c.settingsPost(ctx, "/api/repos/builder-size", body)
 }
 
 // Get reads one workspace (snapshot when cursor is empty; long-poll otherwise,

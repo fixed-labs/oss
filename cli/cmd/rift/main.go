@@ -77,6 +77,10 @@ func main() {
 		err = cmdSetDefaultContext(ctx, args)
 	case "set-default-region":
 		err = cmdSetDefaultRegion(ctx, args)
+	case "set-default-size":
+		err = cmdSetDefaultSize(ctx, args)
+	case "set-repo-builder-size":
+		err = cmdSetRepoBuilderSize(ctx, args)
 	case "sizes":
 		err = cmdSizes(ctx, args)
 	case "regions":
@@ -127,7 +131,9 @@ func usage() {
 		"  rift new [--size S] [--region R] [--repo REPO] [--forge F] [--context CTX] [--ref BRANCH | --image SHA]\n"+
 		"  rift ls [--context CTX]\n"+
 		"  rift set-default-context [CTX]\n"+
-		"  rift set-default-region [SLUG | --clear]\n"+
+		"  rift set-default-region [--repo R] [--context CTX] [SLUG | --clear]\n"+
+		"  rift set-default-size [--repo R] [--context CTX] [SIZE | --clear]\n"+
+		"  rift set-repo-builder-size REPO [SIZE | --clear]\n"+
 		"  rift sizes\n"+
 		"  rift regions\n"+
 		"  rift connect [--new] [--session NAME] <id>\n"+

@@ -443,100 +443,353 @@ func cmdNew(ctx context.Context, args []string) error {
 		fallback = true
 	}
 
-	rctx, cancel := ctxTimeout(ctx, 30*time.Second)
-	defer cancel()
-	res, err := c.Create(rctx, *repo, *size, *region, cid, sendRef, *image, fallback)
-	if err != nil {
-		return explainCreate(err, *repo)
+	// Force-select loop (INV-3: the server never substitutes a missing
+	// region/size — it 400s {"error":"<dim>-required","selectable":[…]}).
+	// On a TTY, resolve each required dimension with a numbered picker over
+	// the server's list and RE-ISSUE the create with the pick filled in; both
+	// dimensions may be missing, so this runs at most one picker round per
+	// dimension (a dimension re-reported after its pick means the server
+	// rejected the re-issue — surface it rather than loop). Non-TTY (CI):
+	// list the selectable values and exit non-zero, never substituting.
+	pickedRegion, pickedSize := *region, *size
+	picked := map[string]bool{}
+	var stdin *bufio.Reader
+	var res *client.CreateResult
+	for {
+		rctx, cancel := ctxTimeout(ctx, 30*time.Second)
+		res, err = c.Create(rctx, *repo, pickedSize, pickedRegion, cid, sendRef, *image, fallback)
+		cancel()
+		if err == nil {
+			break
+		}
+		dim, se, ok := requiredCreateDimension(err)
+		if !ok {
+			return explainCreate(err, *repo)
+		}
+		if !isTTY() || len(se.Selectable) == 0 || picked[dim] {
+			return requiredDimensionErr(dim, se)
+		}
+		picked[dim] = true
+		if stdin == nil {
+			// One reader shared across rounds: a bufio.Reader may buffer past
+			// its own line, so a second reader over os.Stdin would miss input.
+			stdin = bufio.NewReader(os.Stdin)
+		}
+		choice, perr := pickerPrompt(stdin, dim, se)
+		if perr != nil {
+			return perr
+		}
+		if dim == "region" {
+			pickedRegion = choice
+		} else {
+			pickedSize = choice
+		}
 	}
 	fmt.Printf("Created %s (%s, %s). Connecting…\n", res.WorkspaceID, *repo, describeResolved(res))
-	if line := describeRegion(res); line != "" {
+	if line := describeSpawnDefaults(res); line != "" {
 		fmt.Println(line)
 	}
 	return connect(ctx, c, res.WorkspaceID, connectOpts{})
 }
 
-// describeRegion renders the server's resolved-region echo for the `new`
-// success output: "Using region <slug> (<how>)", where <how> explains the
-// resolution source ("explicit" → "you chose it", user/org/system → the
-// default it fell back to). Empty when the server echoes no region (an older
-// server, or a response without the field) — the caller then prints nothing.
-func describeRegion(r *client.CreateResult) string {
-	if r.Region == "" {
-		return ""
-	}
-	var how string
-	switch r.Source {
-	case "explicit":
-		how = "you chose it"
-	case "user":
-		how = "your default"
-	case "org":
-		how = "your org default"
-	case "system":
-		how = "the system default"
-	default:
-		how = r.Source
-	}
-	if how == "" {
-		return fmt.Sprintf("Using region %s", r.Region)
-	}
-	return fmt.Sprintf("Using region %s (%s)", r.Region, how)
+// isTTY reports whether the CLI is running interactively — both stdin AND
+// stdout are terminals (the same gate cmdLogin uses for the device-flow UI).
+// A package var so tests can force either arm: the test harness's stdin/
+// stdout are files/pipes, never real terminals, so the true term.IsTerminal
+// gate cannot be exercised there.
+var isTTY = func() bool {
+	return term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd()))
 }
 
-// cmdSetDefaultRegion sets the caller's SERVER-side default region (unlike
-// set-default-context, which writes the local config): the region default is
-// server-side so it stays consistent across the CLI and web UI on every device.
-// With an argument (a region slug) it does an ADVISORY pre-flight — checks the
-// slug appears in GET /api/regions and warns if not — then POSTs it; the
-// AUTHORITATIVE selectability gate runs server-side at that POST. An empty
-// argument or --clear clears the default (server-side).
+// requiredCreateDimension classifies a Create error as one of the
+// force-select 400s ({"error":"region-required"|"size-required",…}). ok is
+// true only for those two codes; the decoded body rides along for the picker
+// (TTY) or the listing error (non-TTY). Everything else — including the
+// explicit-invalid …-not-available codes — goes to explainCreate.
+func requiredCreateDimension(err error) (string, client.SelectableError, bool) {
+	var ae *client.APIError
+	if !asAPIError(err, &ae) {
+		return "", client.SelectableError{}, false
+	}
+	se, decoded := client.DecodeSelectableError(ae.Body)
+	if !decoded {
+		return "", client.SelectableError{}, false
+	}
+	switch se.Code {
+	case "region-required":
+		return "region", se, true
+	case "size-required":
+		return "size", se, true
+	}
+	return "", se, false
+}
+
+// requiredDimensionErr renders a force-select 400 as a terminal error (the
+// non-TTY arm, plus the TTY dead ends: an empty selectable list, or a
+// dimension the server re-reports after a pick). main prints it to stderr and
+// exits non-zero; the value is never substituted (CI-safe).
+func requiredDimensionErr(dim string, se client.SelectableError) error {
+	msg := se.Detail
+	if msg == "" {
+		msg = "a " + dim + " is required"
+	}
+	if len(se.Selectable) > 0 {
+		msg += " — selectable: " + strings.Join(se.Selectable, ", ")
+	}
+	return fmt.Errorf("%s (re-run with --%s)", msg, dim)
+}
+
+// pickerPrompt runs the numbered force-select picker over the server's
+// selectable list (the cmdSetDefaultContext numbered-stdin precedent, in a
+// loop): print the server's detail plus a 1-based list, read a selection,
+// RE-PROMPT on garbage (a non-number or out-of-range entry), abort on an
+// empty line / EOF. It reads from an injected reader rather than os.Stdin
+// directly so the loop is unit-testable without a real TTY (the TTY gate
+// itself is the isTTY var, decided by the caller).
+func pickerPrompt(in *bufio.Reader, dim string, se client.SelectableError) (string, error) {
+	detail := se.Detail
+	if detail == "" {
+		detail = "a " + dim + " is required"
+	}
+	fmt.Println(detail)
+	for i, v := range se.Selectable {
+		fmt.Printf("%d) %s\n", i+1, v)
+	}
+	for {
+		fmt.Printf("Select a %s [1-%d]: ", dim, len(se.Selectable))
+		line, rerr := in.ReadString('\n')
+		line = strings.TrimSpace(line)
+		if line == "" {
+			// Empty line or EOF (Ctrl-D) with nothing entered → abort.
+			return "", fmt.Errorf("no %s selected", dim)
+		}
+		n, cerr := strconv.Atoi(line)
+		if cerr != nil || n < 1 || n > len(se.Selectable) {
+			fmt.Printf("invalid selection %q — enter a number between 1 and %d\n", line, len(se.Selectable))
+			continue // re-prompt; a post-EOF retry reads "" and aborts above
+		}
+		_ = rerr // a trailing read error is harmless once a valid line was parsed
+		return se.Selectable[n-1], nil
+	}
+}
+
+// describeSpawnDefaults renders the server's per-dimension resolution echo
+// for the `new` success output, e.g. "Using region iad (account default) ·
+// size shared-4x (repo default)". Region and size resolve independently
+// (their sources may differ); a dimension the server didn't echo (an older
+// server) is omitted, and the whole line is empty when neither is echoed —
+// the caller then prints nothing.
+func describeSpawnDefaults(r *client.CreateResult) string {
+	render := func(name, value, source string) string {
+		s := name + " " + value
+		if how := describeSource(source); how != "" {
+			s += " (" + how + ")"
+		}
+		return s
+	}
+	var parts []string
+	if r.Region != "" {
+		parts = append(parts, render("region", r.Region, r.RegionSource))
+	}
+	if r.Size != "" {
+		parts = append(parts, render("size", r.Size, r.SizeSource))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "Using " + strings.Join(parts, " · ")
+}
+
+// describeSource maps a per-dimension resolution-source token to its display
+// wording: "explicit" (the flag), "repo default" (the (context, repo)
+// refinement), "account default" (the context-wide value). An unknown token
+// renders verbatim (forward-compat); empty renders empty (no parenthetical).
+func describeSource(source string) string {
+	switch source {
+	case "explicit":
+		return "explicit"
+	case "repo":
+		return "repo default"
+	case "context-wide":
+		return "account default"
+	}
+	return source
+}
+
+// cmdSetDefaultRegion / cmdSetDefaultSize set (or clear) a context-anchored
+// spawn default on the SERVER (unlike set-default-context, which writes the
+// local config): the defaults are server-side so they stay consistent across
+// the CLI and web UI on every device. Both dimensions share setDefaultSetting.
 func cmdSetDefaultRegion(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("set-default-region", flag.ContinueOnError)
-	clear := fs.Bool("clear", false, "clear your default region")
-	if err := fs.Parse(args); err != nil {
+	return setDefaultSetting(ctx, args, "default-region")
+}
+
+func cmdSetDefaultSize(ctx context.Context, args []string) error {
+	return setDefaultSetting(ctx, args, "default-size")
+}
+
+// setDefaultSetting drives one POST /api/devbox-settings write. The write is
+// scoped to the acting context — resolved exactly as cmdNew resolves it
+// (--context flag, else the config's set-default-context value) — and
+// optionally refined to one repo via --repo (absent → context-wide). An empty
+// value argument or --clear clears the default. Both dimensions run an
+// ADVISORY pre-flight that warns when the value isn't in the dimension's
+// catalog listing (GET /api/regions / GET /api/workspaces/sizes — a typo
+// catch); the AUTHORITATIVE gate runs server-side at the POST — the edge's
+// 4xx (detail + selectable list) is surfaced either way.
+func setDefaultSetting(ctx context.Context, args []string, setting string) error {
+	dim := strings.TrimPrefix(setting, "default-") // "region" | "size"
+	fs := flag.NewFlagSet("set-"+setting, flag.ContinueOnError)
+	repoFlag := fs.String("repo", "", "scope the default to this repo (owner/name, a clone URL, or forge:host/owner/name); absent → context-wide")
+	clear := fs.Bool("clear", false, "clear the default")
+	contextID := fs.String("context", "", "acting context (personal:<id> | company:<id>); defaults to your `rift set-default-context`")
+	pos, err := parseInterleaved(fs, args)
+	if err != nil {
 		return err
 	}
+	c, cfg, err := authedClient()
+	if err != nil {
+		return err
+	}
+	cid := *contextID
+	if cid == "" {
+		cid = cfg.DefaultContext
+	}
+	if cid == "" {
+		return fmt.Errorf("no context set — run `rift set-default-context` or pass --context <ctx>")
+	}
+	repo := ""
+	if *repoFlag != "" {
+		if repo, err = resolveRepoIdentity(*repoFlag, ""); err != nil {
+			return err
+		}
+	}
+	scope := "context-wide"
+	if repo != "" {
+		scope = repo
+	}
+	rctx, cancel := ctxTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	// Clear: an explicit --clear, or no value argument.
+	if *clear || len(pos) < 1 {
+		if err := c.SetDevboxSetting(rctx, cid, repo, setting, "", true); err != nil {
+			return err
+		}
+		fmt.Printf("Default %s cleared (%s, %s).\n", dim, cid, scope)
+		return nil
+	}
+
+	value := pos[0]
+	warnUnknownSettingValue(rctx, c, dim, cid, value)
+	if err := c.SetDevboxSetting(rctx, cid, repo, setting, value, false); err != nil {
+		return err
+	}
+	fmt.Printf("Default %s set to %s (%s, %s).\n", dim, value, cid, scope)
+	return nil
+}
+
+// warnUnknownSettingValue is the ADVISORY pre-flight shared by both
+// set-default dimensions (UX only): it reads the dimension's catalog listing
+// (`rift regions` / `rift sizes`) and warns on stderr when value isn't in it,
+// catching a typo before the POST. The authoritative gate runs server-side at
+// the POST regardless — an unlisted value is still sent and the server's 4xx
+// is surfaced — and a failed catalog read is silently skipped: the pre-flight
+// never blocks the write.
+func warnUnknownSettingValue(ctx context.Context, c *client.Client, dim, contextID, value string) {
+	var known []string
+	switch dim {
+	case "region":
+		res, err := c.Regions(ctx, contextID)
+		if err != nil {
+			return
+		}
+		for _, r := range res.Regions {
+			known = append(known, r.Slug)
+		}
+	case "size":
+		cat, err := c.Sizes(ctx)
+		if err != nil {
+			return
+		}
+		for _, s := range cat.Sizes {
+			known = append(known, s.ID)
+		}
+	default:
+		return
+	}
+	for _, k := range known {
+		if k == value {
+			return
+		}
+	}
+	fmt.Fprintf(os.Stderr, "warning: %q is not in `rift %ss` — sending anyway; the server will validate it.\n", value, dim)
+}
+
+// cmdSetRepoBuilderSize sets (or clears) the per-repo BUILDER size — the VM
+// guest managed image builds for the repo run on. Builds carry no context, so
+// this is repo-scoped only (no --context/--repo split); an empty size or
+// --clear reverts the repo to the server's global default. Validity is
+// authoritative server-side.
+func cmdSetRepoBuilderSize(ctx context.Context, args []string) error {
+	const usage = "rift set-repo-builder-size <repo> [SIZE | --clear]"
+	fs := flag.NewFlagSet("set-repo-builder-size", flag.ContinueOnError)
+	clear := fs.Bool("clear", false, "clear the repo's builder size (revert to the global default)")
+	pos, err := parseInterleaved(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) < 1 {
+		return fmt.Errorf("usage: %s", usage)
+	}
 	c, _, err := authedClient()
+	if err != nil {
+		return err
+	}
+	repo, err := resolveRepoIdentity(pos[0], "")
 	if err != nil {
 		return err
 	}
 	rctx, cancel := ctxTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	// Clear: an explicit --clear, or no slug argument.
-	if *clear || fs.NArg() < 1 {
-		if err := c.SetDefaultRegion(rctx, ""); err != nil {
+	// Clear: an explicit --clear, or no size argument.
+	if *clear || len(pos) < 2 {
+		if err := c.SetRepoBuilderSize(rctx, repo, "", true); err != nil {
 			return err
 		}
-		fmt.Println("Default region cleared.")
+		fmt.Printf("Builder size for %s cleared (global default applies).\n", repo)
 		return nil
 	}
-
-	slug := fs.Arg(0)
-	// Advisory pre-flight (UX only): warn early if the slug isn't in the
-	// selectable list, catching a typo before the POST. The authoritative
-	// region-selectable? gate runs server-side at the POST regardless — an
-	// unlisted slug is still sent and the server's 4xx is surfaced verbatim.
-	res, rerr := c.Regions(rctx, "")
-	if rerr == nil {
-		found := false
-		for _, r := range res.Regions {
-			if r.Slug == slug {
-				found = true
-				break
-			}
-		}
-		if !found {
-			fmt.Fprintf(os.Stderr, "warning: %q is not in `rift regions` — sending anyway; the server will validate it.\n", slug)
-		}
-	}
-
-	if err := c.SetDefaultRegion(rctx, slug); err != nil {
+	size := pos[1]
+	if err := c.SetRepoBuilderSize(rctx, repo, size, false); err != nil {
 		return err
 	}
-	fmt.Printf("Default region set to %s.\n", slug)
+	fmt.Printf("Builder size for %s set to %s.\n", repo, size)
 	return nil
+}
+
+// parseInterleaved parses fs's flags wherever they appear in args — before,
+// between, or after positionals — and returns the positionals in order. The
+// stdlib flag package stops flag parsing at the first positional, which would
+// silently IGNORE a trailing flag (`rift set-default-region iad --repo r`
+// writing the wrong scope); the documented grammar puts flags after the
+// positionals (`rift set-repo-builder-size <REPO> [--clear] <SIZE>`), so this
+// loop re-parses past each positional instead. An unknown flag still errors
+// loudly wherever it sits — fs.Parse rejects it on the pass that reaches it.
+func parseInterleaved(fs *flag.FlagSet, args []string) ([]string, error) {
+	var pos []string
+	for {
+		if err := fs.Parse(args); err != nil {
+			return nil, err
+		}
+		rest := fs.Args()
+		if len(rest) == 0 {
+			return pos, nil
+		}
+		pos = append(pos, rest[0])
+		args = rest[1:]
+	}
 }
 
 // describeResolved renders the api's resolved-selection echo for the `new`
@@ -590,12 +843,15 @@ func inferBranchRef() string {
 // is the canonical identity the api looked up — naming it lets the developer
 // compare against what CI registered.
 //
-// It branches on the response BODY's `error` CODE (the set of boot-selection
-// error codes below), not just the HTTP status: a 409 can now be any of
-// image-not-ready / image-not-ready-for-ref / ambiguous-image, each with its
-// own message and carried data (available_refs / candidates). When the body
-// has no recognized image-error code (a non-image error, or an undecodable
-// body) it falls back to the prior status-based messages.
+// It branches on the response BODY's `error` CODE (the boot-selection and
+// spawn-dimension codes below), not just the HTTP status: a 409 can now be
+// any of image-not-ready / image-not-ready-for-ref / ambiguous-image, each
+// with its own message and carried data (available_refs / candidates), and a
+// 400 can be an explicit-invalid region/size (…-not-available, carrying the
+// selectable list). The force-select …-required codes never reach here — the
+// cmdNew create loop intercepts them for the picker / listing error. When the
+// body has no recognized code (or is undecodable) it falls back to the prior
+// status-based messages.
 func explainCreate(err error, repo string) error {
 	var ae *client.APIError
 	if !asAPIError(err, &ae) {
@@ -626,6 +882,12 @@ func explainCreate(err error, repo string) error {
 		return errors.New(msg)
 	case "image-prefix-too-short":
 		return errors.New("--image needs at least 7 hex chars of the commit SHA")
+	case "region-not-available", "size-not-available":
+		// An EXPLICIT --region/--size the server rejected (unknown or
+		// retired): fail with the server's detail + the selectable list —
+		// never substituted, and never a picker (the flag was deliberate).
+		se, _ := client.DecodeSelectableError(ae.Body)
+		return errors.New(se.Message())
 	}
 	// No recognized image-error code — fall back to status-based messages.
 	switch ae.Status {
