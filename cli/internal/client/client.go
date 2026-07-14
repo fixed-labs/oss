@@ -292,6 +292,49 @@ func (c *Client) imagePin(ctx context.Context, repo, commit, leaf string) error 
 	return c.do(ctx, http.MethodPost, path, nil, nil)
 }
 
+// --- Watched refs (GET /api/repos/watched?repo=… + watch/unwatch, FIX-202) ---
+
+// WatchedRef mirrors one entry of the server's watched-refs response: a git ref
+// this repo builds images for. Status is the server-DERIVED lifecycle of the
+// ref's build slot ("building" | "pending" | "idle"), never stored. AddedBy is
+// the user-id that watched it (the managed-builder sentinel for the
+// onboarding-seeded default branch); AddedAt is epoch-millis.
+type WatchedRef struct {
+	Ref     string `json:"ref"`
+	Status  string `json:"status"`
+	AddedBy string `json:"added_by"`
+	AddedAt int64  `json:"added_at"`
+}
+
+// ListWatched reads the watched refs for a repo, newest-first. repo is the
+// canonical forge-qualified id; it rides as a percent-encoded ?repo= query
+// parameter (same reasoning as ListImages — the canonical id can't be a path
+// segment).
+func (c *Client) ListWatched(ctx context.Context, repo string) ([]WatchedRef, error) {
+	path := "/api/repos/watched?repo=" + url.QueryEscape(repo)
+	var out []WatchedRef
+	if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// Watch / Unwatch start / stop watching a git ref on a repo. The ref rides in
+// the JSON body ({"ref": …}) — a ref carries '/'s, so it is a body field, never
+// a path segment (the repo is still the percent-encoded ?repo= query param).
+func (c *Client) Watch(ctx context.Context, repo, ref string) error {
+	return c.setWatch(ctx, repo, ref, "watch")
+}
+
+func (c *Client) Unwatch(ctx context.Context, repo, ref string) error {
+	return c.setWatch(ctx, repo, ref, "unwatch")
+}
+
+func (c *Client) setWatch(ctx context.Context, repo, ref, leaf string) error {
+	path := "/api/repos/" + leaf + "?repo=" + url.QueryEscape(repo)
+	return c.do(ctx, http.MethodPost, path, map[string]string{"ref": ref}, nil)
+}
+
 // List does a single absolute read (no cursor → snapshot).
 func (c *Client) List(ctx context.Context) ([]ListItem, error) {
 	var out struct {

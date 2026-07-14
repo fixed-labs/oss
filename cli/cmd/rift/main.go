@@ -103,6 +103,12 @@ func main() {
 		err = cmdSecrets(ctx, args)
 	case "image":
 		err = cmdImage(ctx, args)
+	case "watch":
+		err = cmdWatch(ctx, args)
+	case "unwatch":
+		err = cmdUnwatch(ctx, args)
+	case "watched":
+		err = cmdWatched(ctx, args)
 	case "run":
 		err = cmdRun(ctx, args)
 	case "init":
@@ -141,6 +147,7 @@ func usage() {
 		"  rift resize <id> --size S\n"+
 		"  rift keepalive <id> [--for DURATION]\n"+
 		"  rift image ls|pin <sha>|unpin <sha>\n"+
+		"  rift watch <ref> | unwatch <ref> | watched\n"+
 		"  rift secrets status|map <key> <source>\n"+
 		"  rift run --secret NAME [--secret NAME...] -- CMD   (in-VM: inject a secret)\n"+
 		"  rift run --shell --secret NAME ...                 (subshell with secrets)\n"+

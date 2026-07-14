@@ -172,6 +172,82 @@ func TestPinUnpinImage(t *testing.T) {
 	}
 }
 
+func TestListWatched(t *testing.T) {
+	const repo = "github:github.com/org/app"
+	cl := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/repos/watched" || r.Method != http.MethodGet {
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+		// Same wire form as ListImages: the canonical id rides percent-encoded
+		// in ?repo= (its ':' and '/' must not appear raw)…
+		if !strings.Contains(r.URL.RawQuery, "repo=github%3Agithub.com%2Forg%2Fapp") {
+			t.Errorf("raw query not percent-encoded: %q", r.URL.RawQuery)
+		}
+		// …and the DECODED value is the behavioral anchor.
+		if got := r.URL.Query().Get("repo"); got != repo {
+			t.Errorf("repo: %q, want %q", got, repo)
+		}
+		_ = json.NewEncoder(w).Encode([]map[string]any{
+			{"ref": "refs/heads/main", "status": "building", "added_by": "u-1", "added_at": 200},
+			{"ref": "refs/heads/dev", "status": "idle", "added_by": "managed-builder", "added_at": 100},
+		})
+	})
+	items, err := cl.ListWatched(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("ListWatched: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("items: %+v", items)
+	}
+	if items[0].Ref != "refs/heads/main" || items[0].Status != "building" ||
+		items[0].AddedBy != "u-1" || items[0].AddedAt != 200 {
+		t.Fatalf("item0: %+v", items[0])
+	}
+	if items[1].Ref != "refs/heads/dev" || items[1].Status != "idle" {
+		t.Fatalf("item1: %+v", items[1])
+	}
+}
+
+func TestWatchUnwatch(t *testing.T) {
+	const repo = "github:github.com/org/app"
+	const ref = "refs/heads/feature"
+	var paths, repos, bodyRefs []string
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method: %s", r.Method)
+		}
+		// Same wire form as the image writes: percent-encoded raw ?repo=…
+		if !strings.Contains(r.URL.RawQuery, "repo=github%3Agithub.com%2Forg%2Fapp") {
+			t.Errorf("raw query not percent-encoded: %q", r.URL.RawQuery)
+		}
+		// …and the ref rides the JSON body, NOT the URL (it carries '/'s).
+		var body map[string]string
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		paths = append(paths, r.URL.Path)
+		repos = append(repos, r.URL.Query().Get("repo"))
+		bodyRefs = append(bodyRefs, body["ref"])
+		_ = json.NewEncoder(w).Encode(map[string]any{"ref": body["ref"], "watched": true})
+	})
+	if err := c.Watch(context.Background(), repo, ref); err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if err := c.Unwatch(context.Background(), repo, ref); err != nil {
+		t.Fatalf("Unwatch: %v", err)
+	}
+	want := []string{"/api/repos/watch", "/api/repos/unwatch"}
+	if len(paths) != 2 || paths[0] != want[0] || paths[1] != want[1] {
+		t.Fatalf("paths: %v", paths)
+	}
+	for i := range paths {
+		if repos[i] != repo {
+			t.Fatalf("repo query param on %s: %q, want %q", paths[i], repos[i], repo)
+		}
+		if bodyRefs[i] != ref {
+			t.Fatalf("body ref on %s: %q, want %q", paths[i], bodyRefs[i], ref)
+		}
+	}
+}
+
 func TestList(t *testing.T) {
 	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/workspaces" || r.Method != http.MethodGet {
