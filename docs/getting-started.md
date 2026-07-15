@@ -77,10 +77,10 @@ your repo, boots a VM, and returns a workspace id. Useful flags:
 - `rift new --region <fly-region>` — pick a compute region.
 - `rift new --ref <branch>` (e.g. `--ref main`) or `--image <commit-sha>` — override
   which built image the box boots from (mutually exclusive).
-- `rift new --context <ctx>` — scope the workspace to a named context (e.g. a
-  personal vs. an organization account). `rift ls --context <ctx>` filters the
-  list to it, and `rift set-default-context <ctx>` picks the default used when
-  `--context` is omitted.
+The box always bills and configures against the account that **owns the repo**
+(derived from the repo's owner) — there is no context to choose. The former
+`--context` flag (on `rift new` / `rift ls`) and the `set-default-context`
+command have been removed.
 
 The box takes a short while to reach the running state; `rift connect` (next step)
 waits for it.

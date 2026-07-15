@@ -34,7 +34,7 @@ func TestCreateSendsBodyAndAuth(t *testing.T) {
 	})
 	// the repo wire value is the canonical forge-qualified string (what
 	// cmd/rift's canonicalRepo produces and the api stores/returns)
-	res, err := c.Create(context.Background(), "github:github.com/org/app", "shared-2x", "iad", "company:c1", "refs/heads/main", "", true)
+	res, err := c.Create(context.Background(), "github:github.com/org/app", "shared-2x", "iad", "refs/heads/main", "", true)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -48,9 +48,12 @@ func TestCreateSendsBodyAndAuth(t *testing.T) {
 		t.Fatalf("auth: %q", auth)
 	}
 	if got["repo"] != "github:github.com/org/app" || got["size"] != "shared-2x" ||
-		got["region"] != "iad" || got["context_id"] != "company:c1" ||
+		got["region"] != "iad" ||
 		got["ref"] != "refs/heads/main" || got["fallback_to_default"] != true {
 		t.Fatalf("body: %+v", got)
+	}
+	if _, present := got["context_id"]; present {
+		t.Fatalf("Create body must not send context_id: %+v", got)
 	}
 }
 
@@ -60,7 +63,7 @@ func TestCreateOmitsBlankOptionals(t *testing.T) {
 		_ = json.NewDecoder(r.Body).Decode(&got)
 		_ = json.NewEncoder(w).Encode(map[string]any{"workspace_id": "x"})
 	})
-	_, _ = c.Create(context.Background(), "r", "", "", "company:c1", "", "", false)
+	_, _ = c.Create(context.Background(), "r", "", "", "", "", false)
 	if _, ok := got["size"]; ok {
 		t.Fatal("blank size should be omitted")
 	}
@@ -84,7 +87,7 @@ func TestCreateTypedError(t *testing.T) {
 		w.WriteHeader(http.StatusConflict)
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "image-not-ready"})
 	})
-	_, err := c.Create(context.Background(), "r", "", "", "c", "", "", false)
+	_, err := c.Create(context.Background(), "r", "", "", "", "", false)
 	var ae *APIError
 	if !errors.As(err, &ae) || ae.Status != http.StatusConflict {
 		t.Fatalf("want 409 APIError, got %v", err)
@@ -269,9 +272,9 @@ func TestList(t *testing.T) {
 }
 
 // ListItem.Context decodes the `context` json field. A /api/workspaces row
-// carrying "context":"company:c1" must populate ListItem.Context, which is what
-// `ls --context` filters on client-side; a missing/renamed json tag would
-// silently make that filter match nothing.
+// carrying "context":"company:c1" must populate ListItem.Context (the box's
+// billed owning context, server-populated for display); a missing or renamed
+// json tag would silently drop it.
 func TestListDecodesContext(t *testing.T) {
 	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -293,39 +296,6 @@ func TestListDecodesContext(t *testing.T) {
 	}
 	if items[1].Context != "" {
 		t.Fatalf("row 1 (no context) must decode to empty, got %q", items[1].Context)
-	}
-}
-
-// Contexts() decodes the {"contexts":[…]} WRAPPER object, not a bare array
-// (decoding a bare slice would be wrong). It must return the
-// items from the .Contexts field — form_value + label — Personal-first ordering
-// preserved as the server sent it.
-func TestContextsDecodesWrapper(t *testing.T) {
-	var gotPath, gotMethod string
-	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
-		gotPath, gotMethod = r.URL.Path, r.Method
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"contexts": []map[string]any{
-				{"form_value": "personal:u1", "label": "Personal"},
-				{"form_value": "company:c1", "label": "Acme"},
-			},
-		})
-	})
-	items, err := c.Contexts(context.Background())
-	if err != nil {
-		t.Fatalf("Contexts: %v", err)
-	}
-	if gotMethod != http.MethodGet || gotPath != "/api/contexts" {
-		t.Fatalf("endpoint: %s %s", gotMethod, gotPath)
-	}
-	if len(items) != 2 {
-		t.Fatalf("items: %+v", items)
-	}
-	if items[0].FormValue != "personal:u1" || items[0].Label != "Personal" {
-		t.Fatalf("item 0: %+v", items[0])
-	}
-	if items[1].FormValue != "company:c1" || items[1].Label != "Acme" {
-		t.Fatalf("item 1: %+v", items[1])
 	}
 }
 
@@ -846,10 +816,11 @@ func TestPostSecretAccessNilExitEncodesNull(t *testing.T) {
 
 // TestRegions decodes the full read-surface: the *string effective/pinned
 // pointers (both present), and the regions slice with every field. It also
-// pins the request path is /api/regions and that a non-empty contextID rides
-// as ?context_id=<url-escaped> (a form-value like "company:c1" has a ':' that
-// must be percent-encoded).
+// pins the request path is /api/regions and that a non-empty repo rides
+// as ?repo=<url-escaped> (a canonical id like "github:github.com/org/app" has
+// ':' and '/' that must be percent-encoded).
 func TestRegions(t *testing.T) {
+	const repo = "github:github.com/org/app"
 	eff, pin := "us-east", "eu-west"
 	var gotPath, gotRawQuery, gotMethod, gotAuth string
 	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
@@ -866,7 +837,7 @@ func TestRegions(t *testing.T) {
 			},
 		})
 	})
-	res, err := c.Regions(context.Background(), "company:c1")
+	res, err := c.Regions(context.Background(), repo)
 	if err != nil {
 		t.Fatalf("Regions: %v", err)
 	}
@@ -876,9 +847,9 @@ func TestRegions(t *testing.T) {
 	if gotAuth != "Bearer dev-bearer" {
 		t.Fatalf("regions must carry the bearer: %q", gotAuth)
 	}
-	// contextID rides percent-encoded (":" must not appear raw).
-	if gotRawQuery != "context_id=company%3Ac1" {
-		t.Fatalf("context_id query: %q, want context_id=company%%3Ac1", gotRawQuery)
+	// repo rides percent-encoded (":" and "/" must not appear raw).
+	if gotRawQuery != "repo=github%3Agithub.com%2Forg%2Fapp" {
+		t.Fatalf("repo query: %q, want repo=github%%3Agithub.com%%2Forg%%2Fapp", gotRawQuery)
 	}
 	if res.EffectiveDefault == nil || *res.EffectiveDefault != eff {
 		t.Fatalf("effective_default: %v", res.EffectiveDefault)
@@ -900,11 +871,11 @@ func TestRegions(t *testing.T) {
 	}
 }
 
-// TestRegionsNullDefaultsAndEmptyContext covers the null cases: the handler
+// TestRegionsNullDefaultsAndEmptyRepo covers the null cases: the handler
 // returns effective_default:null + pinned_default:null when nothing is
 // selectable / the caller has no pin — both *string must decode to nil, not "".
-// It also pins that an EMPTY contextID omits the query entirely (no bare "?").
-func TestRegionsNullDefaultsAndEmptyContext(t *testing.T) {
+// It also pins that an EMPTY repo omits the query entirely (no bare "?").
+func TestRegionsNullDefaultsAndEmptyRepo(t *testing.T) {
 	var gotRawQuery string
 	sawQuery := false
 	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
@@ -921,7 +892,7 @@ func TestRegionsNullDefaultsAndEmptyContext(t *testing.T) {
 		t.Fatalf("Regions: %v", err)
 	}
 	if sawQuery {
-		t.Fatalf("empty contextID must omit the query entirely, got %q", gotRawQuery)
+		t.Fatalf("empty repo must omit the query entirely, got %q", gotRawQuery)
 	}
 	if res.EffectiveDefault != nil {
 		t.Fatalf("null effective_default must decode nil, got %q", *res.EffectiveDefault)
@@ -950,7 +921,7 @@ func TestCreateDecodesResolutionEcho(t *testing.T) {
 			"size_source":   "repo",
 		})
 	})
-	res, err := c.Create(context.Background(), "r", "", "", "company:c1", "", "", false)
+	res, err := c.Create(context.Background(), "r", "", "", "", "", false)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -965,7 +936,7 @@ func TestCreateDecodesResolutionEcho(t *testing.T) {
 	c2 := testClient(t, func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"workspace_id": "ws-old"})
 	})
-	res2, err := c2.Create(context.Background(), "r", "", "", "company:c1", "", "", false)
+	res2, err := c2.Create(context.Background(), "r", "", "", "", "", false)
 	if err != nil {
 		t.Fatalf("Create (older server): %v", err)
 	}
@@ -977,8 +948,8 @@ func TestCreateDecodesResolutionEcho(t *testing.T) {
 // --- SetDevboxSetting (POST /api/devbox-settings) ---
 
 // TestSetDevboxSettingRepoScoped pins the happy path: a POST to
-// /api/devbox-settings carrying the bearer with body {context_id, repo,
-// setting, value} — and NO clear key on a plain set.
+// /api/devbox-settings carrying the bearer with body {repo, setting, value}
+// — no context_id, and NO clear key on a plain set.
 func TestSetDevboxSettingRepoScoped(t *testing.T) {
 	var gotPath, gotMethod, gotAuth string
 	var gotBody map[string]any
@@ -987,7 +958,7 @@ func TestSetDevboxSettingRepoScoped(t *testing.T) {
 		_ = json.NewDecoder(r.Body).Decode(&gotBody)
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 	})
-	err := c.SetDevboxSetting(context.Background(), "company:c1",
+	err := c.SetDevboxSetting(context.Background(),
 		"github:github.com/org/app", "default-region", "us-east", false)
 	if err != nil {
 		t.Fatalf("SetDevboxSetting: %v", err)
@@ -998,33 +969,15 @@ func TestSetDevboxSettingRepoScoped(t *testing.T) {
 	if gotAuth != "Bearer dev-bearer" {
 		t.Fatalf("auth: %q", gotAuth)
 	}
-	if gotBody["context_id"] != "company:c1" || gotBody["repo"] != "github:github.com/org/app" ||
+	if gotBody["repo"] != "github:github.com/org/app" ||
 		gotBody["setting"] != "default-region" || gotBody["value"] != "us-east" {
 		t.Fatalf("body: %+v", gotBody)
 	}
+	if _, present := gotBody["context_id"]; present {
+		t.Fatalf("body must not send context_id: %+v", gotBody)
+	}
 	if _, present := gotBody["clear"]; present {
 		t.Fatalf("a plain set must not send clear: %+v", gotBody)
-	}
-}
-
-// A context-wide write (empty repo) omits the repo key entirely; a size write
-// carries setting "default-size".
-func TestSetDevboxSettingContextWideOmitsRepo(t *testing.T) {
-	var gotBody map[string]any
-	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewDecoder(r.Body).Decode(&gotBody)
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
-	})
-	err := c.SetDevboxSetting(context.Background(), "personal:u1", "", "default-size", "shared-4x", false)
-	if err != nil {
-		t.Fatalf("SetDevboxSetting: %v", err)
-	}
-	if _, present := gotBody["repo"]; present {
-		t.Fatalf("context-wide write must omit repo: %+v", gotBody)
-	}
-	if gotBody["context_id"] != "personal:u1" || gotBody["setting"] != "default-size" ||
-		gotBody["value"] != "shared-4x" {
-		t.Fatalf("body: %+v", gotBody)
 	}
 }
 
@@ -1035,7 +988,7 @@ func TestSetDevboxSettingClear(t *testing.T) {
 		_ = json.NewDecoder(r.Body).Decode(&gotBody)
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 	})
-	err := c.SetDevboxSetting(context.Background(), "company:c1", "", "default-region", "", true)
+	err := c.SetDevboxSetting(context.Background(), "", "default-region", "", true)
 	if err != nil {
 		t.Fatalf("SetDevboxSetting(clear): %v", err)
 	}
@@ -1060,7 +1013,7 @@ func TestSetDevboxSettingErrorSurfacesDetail(t *testing.T) {
 			"selectable": []string{"us-east", "eu-west"},
 		})
 	})
-	err := c.SetDevboxSetting(context.Background(), "company:c1", "", "default-region", "atlantis", false)
+	err := c.SetDevboxSetting(context.Background(), "", "default-region", "atlantis", false)
 	if err == nil {
 		t.Fatal("a non-selectable slug must error")
 	}
@@ -1089,7 +1042,7 @@ func TestSetDevboxSettingUnstructured4xxSurfacesBodyVerbatim(t *testing.T) {
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = w.Write([]byte("plain nope"))
 	})
-	err := c.SetDevboxSetting(context.Background(), "company:c1", "", "default-region", "iad", false)
+	err := c.SetDevboxSetting(context.Background(), "", "default-region", "iad", false)
 	if err == nil {
 		t.Fatal("a 4xx must error")
 	}

@@ -31,11 +31,6 @@ const DefaultAPIBaseURL = "https://fixedlabs.dev"
 type Config struct {
 	APIBaseURL string `json:"api_base_url"`
 	Token      string `json:"token"`
-	// DefaultContext is the acting context form-value ("company:<uuid>" /
-	// "personal:<uuid>") sent on `new`; empty until set by
-	// `rift set-default-context`. Login no longer seeds it — the CLI session
-	// proves identity only, and the default is a per-device create target.
-	DefaultContext string `json:"default_context,omitempty"`
 	// MachineWorkspaceID is set only in-VM (RIFT_WORKSPACE_ID, injected by
 	// the provisioner alongside the machine bearer). Its presence means Token
 	// is a machine token whose subject is

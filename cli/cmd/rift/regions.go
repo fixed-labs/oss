@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"time"
-
-	"github.com/fixed-labs/oss/cli/internal/config"
 )
 
 // cmdRegions lists the selectable regions (the developer read surface over the
@@ -15,21 +13,17 @@ import (
 // effective default and its row is deprecated, it prints a migrate hint: the
 // pin is stale and a blank `rift new` no longer uses it.
 //
-// The caller's stored default context (config.json DefaultContext) is passed as
-// context_id so the effective/pinned defaults reflect the org the caller acts
-// in; absent, the server uses the caller's Personal context.
+// No repo is in play, so the preview keys on the caller's own Personal context
+// (an empty ?repo=). To preview a specific repo's owning-context defaults, run
+// a repo-scoped write dry-run via `rift set-default-region --repo R`.
 func cmdRegions(ctx context.Context, args []string) error {
 	c, _, err := authedClient()
 	if err != nil {
 		return err
 	}
-	contextID := ""
-	if cfg, _ := config.Load(); cfg != nil {
-		contextID = cfg.DefaultContext
-	}
 	rctx, cancel := ctxTimeout(ctx, 30*time.Second)
 	defer cancel()
-	res, err := c.Regions(rctx, contextID)
+	res, err := c.Regions(rctx, "")
 	if err != nil {
 		return err
 	}

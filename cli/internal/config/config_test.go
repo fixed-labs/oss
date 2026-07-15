@@ -17,7 +17,7 @@ func withConfigHome(t *testing.T) {
 
 func TestSaveLoadRoundTrip(t *testing.T) {
 	withConfigHome(t)
-	want := &Config{APIBaseURL: "https://api.example.dev", Token: "tok", DefaultContext: "company:c1"}
+	want := &Config{APIBaseURL: "https://api.example.dev", Token: "tok"}
 	if err := want.Save(); err != nil {
 		t.Fatalf("Save: %v", err)
 	}

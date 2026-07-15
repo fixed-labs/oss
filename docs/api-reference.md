@@ -30,7 +30,7 @@ A *workspace* is a devbox. `Workspace` / `ListItem` are the read shapes;
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/api/workspaces` | Create a workspace. Body carries `repo` (the canonical repo id — see [Repo ids](#repo-ids)), `context_id`, `fallback_to_default`, and optional `size`, `region`, `ref`, or `image` (`ref`/`image` are mutually exclusive boot-selection overrides). Returns the new `workspace_id` and the resolved ref/commit. |
+| `POST` | `/api/workspaces` | Create a workspace. Body carries `repo` (the canonical repo id — see [Repo ids](#repo-ids)), `fallback_to_default`, and optional `size`, `region`, `ref`, or `image` (`ref`/`image` are mutually exclusive boot-selection overrides). The billing account is derived server-side from `repo` (the account that owns it). Returns the new `workspace_id` and the resolved ref/commit. |
 | `GET`  | `/api/workspaces` | List your workspaces (a single snapshot read). Returns `{ "workspaces": [ … ] }`. |
 | `GET`  | `/api/workspaces/:id` | Read one workspace. A bare read is a snapshot; passing `?cursor=<c>` turns it into a **long poll** that holds until the workspace changes and returns a new cursor — the primitive `rift connect` watches with. A hold-timeout answers `304` (no change; re-poll with the same cursor). |
 | `DELETE` | `/api/workspaces/:id` | Destroy a workspace. |
@@ -54,12 +54,6 @@ All are `POST /api/workspaces/:id/<action>`:
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/api/workspaces/sizes` | The offered VM sizes plus the effective default a blank `rift new` resolves to. Returns `{ "effective_default": <id-or-null>, "sizes": [ … ] }`; each size carries `id`, `display_name`, `description`, `cpu`, `memory_mb`, and a display-only `price` string. |
-
-## Contexts
-
-| Method | Path | Purpose |
-|---|---|---|
-| `GET` | `/api/contexts` | The contexts the caller may act in (e.g. a personal vs. an organization account). Returns `{ "contexts": [ { "form_value": "<stable-id>", "label": "<human label>" } ] }`. The `form_value` is what `rift new --context`/`rift ls --context`/`rift set-default-context` pass. |
 
 ## Repo ids
 

@@ -73,8 +73,6 @@ func main() {
 		err = cmdLogin(ctx, args)
 	case "ls", "list":
 		err = cmdList(ctx, args)
-	case "set-default-context":
-		err = cmdSetDefaultContext(ctx, args)
 	case "set-default-region":
 		err = cmdSetDefaultRegion(ctx, args)
 	case "set-default-size":
@@ -134,11 +132,10 @@ func usage() {
 	fmt.Fprint(os.Stderr, "rift — ephemeral developer workspaces\n\n"+
 		"usage:\n"+
 		"  rift login\n"+
-		"  rift new [--size S] [--region R] [--repo REPO] [--forge F] [--context CTX] [--ref BRANCH | --image SHA]\n"+
-		"  rift ls [--context CTX]\n"+
-		"  rift set-default-context [CTX]\n"+
-		"  rift set-default-region [--repo R] [--context CTX] [SLUG | --clear]\n"+
-		"  rift set-default-size [--repo R] [--context CTX] [SIZE | --clear]\n"+
+		"  rift new [--size S] [--region R] [--repo REPO] [--forge F] [--ref BRANCH | --image SHA]\n"+
+		"  rift ls\n"+
+		"  rift set-default-region [--repo R] [SLUG | --clear]\n"+
+		"  rift set-default-size [--repo R] [SIZE | --clear]\n"+
 		"  rift set-repo-builder-size REPO [SIZE | --clear]\n"+
 		"  rift sizes\n"+
 		"  rift regions\n"+

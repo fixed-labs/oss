@@ -37,8 +37,8 @@ func resolveLoginAPIURL(flagVal string) string {
 }
 
 // cmdLogin runs the device flow and persists the minted bearer. The session
-// proves identity only; the acting context is resolved per command and its
-// per-device default is set separately by `rift set-default-context`.
+// proves identity only; every command derives the owning/billing context from
+// the repo it acts on, so there is no per-device context to select or persist.
 func cmdLogin(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("login", flag.ContinueOnError)
 	apiFlag := fs.String("api", os.Getenv("RIFT_API_URL"), "rift API base URL")
@@ -96,12 +96,11 @@ func cmdLogin(ctx context.Context, args []string) error {
 	return nil
 }
 
+// cmdList lists the workspaces the caller owns, across every context they can
+// see (owner-scoped, server-side). There is no context filter: context is
+// derived from the repo, never a user-facing selector.
 func cmdList(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("ls", flag.ContinueOnError)
-	// --context is a purely client-side display filter over the boxes you own
-	// (matched exactly against each row's billed context form-value); it is NOT
-	// a server-authorized selector. Absent → show everything you own.
-	contextID := fs.String("context", "", "only list boxes in this context (form-value)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -115,15 +114,6 @@ func cmdList(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if *contextID != "" {
-		filtered := items[:0]
-		for _, it := range items {
-			if it.Context == *contextID {
-				filtered = append(filtered, it)
-			}
-		}
-		items = filtered
-	}
 	if len(items) == 0 {
 		fmt.Println("No workspaces.")
 		return nil
@@ -132,77 +122,6 @@ func cmdList(ctx context.Context, args []string) error {
 	for _, it := range items {
 		fmt.Printf("%-38s  %-12s  %-10s  %s\n", it.WorkspaceID, it.Status, it.Size, it.Repo)
 	}
-	return nil
-}
-
-// cmdSetDefaultContext sets the per-device default acting context, written to
-// the local config. With an argument (a form-value, for scripting) it validates
-// that value by EXACT string equality against GET /api/contexts and stores it;
-// with no argument it prints a 1-based numbered picker and reads a selection
-// from stdin. Requires a logged-in CLI (it calls GET /api/contexts).
-func cmdSetDefaultContext(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("set-default-context", flag.ContinueOnError)
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	c, cfg, err := authedClient()
-	if err != nil {
-		return err
-	}
-	rctx, cancel := ctxTimeout(ctx, 30*time.Second)
-	defer cancel()
-	items, err := c.Contexts(rctx)
-	if err != nil {
-		return err
-	}
-	if len(items) == 0 {
-		return fmt.Errorf("no contexts available for this account")
-	}
-
-	var chosen string
-	if fs.NArg() >= 1 {
-		// Argument form: validate the given form-value by exact equality against
-		// the live list, catching typos / stale company references up front
-		// rather than deferring to a `new` 403.
-		want := fs.Arg(0)
-		for _, it := range items {
-			if it.FormValue == want {
-				chosen = it.FormValue
-				break
-			}
-		}
-		if chosen == "" {
-			var b strings.Builder
-			for _, it := range items {
-				fmt.Fprintf(&b, "\n  %s  (%s)", it.Label, it.FormValue)
-			}
-			return fmt.Errorf("unknown context %q — valid contexts:%s", want, b.String())
-		}
-	} else {
-		// Interactive form: plain numbered stdin prompt (no third-party TUI).
-		for i, it := range items {
-			fmt.Printf("%d) %s  (%s)\n", i+1, it.Label, it.FormValue)
-		}
-		fmt.Printf("Select a context [1-%d]: ", len(items))
-		line, rerr := bufio.NewReader(os.Stdin).ReadString('\n')
-		line = strings.TrimSpace(line)
-		if line == "" {
-			// Empty line or EOF (Ctrl-D) with nothing entered → abort.
-			return fmt.Errorf("no selection")
-		}
-		n, cerr := strconv.Atoi(line)
-		if cerr != nil || n < 1 || n > len(items) {
-			return fmt.Errorf("invalid selection %q — enter a number between 1 and %d", line, len(items))
-		}
-		_ = rerr // a trailing read error is harmless once a valid line was parsed
-		chosen = items[n-1].FormValue
-	}
-
-	cfg.DefaultContext = chosen
-	if err := cfg.Save(); err != nil {
-		return err
-	}
-	fmt.Printf("Default context set to %s.\n", chosen)
 	return nil
 }
 
@@ -399,7 +318,6 @@ func cmdNew(ctx context.Context, args []string) error {
 	region := fs.String("region", "", "Region (see 'rift regions')")
 	repo := fs.String("repo", "", "repo (owner/name, a clone URL, or forge:host/owner/name); inferred from cwd if absent")
 	forge := fs.String("forge", "", "forge type of the repo's host (only github this phase); required when the host isn't a known SaaS forge")
-	contextID := fs.String("context", "", "acting context (personal:<id> | company:<id>); defaults to your `rift set-default-context`")
 	ref := fs.String("ref", "", "boot the head image of this branch (e.g. main); mutually exclusive with --image")
 	image := fs.String("image", "", "boot this exact commit's image (full SHA or ≥7-char prefix); mutually exclusive with --ref")
 	if err := fs.Parse(args); err != nil {
@@ -408,20 +326,15 @@ func cmdNew(ctx context.Context, args []string) error {
 	if *ref != "" && *image != "" {
 		return fmt.Errorf("--ref and --image are mutually exclusive")
 	}
-	c, cfg, err := authedClient()
+	c, _, err := authedClient()
 	if err != nil {
 		return err
 	}
 	if *repo, err = resolveRepo(*repo, *forge); err != nil {
 		return err
 	}
-	cid := *contextID
-	if cid == "" {
-		cid = cfg.DefaultContext
-	}
-	if cid == "" {
-		return fmt.Errorf("no context set — run `rift set-default-context` or pass --context <ctx>")
-	}
+	// The billing context is derived server-side from the repo's owning GitHub
+	// account — the caller never names one.
 
 	// Boot selection:
 	//   --image <sha>  → send image, no ref, fallback irrelevant.
@@ -457,7 +370,7 @@ func cmdNew(ctx context.Context, args []string) error {
 	var res *client.CreateResult
 	for {
 		rctx, cancel := ctxTimeout(ctx, 30*time.Second)
-		res, err = c.Create(rctx, *repo, pickedSize, pickedRegion, cid, sendRef, *image, fallback)
+		res, err = c.Create(rctx, *repo, pickedSize, pickedRegion, sendRef, *image, fallback)
 		cancel()
 		if err == nil {
 			break
@@ -540,8 +453,8 @@ func requiredDimensionErr(dim string, se client.SelectableError) error {
 }
 
 // pickerPrompt runs the numbered force-select picker over the server's
-// selectable list (the cmdSetDefaultContext numbered-stdin precedent, in a
-// loop): print the server's detail plus a 1-based list, read a selection,
+// selectable list (a numbered-stdin prompt, in a loop):
+// print the server's detail plus a 1-based list, read a selection,
 // RE-PROMPT on garbage (a non-number or out-of-range entry), abort on an
 // empty line / EOF. It reads from an injected reader rather than os.Stdin
 // directly so the loop is unit-testable without a real TTY (the TTY gate
@@ -616,10 +529,10 @@ func describeSource(source string) string {
 	return source
 }
 
-// cmdSetDefaultRegion / cmdSetDefaultSize set (or clear) a context-anchored
-// spawn default on the SERVER (unlike set-default-context, which writes the
-// local config): the defaults are server-side so they stay consistent across
-// the CLI and web UI on every device. Both dimensions share setDefaultSetting.
+// cmdSetDefaultRegion / cmdSetDefaultSize set (or clear) a repo's owning
+// context's spawn default on the SERVER: the defaults are server-side so they
+// stay consistent across the CLI and web UI on every device. Both dimensions
+// share setDefaultSetting.
 func cmdSetDefaultRegion(ctx context.Context, args []string) error {
 	return setDefaultSetting(ctx, args, "default-region")
 }
@@ -628,79 +541,71 @@ func cmdSetDefaultSize(ctx context.Context, args []string) error {
 	return setDefaultSetting(ctx, args, "default-size")
 }
 
-// setDefaultSetting drives one POST /api/devbox-settings write. The write is
-// scoped to the acting context — resolved exactly as cmdNew resolves it
-// (--context flag, else the config's set-default-context value) — and
-// optionally refined to one repo via --repo (absent → context-wide). An empty
-// value argument or --clear clears the default. Both dimensions run an
+// setDefaultSetting drives one POST /api/devbox-settings write. The write
+// targets the repo's OWNING context's defaults: --repo names the repo, the
+// server derives its owning context and owner/admin-gates the write. A repo is
+// REQUIRED — the server rejects a settings write with no repo ("repo is
+// required"), so the CLI fails fast before the POST when --repo is absent. An
+// empty value argument or --clear clears the default. Both dimensions run an
 // ADVISORY pre-flight that warns when the value isn't in the dimension's
 // catalog listing (GET /api/regions / GET /api/workspaces/sizes — a typo
-// catch); the AUTHORITATIVE gate runs server-side at the POST — the edge's
-// 4xx (detail + selectable list) is surfaced either way.
+// catch); the AUTHORITATIVE gate (including the owner/admin gate) runs
+// server-side at the POST — the edge's 4xx (detail + selectable list) is
+// surfaced either way.
 func setDefaultSetting(ctx context.Context, args []string, setting string) error {
 	dim := strings.TrimPrefix(setting, "default-") // "region" | "size"
 	fs := flag.NewFlagSet("set-"+setting, flag.ContinueOnError)
-	repoFlag := fs.String("repo", "", "scope the default to this repo (owner/name, a clone URL, or forge:host/owner/name); absent → context-wide")
+	repoFlag := fs.String("repo", "", "set the default for this repo (owner/name, a clone URL, or forge:host/owner/name); targets the repo's owning account, owner/admin-gated server-side")
 	clear := fs.Bool("clear", false, "clear the default")
-	contextID := fs.String("context", "", "acting context (personal:<id> | company:<id>); defaults to your `rift set-default-context`")
 	pos, err := parseInterleaved(fs, args)
 	if err != nil {
 		return err
 	}
-	c, cfg, err := authedClient()
+	if *repoFlag == "" {
+		return fmt.Errorf("--repo is required")
+	}
+	c, _, err := authedClient()
 	if err != nil {
 		return err
 	}
-	cid := *contextID
-	if cid == "" {
-		cid = cfg.DefaultContext
-	}
-	if cid == "" {
-		return fmt.Errorf("no context set — run `rift set-default-context` or pass --context <ctx>")
-	}
-	repo := ""
-	if *repoFlag != "" {
-		if repo, err = resolveRepoIdentity(*repoFlag, ""); err != nil {
-			return err
-		}
-	}
-	scope := "context-wide"
-	if repo != "" {
-		scope = repo
+	repo, err := resolveRepoIdentity(*repoFlag, "")
+	if err != nil {
+		return err
 	}
 	rctx, cancel := ctxTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	// Clear: an explicit --clear, or no value argument.
 	if *clear || len(pos) < 1 {
-		if err := c.SetDevboxSetting(rctx, cid, repo, setting, "", true); err != nil {
+		if err := c.SetDevboxSetting(rctx, repo, setting, "", true); err != nil {
 			return err
 		}
-		fmt.Printf("Default %s cleared (%s, %s).\n", dim, cid, scope)
+		fmt.Printf("Default %s cleared (%s).\n", dim, repo)
 		return nil
 	}
 
 	value := pos[0]
-	warnUnknownSettingValue(rctx, c, dim, cid, value)
-	if err := c.SetDevboxSetting(rctx, cid, repo, setting, value, false); err != nil {
+	warnUnknownSettingValue(rctx, c, dim, repo, value)
+	if err := c.SetDevboxSetting(rctx, repo, setting, value, false); err != nil {
 		return err
 	}
-	fmt.Printf("Default %s set to %s (%s, %s).\n", dim, value, cid, scope)
+	fmt.Printf("Default %s set to %s (%s).\n", dim, value, repo)
 	return nil
 }
 
 // warnUnknownSettingValue is the ADVISORY pre-flight shared by both
 // set-default dimensions (UX only): it reads the dimension's catalog listing
 // (`rift regions` / `rift sizes`) and warns on stderr when value isn't in it,
-// catching a typo before the POST. The authoritative gate runs server-side at
-// the POST regardless — an unlisted value is still sent and the server's 4xx
-// is surfaced — and a failed catalog read is silently skipped: the pre-flight
-// never blocks the write.
-func warnUnknownSettingValue(ctx context.Context, c *client.Client, dim, contextID, value string) {
+// catching a typo before the POST. The region preview keys on the repo
+// (?repo= → the repo's owning context). The authoritative gate runs
+// server-side at the POST regardless — an unlisted value is still sent and the
+// server's 4xx is surfaced — and a failed catalog read is silently skipped:
+// the pre-flight never blocks the write.
+func warnUnknownSettingValue(ctx context.Context, c *client.Client, dim, repo, value string) {
 	var known []string
 	switch dim {
 	case "region":
-		res, err := c.Regions(ctx, contextID)
+		res, err := c.Regions(ctx, repo)
 		if err != nil {
 			return
 		}

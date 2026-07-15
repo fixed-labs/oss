@@ -369,116 +369,22 @@ func captureFile(t *testing.T, f **os.File, fn func()) string {
 	return <-done
 }
 
-// contextsHandler answers GET /api/contexts with the given items (form_value +
-// label), the wrapper shape client.Contexts decodes.
-func contextsHandler(items []client.ContextItem) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/contexts" {
-			http.NotFound(w, r)
-			return
-		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"contexts": items})
-	}
-}
-
-var testContexts = []client.ContextItem{
-	{FormValue: "personal:u1", Label: "Personal"},
-	{FormValue: "company:c1", Label: "Acme"},
-	{FormValue: "company:c2", Label: "Beta"},
-}
-
-// --- cmdSetDefaultContext <arg> validates against the live list & persists ---
-
-func TestSetDefaultContextArgMatchPersists(t *testing.T) {
-	srv := hermeticEnv(t, contextsHandler(testContexts))
-	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok"})
-
-	if err := cmdSetDefaultContext(context.Background(), []string{"company:c1"}); err != nil {
-		t.Fatalf("exact match must succeed: %v", err)
-	}
-	if got := loadConfig(t).DefaultContext; got != "company:c1" {
-		t.Fatalf("DefaultContext = %q, want company:c1", got)
-	}
-}
-
-func TestSetDefaultContextArgNoMatchErrorsAndDoesNotWrite(t *testing.T) {
-	srv := hermeticEnv(t, contextsHandler(testContexts))
-	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok"})
-
-	err := cmdSetDefaultContext(context.Background(), []string{"company:nope"})
-	if err == nil {
-		t.Fatal("a non-matching form-value must error")
-	}
-	// Surfaces the available contexts (loosely — not the exact "unknown context"
-	// wording, which is not part of the stable output contract).
-	if !strings.Contains(err.Error(), "company:c1") {
-		t.Fatalf("error should surface the valid contexts, got %v", err)
-	}
-	if got := loadConfig(t).DefaultContext; got != "" {
-		t.Fatalf("a rejected context must not be written, got %q", got)
-	}
-}
-
-// --- cmdSetDefaultContext no-arg numbered picker ---
-
-func TestSetDefaultContextPickerValidSelection(t *testing.T) {
-	srv := hermeticEnv(t, contextsHandler(testContexts))
-	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok"})
-	withStdin(t, "2\n") // 1-based → the 2nd item (company:c1)
-
-	var err error
-	_ = captureStdout(t, func() { err = cmdSetDefaultContext(context.Background(), nil) })
-	if err != nil {
-		t.Fatalf("valid selection must succeed: %v", err)
-	}
-	// Selection 2 maps to items[1].FormValue — pins the index→form_value mapping,
-	// not the picker glyphs.
-	if got := loadConfig(t).DefaultContext; got != "company:c1" {
-		t.Fatalf("DefaultContext = %q, want company:c1 (2nd item)", got)
-	}
-}
-
-func TestSetDefaultContextPickerInvalidInputDoesNotWrite(t *testing.T) {
-	cases := map[string]string{
-		"non-integer":  "abc\n",
-		"out-of-range": "99\n",
-		"empty":        "",   // immediate EOF, nothing entered
-		"eof-blank":    "\n", // just a newline → blank line
-	}
-	for name, input := range cases {
-		t.Run(name, func(t *testing.T) {
-			srv := hermeticEnv(t, contextsHandler(testContexts))
-			seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok"})
-			withStdin(t, input)
-
-			var err error
-			_ = captureStdout(t, func() { err = cmdSetDefaultContext(context.Background(), nil) })
-			if err == nil {
-				t.Fatalf("input %q must error (non-zero exit)", input)
-			}
-			if got := loadConfig(t).DefaultContext; got != "" {
-				t.Fatalf("invalid input must not write, got %q", got)
-			}
-		})
-	}
-}
-
-// --- cmdNew context fallback chain & error ---
+// --- cmdNew billing context is repo-derived (no context input) ---
 //
-// The happy path calls connect() after Create; the mock captures context_id on
-// the Create request (which runs first), then answers the connect-time Get with a
-// "failed" workspace so waitRunning returns promptly and cmdNew unwinds without a
-// live box. We assert only the captured context_id (precedence), not the connect
-// outcome. --repo is passed so no git remote is inferred; --ref avoids the branch
-// inference shell-out.
+// The happy path calls connect() after Create; the mock captures the Create
+// body (which runs first), then answers the connect-time Get with a "failed"
+// workspace so waitRunning returns promptly and cmdNew unwinds without a live
+// box. We assert the create body carries NO context_id (the server derives it
+// from the repo). --repo is passed so no git remote is inferred; --ref avoids
+// the branch inference shell-out.
 
-func newCaptureHandler(createHit *bool, gotContextID *string) http.HandlerFunc {
+func newCaptureHandler(createHit *bool, gotBody *map[string]any) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost && r.URL.Path == "/api/workspaces" {
 			*createHit = true
 			var body map[string]any
 			_ = json.NewDecoder(r.Body).Decode(&body)
-			*gotContextID, _ = body["context_id"].(string)
+			*gotBody = body
 			_ = json.NewEncoder(w).Encode(map[string]any{"workspace_id": "ws-new"})
 			return
 		}
@@ -489,29 +395,13 @@ func newCaptureHandler(createHit *bool, gotContextID *string) http.HandlerFunc {
 	}
 }
 
-func TestCmdNewExplicitContextWins(t *testing.T) {
+// A plain `new` sends no context_id — the billing context is derived
+// server-side from the repo.
+func TestCmdNewSendsNoContextID(t *testing.T) {
 	var createHit bool
-	var gotContextID string
-	srv := hermeticEnv(t, newCaptureHandler(&createHit, &gotContextID))
-	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "company:seeded"})
-
-	// --context beats the seeded default; connect error after Create is ignored.
-	_ = captureStdout(t, func() {
-		_ = cmdNew(context.Background(), []string{"--repo", "org/app", "--ref", "main", "--context", "company:explicit"})
-	})
-	if !createHit {
-		t.Fatal("Create was not called")
-	}
-	if gotContextID != "company:explicit" {
-		t.Fatalf("context_id = %q, want the explicit --context (company:explicit)", gotContextID)
-	}
-}
-
-func TestCmdNewFallsBackToDefaultContext(t *testing.T) {
-	var createHit bool
-	var gotContextID string
-	srv := hermeticEnv(t, newCaptureHandler(&createHit, &gotContextID))
-	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "company:seeded"})
+	var gotBody map[string]any
+	srv := hermeticEnv(t, newCaptureHandler(&createHit, &gotBody))
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok"})
 
 	_ = captureStdout(t, func() {
 		_ = cmdNew(context.Background(), []string{"--repo", "org/app", "--ref", "main"})
@@ -519,28 +409,11 @@ func TestCmdNewFallsBackToDefaultContext(t *testing.T) {
 	if !createHit {
 		t.Fatal("Create was not called")
 	}
-	if gotContextID != "company:seeded" {
-		t.Fatalf("context_id = %q, want the cfg.DefaultContext fallback (company:seeded)", gotContextID)
+	if _, present := gotBody["context_id"]; present {
+		t.Fatalf("create body must not carry a context_id (server derives it from repo): %+v", gotBody)
 	}
-}
-
-func TestCmdNewNoContextErrorsBeforeCreate(t *testing.T) {
-	var createHit bool
-	var gotContextID string
-	srv := hermeticEnv(t, newCaptureHandler(&createHit, &gotContextID))
-	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok"}) // no DefaultContext
-
-	err := cmdNew(context.Background(), []string{"--repo", "org/app", "--ref", "main"})
-	if err == nil {
-		t.Fatal("no context set must error")
-	}
-	// The exact error message, verbatim.
-	want := "no context set — run `rift set-default-context` or pass --context <ctx>"
-	if err.Error() != want {
-		t.Fatalf("error = %q, want %q", err.Error(), want)
-	}
-	if createHit {
-		t.Fatal("Create must NOT be called when no context resolves")
+	if gotBody["repo"] != "github:github.com/org/app" {
+		t.Fatalf("create body must carry the canonical repo: %+v", gotBody)
 	}
 }
 
@@ -568,7 +441,7 @@ func TestCmdNewForgeFlagResolvesCanonicalRepo(t *testing.T) {
 			"workspace": map[string]any{"workspace_id": "ws-new", "status": "failed", "error_message": "test-stop"},
 		})
 	})
-	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "company:c1"})
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok"})
 
 	_ = captureStdout(t, func() {
 		_ = cmdNew(context.Background(), []string{"--repo", "acme/widget", "--forge", "github", "--ref", "main"})
@@ -589,7 +462,7 @@ func TestCmdNewForgeConflictSurfacesThroughCommand(t *testing.T) {
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{})
 	})
-	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "company:c1"})
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok"})
 
 	// --forge gitlab against a github.com --repo → the flow-1 conflict error
 	// must surface through the command, before any Create.
@@ -605,7 +478,7 @@ func TestCmdNewForgeConflictSurfacesThroughCommand(t *testing.T) {
 	}
 }
 
-// --- cmdList --context client-side filter; bare `ls` ignores the default ---
+// --- cmdList is owner-scoped; there is no context filter ---
 
 func listHandler(items []client.ListItem) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -622,24 +495,9 @@ var listRows = []client.ListItem{
 	{WorkspaceID: "ws-beta", Status: "running", Repo: "org/b", Context: "company:c2"},
 }
 
-func TestCmdListContextFilterShowsOnlyMatches(t *testing.T) {
-	srv := hermeticEnv(t, listHandler(listRows))
-	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok"})
-
-	out := captureStdout(t, func() {
-		if err := cmdList(context.Background(), []string{"--context", "company:c1"}); err != nil {
-			t.Fatalf("cmdList: %v", err)
-		}
-	})
-	if !strings.Contains(out, "ws-acme") {
-		t.Fatalf("--context company:c1 must render its box, got:\n%s", out)
-	}
-	if strings.Contains(out, "ws-beta") {
-		t.Fatalf("--context company:c1 must NOT render the other context's box, got:\n%s", out)
-	}
-}
-
-func TestCmdListNoFlagNoDefaultShowsAll(t *testing.T) {
+// A bare `ls` renders every workspace the caller owns, across all contexts they
+// can see — there is no context filter to narrow it.
+func TestCmdListShowsAllOwnedWorkspaces(t *testing.T) {
 	srv := hermeticEnv(t, listHandler(listRows))
 	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok"})
 
@@ -649,33 +507,28 @@ func TestCmdListNoFlagNoDefaultShowsAll(t *testing.T) {
 		}
 	})
 	if !strings.Contains(out, "ws-acme") || !strings.Contains(out, "ws-beta") {
-		t.Fatalf("bare ls must render all boxes, got:\n%s", out)
+		t.Fatalf("ls must render all owned boxes across contexts, got:\n%s", out)
 	}
 }
 
-// The key regression guard: a bare `ls` must IGNORE cfg.DefaultContext (the
-// default is a create target, not an ls filter) — all boxes still render even
-// though the seeded default matches only one.
-func TestCmdListBareIgnoresDefaultContext(t *testing.T) {
+// The retired --context flag is now an unknown flag: it errors at parse rather
+// than silently filtering.
+func TestCmdListContextFlagRetired(t *testing.T) {
 	srv := hermeticEnv(t, listHandler(listRows))
-	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "company:c1"})
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok"})
 
-	out := captureStdout(t, func() {
-		if err := cmdList(context.Background(), nil); err != nil {
-			t.Fatalf("cmdList: %v", err)
+	_ = captureStderr(t, func() { // fs.Parse prints its own usage on error
+		if err := cmdList(context.Background(), []string{"--context", "company:c1"}); err == nil {
+			t.Fatal("--context must be a retired/unknown flag now")
 		}
 	})
-	if !strings.Contains(out, "ws-acme") || !strings.Contains(out, "ws-beta") {
-		t.Fatalf("bare ls must ignore cfg.DefaultContext and render ALL boxes, got:\n%s", out)
-	}
 }
 
-// --- cmdLogin preserves an existing DefaultContext ---
+// --- cmdLogin: login persists only APIBaseURL + Token ---
 //
-// Login persists only APIBaseURL + Token; a pre-existing per-device default must
-// survive it (the poll no longer even carries a context to latch onto).
+// There is no per-device context to seed or preserve.
 
-func TestCmdLoginPreservesDefaultContext(t *testing.T) {
+func TestCmdLoginPersistsOnlyURLAndToken(t *testing.T) {
 	srv := hermeticEnv(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/login/device/start":
@@ -689,8 +542,7 @@ func TestCmdLoginPreservesDefaultContext(t *testing.T) {
 			http.NotFound(w, r)
 		}
 	})
-	// Pre-seed a SENTINEL default the login path must not touch.
-	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "old", DefaultContext: "company:sentinel"})
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "old"})
 
 	out := captureStdout(t, func() {
 		if err := cmdLogin(context.Background(), []string{"--api", srv.URL}); err != nil {
@@ -703,9 +555,6 @@ func TestCmdLoginPreservesDefaultContext(t *testing.T) {
 	}
 	if got.APIBaseURL != srv.URL {
 		t.Fatalf("login must persist the API base URL, got %q", got.APIBaseURL)
-	}
-	if got.DefaultContext != "company:sentinel" {
-		t.Fatalf("login must PRESERVE DefaultContext, got %q", got.DefaultContext)
 	}
 
 	// Printed-URL fallback: the always-present invariant. The captured stdout
@@ -804,7 +653,7 @@ func TestCmdLoginFatalPollErrorNoConfigWrite(t *testing.T) {
 		}
 	})
 	// Pre-seed a full session the failed login must not touch.
-	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "preseeded-tok", DefaultContext: "company:pre"})
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "preseeded-tok"})
 
 	var err error
 	_ = captureStdout(t, func() {
@@ -818,13 +667,10 @@ func TestCmdLoginFatalPollErrorNoConfigWrite(t *testing.T) {
 	if !strings.Contains(err.Error(), "login:") {
 		t.Fatalf("error must carry the login: wrap, got %v", err)
 	}
-	// No partial write: the pre-seeded token + DefaultContext survive untouched.
+	// No partial write: the pre-seeded token survives untouched.
 	got := loadConfig(t)
 	if got.Token != "preseeded-tok" {
 		t.Fatalf("failed login must NOT overwrite the token, got %q", got.Token)
-	}
-	if got.DefaultContext != "company:pre" {
-		t.Fatalf("failed login must NOT touch DefaultContext, got %q", got.DefaultContext)
 	}
 }
 
@@ -918,7 +764,7 @@ func forceSelectHandler(bodies *[]map[string]any) http.HandlerFunc {
 func TestCmdNewForceSelectPickerLoop(t *testing.T) {
 	var bodies []map[string]any
 	srv := hermeticEnv(t, forceSelectHandler(&bodies))
-	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "company:c1"})
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok"})
 	forceTTY(t, true)
 	// Region picker: "abc" (re-prompt) then "2" → ewr; size picker: "1" →
 	// shared-2x.
@@ -968,7 +814,7 @@ func TestCmdNewForceSelectPickerLoop(t *testing.T) {
 func TestCmdNewForceSelectAbortsOnEmptyStdin(t *testing.T) {
 	var bodies []map[string]any
 	srv := hermeticEnv(t, forceSelectHandler(&bodies))
-	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "company:c1"})
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok"})
 	forceTTY(t, true)
 	withStdin(t, "\n")
 
@@ -990,7 +836,7 @@ func TestCmdNewForceSelectAbortsOnEmptyStdin(t *testing.T) {
 func TestCmdNewForceSelectNonTTYListsAndFails(t *testing.T) {
 	var bodies []map[string]any
 	srv := hermeticEnv(t, forceSelectHandler(&bodies))
-	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "company:c1"})
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok"})
 	forceTTY(t, false)
 
 	err := cmdNew(context.Background(), []string{"--repo", "org/app", "--ref", "main"})
@@ -1028,7 +874,7 @@ func TestCmdNewForceSelectEmptySelectableFailsEvenOnTTY(t *testing.T) {
 		}
 		http.NotFound(w, r)
 	})
-	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "company:c1"})
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok"})
 	forceTTY(t, true)   // even interactively…
 	withStdin(t, "1\n") // …an empty list must never reach a picker read
 
@@ -1070,7 +916,7 @@ func TestCmdNewExplicitNotAvailableFailsWithList(t *testing.T) {
 		}
 		http.NotFound(w, r)
 	})
-	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "company:c1"})
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok"})
 	forceTTY(t, true)   // even interactively…
 	withStdin(t, "1\n") // …an explicit-invalid must NOT consume a picker entry
 
@@ -1105,7 +951,7 @@ func TestCmdNewForceSelectGuardsRepeatedRequired(t *testing.T) {
 		}
 		http.NotFound(w, r)
 	})
-	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "company:c1"})
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok"})
 	forceTTY(t, true)
 	withStdin(t, "1\n1\n1\n1\n") // more input than the guard should ever consume
 
@@ -1209,13 +1055,14 @@ func settingsCaptureHandler(byPath map[string]map[string]any, hits *settingsHits
 	}
 }
 
-// A --repo write canonicalizes the repo, scopes the body to the config's
-// default context, and keeps the region advisory pre-flight.
+// A --repo write canonicalizes the repo and sends it as the sole scope key —
+// no context_id (the server derives + owner/admin-gates the owning context) —
+// and keeps the region advisory pre-flight.
 func TestCmdSetDefaultRegionRepoScopedBody(t *testing.T) {
 	byPath := map[string]map[string]any{}
 	var hits settingsHits
 	srv := hermeticEnv(t, settingsCaptureHandler(byPath, &hits))
-	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "company:seeded"})
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok"})
 
 	out := captureStdout(t, func() {
 		if err := cmdSetDefaultRegion(context.Background(), []string{"--repo", "Acme/Widget", "iad"}); err != nil {
@@ -1226,9 +1073,12 @@ func TestCmdSetDefaultRegionRepoScopedBody(t *testing.T) {
 	if body == nil {
 		t.Fatal("no POST /api/devbox-settings captured")
 	}
-	if body["context_id"] != "company:seeded" || body["repo"] != "github:github.com/acme/widget" ||
+	if body["repo"] != "github:github.com/acme/widget" ||
 		body["setting"] != "default-region" || body["value"] != "iad" {
 		t.Fatalf("body: %+v", body)
+	}
+	if _, present := body["context_id"]; present {
+		t.Fatalf("the write must carry no context_id (server derives it from repo): %+v", body)
 	}
 	if _, present := body["clear"]; present {
 		t.Fatalf("a plain set must not send clear: %+v", body)
@@ -1244,39 +1094,41 @@ func TestCmdSetDefaultRegionRepoScopedBody(t *testing.T) {
 	}
 }
 
-// --context beats the config default (the same resolution cmdNew uses), and
-// no --repo means the context-wide scope (no repo key at all).
-func TestCmdSetDefaultRegionContextFlagWinsAndContextWide(t *testing.T) {
+// A settings write REQUIRES a repo (the server 400s a no-repo write): with
+// --repo absent the CLI fails fast, before any HTTP request.
+func TestCmdSetDefaultRegionNoRepoRequired(t *testing.T) {
 	byPath := map[string]map[string]any{}
 	var hits settingsHits
 	srv := hermeticEnv(t, settingsCaptureHandler(byPath, &hits))
-	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "company:seeded"})
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok"})
 
+	var err error
 	_ = captureStdout(t, func() {
-		if err := cmdSetDefaultRegion(context.Background(), []string{"--context", "personal:u9", "iad"}); err != nil {
-			t.Fatalf("cmdSetDefaultRegion: %v", err)
-		}
+		err = cmdSetDefaultRegion(context.Background(), []string{"iad"})
 	})
-	body := byPath["/api/devbox-settings"]
-	if body["context_id"] != "personal:u9" {
-		t.Fatalf("--context must beat the config default: %+v", body)
+	if err == nil {
+		t.Fatal("no --repo must error")
 	}
-	if _, present := body["repo"]; present {
-		t.Fatalf("no --repo → context-wide (no repo key): %+v", body)
+	if !strings.Contains(err.Error(), "--repo is required") {
+		t.Fatalf("error should name the missing --repo, got: %v", err)
+	}
+	if len(byPath) != 0 || hits.regions != 0 || hits.sizes != 0 {
+		t.Fatalf("no request must be made before the --repo check: byPath=%+v hits=%+v", byPath, hits)
 	}
 }
 
-// --clear (or no value argument) sends clear:true and omits value.
+// --clear (or no value argument) sends clear:true and omits value — but only
+// with a repo, which a settings write requires.
 func TestCmdSetDefaultRegionClear(t *testing.T) {
 	for name, args := range map[string][]string{
-		"explicit-clear": {"--clear"},
-		"no-arg":         {},
+		"explicit-clear": {"--repo", "Acme/Widget", "--clear"},
+		"no-arg":         {"--repo", "Acme/Widget"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			byPath := map[string]map[string]any{}
 			var hits settingsHits
 			srv := hermeticEnv(t, settingsCaptureHandler(byPath, &hits))
-			seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "company:c1"})
+			seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok"})
 
 			out := captureStdout(t, func() {
 				if err := cmdSetDefaultRegion(context.Background(), args); err != nil {
@@ -1284,6 +1136,9 @@ func TestCmdSetDefaultRegionClear(t *testing.T) {
 				}
 			})
 			body := byPath["/api/devbox-settings"]
+			if body["repo"] != "github:github.com/acme/widget" {
+				t.Fatalf("clear must carry the repo scope: %+v", body)
+			}
 			if v, present := body["clear"]; !present || v != true {
 				t.Fatalf("clear must send clear:true: %+v", body)
 			}
@@ -1297,22 +1152,56 @@ func TestCmdSetDefaultRegionClear(t *testing.T) {
 	}
 }
 
+// A no-repo clear (explicit --clear or bare no-arg) also fails fast with the
+// --repo-required error, before any HTTP request — a no-repo settings write is
+// unsupported.
+func TestCmdSetDefaultRegionClearNoRepoRequired(t *testing.T) {
+	for name, args := range map[string][]string{
+		"explicit-clear": {"--clear"},
+		"no-arg":         {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			byPath := map[string]map[string]any{}
+			var hits settingsHits
+			srv := hermeticEnv(t, settingsCaptureHandler(byPath, &hits))
+			seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok"})
+
+			var err error
+			_ = captureStdout(t, func() {
+				err = cmdSetDefaultRegion(context.Background(), args)
+			})
+			if err == nil || !strings.Contains(err.Error(), "--repo is required") {
+				t.Fatalf("no --repo must error with --repo required, got: %v", err)
+			}
+			if len(byPath) != 0 {
+				t.Fatalf("no request must be made before the --repo check: %+v", byPath)
+			}
+		})
+	}
+}
+
 // set-default-size posts setting "default-size" with its own advisory
 // pre-flight (GET /api/workspaces/sizes) — and never the region one.
 func TestCmdSetDefaultSizeBody(t *testing.T) {
 	byPath := map[string]map[string]any{}
 	var hits settingsHits
 	srv := hermeticEnv(t, settingsCaptureHandler(byPath, &hits))
-	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "personal:u1"})
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok"})
 
 	out := captureStdout(t, func() {
-		if err := cmdSetDefaultSize(context.Background(), []string{"shared-4x"}); err != nil {
+		if err := cmdSetDefaultSize(context.Background(), []string{"--repo", "Acme/Widget", "shared-4x"}); err != nil {
 			t.Fatalf("cmdSetDefaultSize: %v", err)
 		}
 	})
 	body := byPath["/api/devbox-settings"]
-	if body["context_id"] != "personal:u1" || body["setting"] != "default-size" || body["value"] != "shared-4x" {
+	if body["setting"] != "default-size" || body["value"] != "shared-4x" {
 		t.Fatalf("body: %+v", body)
+	}
+	if body["repo"] != "github:github.com/acme/widget" {
+		t.Fatalf("the write must carry the derived repo scope: %+v", body)
+	}
+	if _, present := body["context_id"]; present {
+		t.Fatalf("the write must carry no context_id (server derives it): %+v", body)
 	}
 	if hits.sizes != 1 {
 		t.Fatalf("size set keeps the advisory pre-flight (1 GET /api/workspaces/sizes), got %d", hits.sizes)
@@ -1331,12 +1220,12 @@ func TestCmdSetDefaultSizeUnknownIDWarnsButPosts(t *testing.T) {
 	byPath := map[string]map[string]any{}
 	var hits settingsHits
 	srv := hermeticEnv(t, settingsCaptureHandler(byPath, &hits))
-	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "personal:u1"})
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok"})
 
 	var stderr string
 	out := captureStdout(t, func() {
 		stderr = captureStderr(t, func() {
-			if err := cmdSetDefaultSize(context.Background(), []string{"mega-999"}); err != nil {
+			if err := cmdSetDefaultSize(context.Background(), []string{"--repo", "Acme/Widget", "mega-999"}); err != nil {
 				t.Errorf("cmdSetDefaultSize: %v", err)
 			}
 		})
@@ -1370,10 +1259,10 @@ func TestCmdSetDefaultSizePreflightFailureDoesNotBlockPost(t *testing.T) {
 			http.NotFound(w, r)
 		}
 	})
-	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "personal:u1"})
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok"})
 
 	out := captureStdout(t, func() {
-		if err := cmdSetDefaultSize(context.Background(), []string{"shared-4x"}); err != nil {
+		if err := cmdSetDefaultSize(context.Background(), []string{"--repo", "Acme/Widget", "shared-4x"}); err != nil {
 			t.Errorf("a failed pre-flight must not fail the command: %v", err)
 		}
 	})
@@ -1383,26 +1272,6 @@ func TestCmdSetDefaultSizePreflightFailureDoesNotBlockPost(t *testing.T) {
 	}
 	if !strings.Contains(out, "Default size set to shared-4x") {
 		t.Fatalf("confirmation output, got:\n%s", out)
-	}
-}
-
-// No acting context resolvable → the same error cmdNew raises, before any POST.
-func TestCmdSetDefaultSettingNoContextErrors(t *testing.T) {
-	byPath := map[string]map[string]any{}
-	var hits settingsHits
-	srv := hermeticEnv(t, settingsCaptureHandler(byPath, &hits))
-	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok"}) // no DefaultContext
-
-	err := cmdSetDefaultSize(context.Background(), []string{"shared-4x"})
-	if err == nil {
-		t.Fatal("no context set must error")
-	}
-	want := "no context set — run `rift set-default-context` or pass --context <ctx>"
-	if err.Error() != want {
-		t.Fatalf("error = %q, want %q", err.Error(), want)
-	}
-	if len(byPath) != 0 {
-		t.Fatalf("nothing may be POSTed without a context: %+v", byPath)
 	}
 }
 
@@ -1530,10 +1399,10 @@ func TestSetCommandsAcceptInterleavedFlags(t *testing.T) {
 			args: []string{"iad", "--repo", "acme/widget"},
 			path: "/api/devbox-settings",
 			wantBody: map[string]any{
-				"context_id": "company:c1", "repo": "github:github.com/acme/widget",
+				"repo":    "github:github.com/acme/widget",
 				"setting": "default-region", "value": "iad",
 			},
-			absent:  []string{"clear"},
+			absent:  []string{"context_id", "clear"},
 			wantOut: "Default region set to iad",
 		},
 		"region --repo then trailing --clear": {
@@ -1541,20 +1410,21 @@ func TestSetCommandsAcceptInterleavedFlags(t *testing.T) {
 			args: []string{"--repo", "acme/widget", "--clear"},
 			path: "/api/devbox-settings",
 			wantBody: map[string]any{
-				"context_id": "company:c1", "repo": "github:github.com/acme/widget",
+				"repo":    "github:github.com/acme/widget",
 				"setting": "default-region", "clear": true,
 			},
-			absent:  []string{"value"},
+			absent:  []string{"context_id", "value"},
 			wantOut: "cleared",
 		},
-		"size value then trailing --context": {
+		"size value then trailing --repo": {
 			run:  cmdSetDefaultSize,
-			args: []string{"shared-4x", "--context", "personal:u9"},
+			args: []string{"shared-4x", "--repo", "acme/widget"},
 			path: "/api/devbox-settings",
 			wantBody: map[string]any{
-				"context_id": "personal:u9", "setting": "default-size", "value": "shared-4x",
+				"repo":    "github:github.com/acme/widget",
+				"setting": "default-size", "value": "shared-4x",
 			},
-			absent:  []string{"repo", "clear"},
+			absent:  []string{"context_id", "clear"},
 			wantOut: "Default size set to shared-4x",
 		},
 	}
@@ -1563,7 +1433,7 @@ func TestSetCommandsAcceptInterleavedFlags(t *testing.T) {
 			byPath := map[string]map[string]any{}
 			var hits settingsHits
 			srv := hermeticEnv(t, settingsCaptureHandler(byPath, &hits))
-			seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "company:c1"})
+			seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok"})
 
 			out := captureStdout(t, func() {
 				if err := c.run(context.Background(), c.args); err != nil {
@@ -1597,7 +1467,7 @@ func TestSetCommandsUnknownFlagAnywhereErrors(t *testing.T) {
 	byPath := map[string]map[string]any{}
 	var hits settingsHits
 	srv := hermeticEnv(t, settingsCaptureHandler(byPath, &hits))
-	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok", DefaultContext: "company:c1"})
+	seedConfig(t, &config.Config{APIBaseURL: srv.URL, Token: "tok"})
 
 	_ = captureStderr(t, func() { // fs.Parse prints its own usage on error
 		if err := cmdSetDefaultRegion(context.Background(), []string{"iad", "--bogus"}); err == nil ||

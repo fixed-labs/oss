@@ -113,18 +113,10 @@ type ListItem struct {
 	ImageCommit string `json:"image_commit"`
 	Size        string `json:"size"`
 	CreatedAt   int64  `json:"created_at"`
-	// Context is the box's billed context as a form-value string (the
-	// context_id it was created/claimed against). `ls --context` filters on it
-	// client-side; an empty string (pre-backfill live rows) matches no filter.
+	// Context is the box's billed context as a form-value string (the owning
+	// context the repo derived, per FIX-217). Server-populated and decoded here,
+	// but not yet surfaced by `rift ls`; an empty string is a pre-backfill live row.
 	Context string `json:"context"`
-}
-
-// ContextItem is one context the caller may act in, as returned by
-// GET /api/contexts — its stable form-value plus a human label. Platform is
-// excluded server-side, so set-default-context can never select it.
-type ContextItem struct {
-	FormValue string `json:"form_value"`
-	Label     string `json:"label"`
 }
 
 // Size is one offered VM size as returned by GET /api/workspaces/sizes — the
@@ -219,11 +211,10 @@ type CreateResult struct {
 // is always sent; it tells the api to silently fall back to the default
 // branch when an INFERRED cwd branch has no built image (false for an
 // explicit --ref, so a typo fails loudly).
-func (c *Client) Create(ctx context.Context, repo, size, region, contextID, ref, image string, fallbackToDefault bool) (*CreateResult, error) {
+func (c *Client) Create(ctx context.Context, repo, size, region, ref, image string, fallbackToDefault bool) (*CreateResult, error) {
 	var out CreateResult
 	body := map[string]any{
 		"repo":                repo,
-		"context_id":          contextID,
 		"fallback_to_default": fallbackToDefault,
 	}
 	if size != "" {
@@ -346,20 +337,6 @@ func (c *Client) List(ctx context.Context) ([]ListItem, error) {
 	return out.Workspaces, nil
 }
 
-// Contexts lists the contexts the authenticated caller may act in (Personal
-// first, then each company membership; Platform is excluded server-side). The
-// body is a wrapper object {"contexts":[…]}, not a bare array — decode it like
-// List does.
-func (c *Client) Contexts(ctx context.Context) ([]ContextItem, error) {
-	var out struct {
-		Contexts []ContextItem `json:"contexts"`
-	}
-	if err := c.do(ctx, http.MethodGet, "/api/contexts", nil, &out); err != nil {
-		return nil, err
-	}
-	return out.Contexts, nil
-}
-
 // Sizes reads the offered VM size catalog from the developer surface
 // (GET /api/workspaces/sizes — bearer-authenticated, same as List), returning
 // the offered sizes plus the effective default a blank `devbox new` resolves to.
@@ -372,14 +349,13 @@ func (c *Client) Sizes(ctx context.Context) (*SizeCatalog, error) {
 }
 
 // Regions reads the selectable region catalog from the developer surface
-// (GET /api/regions — bearer-authenticated, same as List). contextID is the
-// caller's acting context form-value (the stored `rift set-default-context`);
-// when non-empty it rides as ?context_id= so the defaults reflect the caller's
-// org. Absent ⇒ the server uses the bearer's Personal context.
-func (c *Client) Regions(ctx context.Context, contextID string) (*RegionsResult, error) {
+// (GET /api/regions — bearer-authenticated, same as List). repo, when
+// non-empty, rides as ?repo= so the defaults reflect the repo's OWNING context
+// (FIX-217); absent ⇒ the server uses the bearer's Personal context.
+func (c *Client) Regions(ctx context.Context, repo string) (*RegionsResult, error) {
 	path := "/api/regions"
-	if contextID != "" {
-		path += "?context_id=" + url.QueryEscape(contextID)
+	if repo != "" {
+		path += "?repo=" + url.QueryEscape(repo)
 	}
 	var out RegionsResult
 	if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
@@ -442,15 +418,15 @@ func (c *Client) settingsPost(ctx context.Context, path string, body any) error 
 	return nil
 }
 
-// SetDevboxSetting writes (or, with clear, clears) one context-anchored spawn
-// default via POST /api/devbox-settings. contextID is the acting context's
-// form-value ("personal:<id>" | "company:<id>"); repo optionally refines the
-// scope to a (context, repo) pair — empty means the context-wide scope;
-// setting is "default-region" | "default-size". Validity is authoritative
-// server-side (a structured 4xx surfaces its detail + selectable list; a
-// company write by a non-admin is a 403).
-func (c *Client) SetDevboxSetting(ctx context.Context, contextID, repo, setting, value string, clear bool) error {
-	body := map[string]any{"context_id": contextID, "setting": setting}
+// SetDevboxSetting writes (or, with clear, clears) one spawn default via
+// POST /api/devbox-settings. repo is REQUIRED (FIX-217): it names the repo
+// whose OWNING context's defaults the write targets (owner/admin-gated
+// server-side) — the server rejects a settings write with no repo. setting is
+// "default-region" | "default-size". Validity is authoritative server-side (a
+// structured 4xx surfaces its detail + selectable list; a repo write by a
+// non-admin is a 403).
+func (c *Client) SetDevboxSetting(ctx context.Context, repo, setting, value string, clear bool) error {
+	body := map[string]any{"setting": setting}
 	if repo != "" {
 		body["repo"] = repo
 	}
