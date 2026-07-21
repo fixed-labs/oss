@@ -114,6 +114,10 @@ type UserConfig struct {
 	path string // where this was loaded from (for Save)
 }
 
+// defaultUserConfigPath returns ~/.config/rift/secrets.json. This store is
+// deliberately ENV-SHARED across named login sessions (RIFT_ENV): it lives in a
+// different package from the env-routed config.json, and its TOFU Trusted map is
+// keyed by qualified repo id — env-independent — so trust deliberately spans envs.
 func defaultUserConfigPath() (string, error) {
 	base, err := os.UserConfigDir()
 	if err != nil {

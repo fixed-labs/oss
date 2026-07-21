@@ -302,6 +302,10 @@ func hermeticEnv(t *testing.T, h http.HandlerFunc) *httptest.Server {
 	t.Setenv("RIFT_WORKSPACE_ID", "")
 	t.Setenv("RIFT_API_URL", "")
 	t.Setenv("RIFT_TOKEN", "")
+	// Clear the env selector too: the suite may run from inside a
+	// `rift-env <env>` subshell, and a leaked RIFT_ENV would redirect every
+	// hermetic test to config.<env>.json (or, if invalid, make path() error).
+	t.Setenv("RIFT_ENV", "")
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 	return srv
@@ -557,6 +561,17 @@ func TestCmdLoginPersistsOnlyURLAndToken(t *testing.T) {
 		t.Fatalf("login must persist the API base URL, got %q", got.APIBaseURL)
 	}
 
+	// Prod routing (folded in — no standalone prod login test): the default env
+	// (RIFT_ENV cleared by hermeticEnv) is "prod", which persists to the
+	// unsuffixed config.json and NEVER forks a config.prod.json.
+	dir := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "rift")
+	if _, err := os.Stat(filepath.Join(dir, "config.json")); err != nil {
+		t.Fatalf("prod login must persist to config.json: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "config.prod.json")); !os.IsNotExist(err) {
+		t.Fatalf("prod login must NOT fork a config.prod.json (stat err=%v)", err)
+	}
+
 	// Printed-URL fallback: the always-present invariant. The captured stdout
 	// must carry the server's ACTUAL verification_url (whatever the hermetic
 	// handler returns above) plus the "Waiting for approval" line — the printed
@@ -568,6 +583,11 @@ func TestCmdLoginPersistsOnlyURLAndToken(t *testing.T) {
 	}
 	if !strings.Contains(out, "Waiting for approval") {
 		t.Fatalf("stdout must print the Waiting-for-approval fallback line, got:\n%s", out)
+	}
+	// Prod success line is a byte-for-byte invariant (design pins it). It comes
+	// LAST, after the fallback block above, so assert it as a trailing line.
+	if !strings.Contains(out, "Logged in.\n") {
+		t.Fatalf("prod login must print the exact %q line, got:\n%s", "Logged in.", out)
 	}
 }
 
@@ -1488,28 +1508,212 @@ func TestSetCommandsUnknownFlagAnywhereErrors(t *testing.T) {
 	}
 }
 
-// resolveLoginAPIURL's fallback chain: explicit flag/env > saved config >
-// hosted production default. hermeticEnv clears RIFT_API_URL and points config
-// at an empty temp dir, so the no-flag/no-config case must land on the default.
+// resolveLoginAPIURL's precedence: the typed --api flag > the RIFT_API_URL
+// override var (envURL) > the active env's saved config URL > — ONLY for env
+// "prod" — the hosted production default. fromOverrideVar is true iff the
+// override var (source 2) wins. hermeticEnv clears RIFT_API_URL and points
+// config at an empty temp dir, so a seeded/unseeded config is deterministic.
+//
+// §2.1 precedence + fromOverrideVar; §2.3 prod fallback (no saved config).
 func TestResolveLoginAPIURL(t *testing.T) {
-	t.Run("explicit flag wins", func(t *testing.T) {
+	// §2.1: flag > envURL > saved > default, and fromOverrideVar true ONLY
+	// when envURL wins.
+	t.Run("flag wins over envURL and saved", func(t *testing.T) {
 		_ = hermeticEnv(t, func(http.ResponseWriter, *http.Request) {})
 		seedConfig(t, &config.Config{APIBaseURL: "https://saved.example", Token: "t"})
-		if got := resolveLoginAPIURL("https://flag.example"); got != "https://flag.example" {
-			t.Fatalf("flag must win, got %q", got)
+		url, from, err := resolveLoginAPIURL("https://flag.example", "https://env.example", "staging")
+		if err != nil || url != "https://flag.example" || from {
+			t.Fatalf("flag must win with fromOverrideVar=false, got url=%q from=%v err=%v", url, from, err)
 		}
 	})
-	t.Run("saved config used when flag empty", func(t *testing.T) {
+	t.Run("envURL wins over saved, fromOverrideVar true", func(t *testing.T) {
 		_ = hermeticEnv(t, func(http.ResponseWriter, *http.Request) {})
 		seedConfig(t, &config.Config{APIBaseURL: "https://saved.example", Token: "t"})
-		if got := resolveLoginAPIURL(""); got != "https://saved.example" {
-			t.Fatalf("saved config must be reused, got %q", got)
+		url, from, err := resolveLoginAPIURL("", "https://env.example", "staging")
+		if err != nil || url != "https://env.example" || !from {
+			t.Fatalf("envURL must win with fromOverrideVar=true, got url=%q from=%v err=%v", url, from, err)
 		}
 	})
-	t.Run("prod default when neither flag nor config", func(t *testing.T) {
+	t.Run("saved config used when no flag/envURL, fromOverrideVar false", func(t *testing.T) {
 		_ = hermeticEnv(t, func(http.ResponseWriter, *http.Request) {})
-		if got := resolveLoginAPIURL(""); got != config.DefaultAPIBaseURL {
-			t.Fatalf("first login must default to %q, got %q", config.DefaultAPIBaseURL, got)
+		seedConfig(t, &config.Config{APIBaseURL: "https://saved.example", Token: "t"})
+		url, from, err := resolveLoginAPIURL("", "", "staging")
+		if err != nil || url != "https://saved.example" || from {
+			t.Fatalf("saved config must be reused with fromOverrideVar=false, got url=%q from=%v err=%v", url, from, err)
 		}
 	})
+	// §2.3: prod fallback intact — no saved config, empty flag/envURL, env
+	// "prod" → DefaultAPIBaseURL, fromOverrideVar=false, no error.
+	t.Run("prod default when neither flag/envURL nor config", func(t *testing.T) {
+		_ = hermeticEnv(t, func(http.ResponseWriter, *http.Request) {})
+		url, from, err := resolveLoginAPIURL("", "", "prod")
+		if err != nil || url != config.DefaultAPIBaseURL || from {
+			t.Fatalf("prod first login must default to %q with fromOverrideVar=false, got url=%q from=%v err=%v",
+				config.DefaultAPIBaseURL, url, from, err)
+		}
+	})
+}
+
+// deviceStartFatalHandler fails the test if the device flow is ever started —
+// the guard / invalid-env tests below assert cmdLogin returns BEFORE any HTTP
+// call. Any hit is a bug (the reason err != nil is the PRIMARY assertion: a
+// regressed guard would dial prod's DefaultAPIBaseURL, not this server, so a
+// hit-only check couldn't fire — but if it somehow does reach the server, this
+// makes the failure loud rather than a silent success).
+func deviceStartFatalHandler(t *testing.T) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/login/device/start" {
+			t.Errorf("device flow must NOT start: %s %s", r.Method, r.URL.Path)
+		}
+		http.NotFound(w, r)
+	}
+}
+
+// §2.2 — Non-prod login guard: RIFT_ENV=staging with an empty config (no --api,
+// no RIFT_API_URL, no saved URL) has no safe URL, so cmdLogin must ERROR before
+// the device flow rather than silently device-flowing against prod. PRIMARY
+// assertion: err != nil; the message names the env + --api; nothing persisted;
+// and the device-start handler is never hit.
+func TestCmdLoginNonProdGuardBeforeDeviceFlow(t *testing.T) {
+	_ = hermeticEnv(t, deviceStartFatalHandler(t))
+	t.Setenv("RIFT_ENV", "staging")
+
+	var err error
+	_ = captureStdout(t, func() {
+		err = cmdLogin(context.Background(), nil)
+	})
+	if err == nil {
+		t.Fatal("a non-prod login with no URL must error before the device flow")
+	}
+	if !strings.Contains(err.Error(), "staging") || !strings.Contains(err.Error(), "--api") {
+		t.Fatalf("guard error must name the env and --api, got %v", err)
+	}
+	// Nothing was persisted: no config file for staging (or prod) was written.
+	dir := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "rift")
+	if _, statErr := os.Stat(filepath.Join(dir, "config.staging.json")); !os.IsNotExist(statErr) {
+		t.Fatalf("guard must persist nothing (config.staging.json stat err=%v)", statErr)
+	}
+}
+
+// §2.7 — An invalid RIFT_ENV fails at cmdLogin's top EnvName() call, before the
+// device flow (a malformed env must not cost a browser round-trip). PRIMARY:
+// err != nil; the device-start handler is never hit.
+func TestCmdLoginInvalidEnvBeforeDeviceFlow(t *testing.T) {
+	_ = hermeticEnv(t, deviceStartFatalHandler(t))
+	t.Setenv("RIFT_ENV", "../x")
+
+	var err error
+	_ = captureStdout(t, func() {
+		err = cmdLogin(context.Background(), nil)
+	})
+	if err == nil {
+		t.Fatal("an invalid RIFT_ENV must error before the device flow")
+	}
+	if !strings.Contains(err.Error(), "RIFT_ENV") {
+		t.Fatalf("invalid-env error must name RIFT_ENV, got %v", err)
+	}
+}
+
+// §2.5 — Non-prod login, URL from the flag (or a saved URL): the success line
+// discloses the env but NOT the override-var clause, and persists to
+// config.staging.json. Substrings only (design pins only prod output).
+func TestCmdLoginNonProdDisclosureFromFlag(t *testing.T) {
+	srv := hermeticEnv(t, loginHappyHandler())
+	t.Setenv("RIFT_ENV", "staging")
+
+	out := captureStdout(t, func() {
+		if err := cmdLogin(context.Background(), []string{"--api", srv.URL}); err != nil {
+			t.Fatalf("cmdLogin: %v", err)
+		}
+	})
+	if !strings.Contains(out, srv.URL) {
+		t.Fatalf("non-prod success line must disclose the URL %q, got:\n%s", srv.URL, out)
+	}
+	if !strings.Contains(out, "(env staging") {
+		t.Fatalf("non-prod success line must disclose the env, got:\n%s", out)
+	}
+	if strings.Contains(out, "URL from") {
+		t.Fatalf("a flag-sourced URL must NOT show the override-var clause, got:\n%s", out)
+	}
+	// Persisted under the staging session, never prod's config.json.
+	dir := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "rift")
+	if _, err := os.Stat(filepath.Join(dir, "config.staging.json")); err != nil {
+		t.Fatalf("non-prod login must persist to config.staging.json: %v", err)
+	}
+}
+
+// §2.6 — Non-prod login, URL from the RIFT_API_URL override var (no --api): the
+// success line discloses the env AND names the override var — the one moment a
+// wrong-plane credential could be mis-seeded under a non-prod profile.
+func TestCmdLoginNonProdDisclosureFromOverrideVar(t *testing.T) {
+	srv := hermeticEnv(t, loginHappyHandler())
+	t.Setenv("RIFT_ENV", "staging")
+	t.Setenv("RIFT_API_URL", srv.URL)
+
+	out := captureStdout(t, func() {
+		if err := cmdLogin(context.Background(), nil); err != nil {
+			t.Fatalf("cmdLogin: %v", err)
+		}
+	})
+	if !strings.Contains(out, srv.URL) {
+		t.Fatalf("success line must disclose the URL %q, got:\n%s", srv.URL, out)
+	}
+	if !strings.Contains(out, "(env staging") {
+		t.Fatalf("success line must disclose the env, got:\n%s", out)
+	}
+	if !strings.Contains(out, "URL from RIFT_API_URL") {
+		t.Fatalf("an override-var-sourced URL must name RIFT_API_URL, got:\n%s", out)
+	}
+}
+
+// §2.8 — usage() names the RIFT_ENV selector (guards §5's hot-file main.go
+// merge from silently dropping the help line). usage() writes to STDERR.
+func TestUsageMentionsRiftEnv(t *testing.T) {
+	out := captureStderr(t, usage)
+	if !strings.Contains(out, "RIFT_ENV") {
+		t.Fatalf("usage() must mention RIFT_ENV, got:\n%s", out)
+	}
+}
+
+// §2.10 — Machine mode at the COMMAND surface: an in-VM lifecycle verb survives
+// a stray invalid RIFT_ENV. With RIFT_WORKSPACE_ID set + an invalid RIFT_ENV +
+// the machine RIFT_API_URL/RIFT_TOKEN overlay (mirroring
+// TestInVMHonorsEnvOverride), cmdKeepalive must reach its handler — NOT fail at
+// authedClient with an "invalid RIFT_ENV" error. EnvName short-circuits to
+// "prod" on a non-empty RIFT_WORKSPACE_ID, so the bad selector never reaches
+// path().
+func TestCmdKeepaliveMachineModeHonorsEnvOverride(t *testing.T) {
+	var hit bool
+	// hermeticEnv clears RIFT_WORKSPACE_ID/RIFT_API_URL/RIFT_TOKEN; the machine
+	// overlay is set below, AFTER, so it wins for this test.
+	srv := hermeticEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/api/rift/v1/ws-self/keepalive" {
+			hit = true
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		http.NotFound(w, r)
+	})
+	t.Setenv("RIFT_WORKSPACE_ID", "ws-self")
+	t.Setenv("RIFT_ENV", "../x") // a stray, invalid box-shell selector
+	t.Setenv("RIFT_API_URL", srv.URL)
+	t.Setenv("RIFT_TOKEN", "machine-tok")
+
+	var err error
+	out := captureStdout(t, func() {
+		err = cmdKeepalive(context.Background(), nil) // no id: machine acts on its own workspace
+	})
+	if err != nil {
+		if strings.Contains(err.Error(), "RIFT_ENV") {
+			t.Fatalf("a stray invalid RIFT_ENV must NOT break in-VM verbs: %v", err)
+		}
+		t.Fatalf("cmdKeepalive: %v", err)
+	}
+	if !hit {
+		t.Fatal("cmdKeepalive must reach the machine keepalive handler")
+	}
+	if !strings.Contains(out, "ws-self") {
+		t.Fatalf("keepalive confirmation should name the workspace, got:\n%s", out)
+	}
 }

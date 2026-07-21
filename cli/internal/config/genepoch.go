@@ -14,6 +14,13 @@ import (
 // The map is keyed by workspace-id. A missing file (or a missing key) means we
 // have never connected to that box, so there is no prior epoch to compare and no
 // loss to report.
+//
+// This store is deliberately ENV-SHARED across named sessions: it is reached off
+// dir() (not the env-routed config.path()), and workspace-ids are unique per
+// control plane, so a shared map cannot collide across envs. Accepted risk: two
+// concurrent `rift connect`s in different env subshells race the whole-map
+// read-modify-write; worst case is one lost epoch → one suppressed loss-notice.
+// genepoch_test.go assumes this file is env-agnostic.
 const genEpochFile = "gen-epochs.json"
 
 func genEpochPath() (string, error) {

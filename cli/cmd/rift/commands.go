@@ -21,32 +21,60 @@ import (
 	"github.com/fixed-labs/oss/cli/internal/config"
 )
 
-// resolveLoginAPIURL picks the control-plane base URL for `rift login`.
-// Precedence: the explicit --api / RIFT_API_URL value (passed in as flagVal),
-// then a previously-saved config, then the hosted production default — so a
-// first login on a laptop needs no flag while returning users keep whatever
-// endpoint they last logged into.
-func resolveLoginAPIURL(flagVal string) string {
+// resolveLoginAPIURL picks the control-plane base URL for `rift login` under
+// the active env. Precedence: the typed --api flag (flagVal), then the
+// RIFT_API_URL override var (envURL), then the active env's saved config URL,
+// then — ONLY for env "prod" — the hosted production default. For a non-prod
+// env with none of the first three, there is no safe default: returning prod's
+// URL would persist a prod credential under a staging label, so it errors
+// instead. DefaultAPIBaseURL is a non-empty compiled-in constant, so prod never
+// reaches an empty result and the guard is unreachable for prod.
+//
+// url is empty iff err != nil. fromOverrideVar is true when the override var
+// (source 2) won — the one case the success line must disclose, since an
+// ambient RIFT_API_URL is the only path that can seed a wrong-plane URL+token
+// into a non-prod profile while the guard is satisfied by design.
+func resolveLoginAPIURL(flagVal, envURL, env string) (url string, fromOverrideVar bool, err error) {
 	if flagVal != "" {
-		return flagVal
+		return flagVal, false, nil
+	}
+	if envURL != "" {
+		return envURL, true, nil
 	}
 	if prev, _ := config.Load(); prev != nil && prev.APIBaseURL != "" {
-		return prev.APIBaseURL
+		return prev.APIBaseURL, false, nil
 	}
-	return config.DefaultAPIBaseURL
+	if env != "prod" {
+		// No URL from any source and no safe default off prod — never fall
+		// back to the prod endpoint under a non-prod profile name.
+		return "", false, fmt.Errorf("no API URL saved for env %q — run rift login --api <url>", env)
+	}
+	return config.DefaultAPIBaseURL, false, nil
 }
 
 // cmdLogin runs the device flow and persists the minted bearer. The session
 // proves identity only; every command derives the owning/billing context from
 // the repo it acts on, so there is no per-device context to select or persist.
 func cmdLogin(ctx context.Context, args []string) error {
+	// Resolve the active session name first: an invalid RIFT_ENV must fail
+	// before the device flow, not after a browser round-trip.
+	env, err := config.EnvName()
+	if err != nil {
+		return err
+	}
 	fs := flag.NewFlagSet("login", flag.ContinueOnError)
-	apiFlag := fs.String("api", os.Getenv("RIFT_API_URL"), "rift API base URL")
+	// --api defaults to empty (NOT RIFT_API_URL) so a typed flag and the ambient
+	// override var stay distinguishable; RIFT_API_URL is read explicitly below.
+	apiFlag := fs.String("api", "", "rift API base URL")
 	noBrowser := fs.Bool("no-browser", false, "do not auto-open the verification URL in a browser")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	apiURL := resolveLoginAPIURL(*apiFlag)
+	envURL := os.Getenv("RIFT_API_URL")
+	apiURL, fromOverrideVar, err := resolveLoginAPIURL(*apiFlag, envURL, env)
+	if err != nil {
+		return err
+	}
 
 	c := client.New(apiURL, "")
 	startCtx, cancelStart := ctxTimeout(ctx, 30*time.Second)
@@ -92,7 +120,18 @@ func cmdLogin(ctx context.Context, args []string) error {
 	if err := cfg.Save(); err != nil {
 		return err
 	}
-	fmt.Println("Logged in.")
+	// Prod keeps today's exact line. A non-prod login discloses the env, and —
+	// when the URL came from the ambient override var rather than a typed flag —
+	// names that var, surfacing the one moment a wrong-plane credential could be
+	// mis-seeded under a non-prod profile.
+	switch {
+	case env == "prod":
+		fmt.Println("Logged in.")
+	case fromOverrideVar:
+		fmt.Printf("Logged in to %s (env %s; URL from RIFT_API_URL).\n", apiURL, env)
+	default:
+		fmt.Printf("Logged in to %s (env %s).\n", apiURL, env)
+	}
 	return nil
 }
 

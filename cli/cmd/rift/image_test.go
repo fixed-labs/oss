@@ -97,6 +97,10 @@ func hermeticNoLogin(t *testing.T) {
 	t.Setenv("HOME", d)
 	// Ensure laptop-mode (no machine-token env override).
 	t.Setenv("RIFT_WORKSPACE_ID", "")
+	// Clear the env selector: a leaked RIFT_ENV (e.g. running from a
+	// `rift-env <env>` subshell) would redirect config lookup to
+	// config.<env>.json or, if invalid, make path() error.
+	t.Setenv("RIFT_ENV", "")
 }
 
 func TestCmdImageUnknownSubcommand(t *testing.T) {

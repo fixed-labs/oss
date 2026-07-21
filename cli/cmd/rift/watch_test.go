@@ -62,3 +62,22 @@ func TestCmdWatchRoutesToHandler(t *testing.T) {
 		})
 	}
 }
+
+// §2.9 — Validate()'s env suffix reaches the USER through a command. Under a
+// hermetic HOME with RIFT_ENV=staging and no session file, a config-reading
+// command (cmdWatched, which takes no positional arg so it routes straight to
+// authedClient) surfaces an error naming the active env — proving the
+// env-naming survives from config.Validate all the way out to the command
+// (the rift mirror of the fplctl 3.9 case).
+func TestCmdWatchedNamesEnvInNoConfigError(t *testing.T) {
+	hermeticNoLogin(t)
+	t.Setenv("RIFT_ENV", "staging") // overrides hermeticNoLogin's cleared value
+
+	err := cmdWatched(context.Background(), nil)
+	if err == nil {
+		t.Fatal("a no-session config-reading command must error")
+	}
+	if !strings.Contains(err.Error(), "(RIFT_ENV=staging)") {
+		t.Fatalf("the surfaced error must name the active env, got %v", err)
+	}
+}

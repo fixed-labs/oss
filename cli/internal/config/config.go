@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 )
 
 // DefaultAPIBaseURL is the hosted production control plane. `rift login`
@@ -47,12 +48,45 @@ func dir() (string, error) {
 	return filepath.Join(base, "rift"), nil
 }
 
+// envNameRE is the env-name grammar. It is interpolated into a session
+// filename (config.<env>.json), so it doubles as a path-safety boundary.
+// Keep in sync with the same grammar in fplctl's config package and in
+// bin/rift-env.
+var envNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
+
+// EnvName returns the active session name. Machine mode (rift only): a
+// non-empty RIFT_WORKSPACE_ID means in-VM — return "prod" WITHOUT reading
+// RIFT_ENV, so a stray var in a box shell can neither redirect nor break
+// lifecycle verbs. Otherwise the selector RIFT_ENV chooses the session:
+// empty or "prod" resolves to prod (today's behavior, byte-for-byte); any
+// other value must match the grammar or this errors.
+func EnvName() (string, error) {
+	if os.Getenv("RIFT_WORKSPACE_ID") != "" {
+		return "prod", nil
+	}
+	v := os.Getenv("RIFT_ENV")
+	if v == "" || v == "prod" {
+		return "prod", nil
+	}
+	if !envNameRE.MatchString(v) {
+		return "", fmt.Errorf("invalid RIFT_ENV %q: must match ^[a-z0-9][a-z0-9-]*$", v)
+	}
+	return v, nil
+}
+
 func path() (string, error) {
 	d, err := dir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(d, "config.json"), nil
+	env, err := EnvName()
+	if err != nil {
+		return "", err
+	}
+	if env == "prod" {
+		return filepath.Join(d, "config.json"), nil
+	}
+	return filepath.Join(d, "config."+env+".json"), nil
 }
 
 // Load reads the persisted config; a missing file yields a zero Config (not
@@ -76,7 +110,9 @@ func Load() (*Config, error) {
 	return &c, nil
 }
 
-// Save writes the config 0600 (it holds the bearer).
+// Save writes the config 0600 (it holds the bearer). It routes through path()
+// so a non-prod session persists to config.<env>.json, not prod's config.json —
+// a Load()-only reroute would read the env file while writes clobbered prod.
 func (c *Config) Save() error {
 	d, err := dir()
 	if err != nil {
@@ -85,7 +121,10 @@ func (c *Config) Save() error {
 	if err := os.MkdirAll(d, 0o700); err != nil {
 		return err
 	}
-	p := filepath.Join(d, "config.json")
+	p, err := path()
+	if err != nil {
+		return err
+	}
 	b, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
 		return err
@@ -121,11 +160,18 @@ func FromEnvOrFile() (*Config, error) {
 }
 
 func (c *Config) Validate() error {
+	// Name the env in the message when non-prod. EnvName is only for the name;
+	// a bad env has already errored via Load() before Validate runs, so the
+	// error here is unreachable and ignored. Prod → suffix "" → today's wording.
+	suffix := ""
+	if env, _ := EnvName(); env != "prod" {
+		suffix = fmt.Sprintf(" (RIFT_ENV=%s)", env)
+	}
 	if c.APIBaseURL == "" {
-		return fmt.Errorf("no API URL configured — run `rift login` (or set RIFT_API_URL)")
+		return fmt.Errorf("no API URL configured%s — run `rift login` (or set RIFT_API_URL)", suffix)
 	}
 	if c.Token == "" {
-		return fmt.Errorf("not logged in — run `rift login`")
+		return fmt.Errorf("not logged in%s — run `rift login`", suffix)
 	}
 	return nil
 }

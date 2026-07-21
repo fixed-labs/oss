@@ -155,6 +155,8 @@ func usage() {
 		"  rift pool ls [REPO] [--org ORG] | set <repo> <ref> <region> <size> <count> | rm <repo> <ref> <region> <size>\n"+
 		"  rift version\n\n"+
 		"The API URL + bearer come from `rift login` (~/.config/rift/config.json).\n"+
+		"RIFT_ENV=<name> selects a named login session (default \"prod\"); create one\n"+
+		"by running rift login under that RIFT_ENV.\n"+
 		"In-VM the provisioner injects a machine token via RIFT_API_URL/RIFT_TOKEN/\n"+
 		"RIFT_WORKSPACE_ID; there only suspend/resize/keepalive are available, acting\n"+
 		"on the VM's own workspace, and <id> may be omitted.\n")
