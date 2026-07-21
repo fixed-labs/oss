@@ -111,6 +111,8 @@ func main() {
 		err = cmdRun(ctx, args)
 	case "init":
 		err = cmdInit(ctx, args)
+	case "pool":
+		err = cmdPool(ctx, args)
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -150,6 +152,7 @@ func usage() {
 		"  rift run --shell --secret NAME ...                 (subshell with secrets)\n"+
 		"  rift run --secret NAME --materialize-to PATH       (write secret to a file)\n"+
 		"  rift init | rift init emit --packages LIST [--option k=v ...]\n"+
+		"  rift pool ls [REPO] [--org ORG] | set <repo> <ref> <region> <size> <count> | rm <repo> <ref> <region> <size>\n"+
 		"  rift version\n\n"+
 		"The API URL + bearer come from `rift login` (~/.config/rift/config.json).\n"+
 		"In-VM the provisioner injects a machine token via RIFT_API_URL/RIFT_TOKEN/\n"+

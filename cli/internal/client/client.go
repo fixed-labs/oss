@@ -400,6 +400,82 @@ func (e SelectableError) Message() string {
 	return msg
 }
 
+// --- Pool operations (GET /api/pool + POST /api/pool, FIX-213) ---
+
+// PoolTupleEntry mirrors one (ref, region, size) config tuple in the GET
+// /api/pool response. The status view (when ?repo= is used) adds the live VM
+// counts (Available/Warming/Popped) and a server-derived State.
+type PoolTupleEntry struct {
+	Desired   int    `json:"desired"`   // configured count (config view)
+	Placement string `json:"placement"` // resolved Fly placement (e.g. "fly:iad")
+	// Status-view fields (present when ?repo= is used):
+	Available int    `json:"available"` // ready-to-claim VMs
+	Warming   int    `json:"warming"`   // booting VMs
+	Popped    int    `json:"popped"`    // claimed-but-not-yet-acked VMs
+	State     string `json:"state"`     // "active" | "pending-image"
+}
+
+// PoolRepoEntry is {ref → {region → {size → PoolTupleEntry}}}.
+type PoolRepoEntry map[string]map[string]map[string]PoolTupleEntry
+
+// PoolOrgMembership is one org the caller admins, returned in the personal-
+// context listing so the user can discover --org targets.
+type PoolOrgMembership struct {
+	Name string `json:"name"` // company display name
+	ID   string `json:"id"`   // CompanyId (UUID)
+}
+
+// PoolLsResult is the GET /api/pool response.
+type PoolLsResult struct {
+	Frozen  bool                     `json:"frozen"`   // ledger :frozen?
+	Cap     int                      `json:"cap"`      // per-context aggregate cap
+	Total   int                      `json:"total"`    // current Σdesired (config view)
+	Repos   map[string]PoolRepoEntry `json:"repos"`    // repo → ref → region → size → entry
+	AdminOf []PoolOrgMembership      `json:"admin_of"` // orgs the caller admins (personal view only)
+}
+
+// PoolSetResult is the POST /api/pool response on success.
+type PoolSetResult struct {
+	Accepted bool `json:"accepted"`
+	Frozen   bool `json:"frozen"` // echoed from the ledger; true = accepted but ships 0
+}
+
+// PoolLs calls GET /api/pool with the appropriate query parameter:
+//   - repoArg non-empty  → ?repo=<v>   (status / live-count view)
+//   - org non-empty      → ?org=<v>    (org config view)
+//   - both empty         → no param    (personal config view + admin-org list)
+func (c *Client) PoolLs(ctx context.Context, repoArg, org string) (*PoolLsResult, error) {
+	path := "/api/pool"
+	switch {
+	case repoArg != "":
+		path += "?repo=" + url.QueryEscape(repoArg)
+	case org != "":
+		path += "?org=" + url.QueryEscape(org)
+	}
+	var out PoolLsResult
+	if err := c.do(ctx, "GET", path, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// PoolSet calls POST /api/pool with the (repo, ref, region, size, count)
+// tuple. count=0 is the remove case (pool rm).
+func (c *Client) PoolSet(ctx context.Context, repo, ref, region, size string, count int) (*PoolSetResult, error) {
+	body := map[string]any{
+		"repo":   repo,
+		"ref":    ref,
+		"region": region,
+		"size":   size,
+		"count":  count,
+	}
+	var out PoolSetResult
+	if err := c.do(ctx, "POST", "/api/pool", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // settingsPost POSTs a settings write and surfaces a structured 4xx
 // (SelectableError shape) as its human message rather than the raw
 // "HTTP 4xx: {…json…}" APIError string; an unstructured 4xx body is surfaced
