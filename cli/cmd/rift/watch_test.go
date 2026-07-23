@@ -10,7 +10,7 @@ import (
 //
 // Seam note (same as image_test.go): a routed watch/unwatch/watched handler
 // calls the package-level authedClient() (reads config from disk/env) and
-// resolveRepo() (shells `git`) before touching the HTTP client — there is no
+// repoid.Resolve() (shells `git`) before touching the HTTP client — there is no
 // client-injection seam at this layer. What IS deterministically testable is
 // the arg/usage guards that resolve BEFORE authedClient(), and that a
 // well-formed invocation ROUTES past those guards into the handler (failing

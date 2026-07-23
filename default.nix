@@ -258,7 +258,7 @@ let
         version = "0.1.0";
         src = ./cli;
         subPackages = [ "cmd/rift" ];
-        vendorHash = "sha256-tj3ld/M4T1Hwcdj5v7H6uLTS7dWA7/99L1mEI9UZmWw=";
+        vendorHash = "sha256-YCjc4MqmaRYg0fOkmXkMZgxGc85Hn8x8qD9dKqRlsbQ=";
         # CGO off — the Go deps (wireguard-go netstack, x/crypto) are pure Go,
         # so the inner binary stays static (small closure, no glibc dep).
         env.CGO_ENABLED = "0";

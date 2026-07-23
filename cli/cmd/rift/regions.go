@@ -3,7 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
+
+	"github.com/fixed-labs/oss/cli/clikit/table"
 )
 
 // cmdRegions lists the selectable regions (the developer read surface over the
@@ -35,7 +38,7 @@ func cmdRegions(ctx context.Context, args []string) error {
 	if res.EffectiveDefault != nil {
 		def = *res.EffectiveDefault
 	}
-	fmt.Printf("%-14s  %-30s  %-11s  %s\n", "SLUG", "NAME", "STATUS", "AVAILABLE")
+	t := table.New(os.Stdout, "SLUG", "NAME", "STATUS", "AVAILABLE")
 	for _, r := range res.Regions {
 		slug := r.Slug
 		if r.Slug == def {
@@ -45,7 +48,10 @@ func cmdRegions(ctx context.Context, args []string) error {
 		if r.AvailableNow {
 			avail = "yes"
 		}
-		fmt.Printf("%-14s  %-30s  %-11s  %s\n", slug, r.DisplayName, r.Status, avail)
+		t.Row(slug, r.DisplayName, r.Status, avail)
+	}
+	if err := t.Flush(); err != nil {
+		return err
 	}
 	if def != "" {
 		fmt.Printf("\ndefault: %s\n", def)

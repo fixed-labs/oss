@@ -70,7 +70,7 @@ func TestImageFlags(t *testing.T) {
 //
 // Seam note: a VALID subcommand (ls/pin/unpin) routes into imageLs/imagePin,
 // which call the package-level authedClient() (reads config from disk/env) and
-// resolveRepo() (shells `git`) before ever touching the HTTP client — there is
+// repoid.Resolve() (shells `git`) before ever touching the HTTP client — there is
 // no client-injection seam at this layer (unlike internal/client, whose own
 // tests exercise it with an httptest server). So the dispatch's happy path can't be
 // driven against a stubbed client/server here. What IS deterministically

@@ -1,89 +1,35 @@
-// Package client is the devbox CLI's HTTP client for the server's
-// developer surface plus the device-flow login. All requests carry the
-// developer bearer; the wire shapes mirror the server's JSON exactly.
+// Package client is the rift developer CLI's HTTP client for the server's
+// developer surface. It embeds the shared httpx base (bearer-authenticated JSON
+// transport) and adds rift's endpoint methods; the wire shapes mirror the
+// server's JSON exactly. The device-flow login lives in clikit/deviceflow.
 package client
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
-	"time"
+
+	"github.com/fixed-labs/oss/cli/clikit/httpx"
 )
 
+// Client embeds the shared httpx base (Do/APIError/New + the PollTimeout field)
+// and adds rift's endpoint methods below.
 type Client struct {
-	BaseURL string
-	Token   string
-	HTTP    *http.Client
-	// PollTimeout bounds a single device-flow poll request (see
-	// DevicePoll). Zero means the production default (defaultPollTimeout);
-	// tests inject a small value to exercise the per-request-timeout branch
-	// without a real 35s wait.
-	PollTimeout time.Duration
+	*httpx.Client
 }
 
+// New builds a rift client over the shared httpx base.
 func New(baseURL, token string) *Client {
-	return &Client{
-		BaseURL: baseURL,
-		Token:   token,
-		// Long enough to outlive the api's ≤25s long-poll hold (ls/connect
-		// watchers); per-call contexts bound the rest.
-		HTTP: &http.Client{Timeout: 35 * time.Second},
-	}
+	return &Client{Client: httpx.New(baseURL, token)}
 }
 
-// APIError carries a non-2xx response so callers can branch on status (e.g.
-// 409 image-not-ready, 503 no-ready-relay/pool-full).
-type APIError struct {
-	Status int
-	Body   string
-}
-
-func (e *APIError) Error() string {
-	return fmt.Sprintf("HTTP %d: %s", e.Status, e.Body)
-}
-
-func (c *Client) do(ctx context.Context, method, path string, body any, out any) error {
-	var rdr io.Reader
-	if body != nil {
-		b, err := json.Marshal(body)
-		if err != nil {
-			return err
-		}
-		rdr = bytes.NewReader(b)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, c.BaseURL+path, rdr)
-	if err != nil {
-		return err
-	}
-	if c.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.Token)
-	}
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return &APIError{Status: resp.StatusCode, Body: string(raw)}
-	}
-	if out != nil && len(raw) > 0 {
-		if err := json.Unmarshal(raw, out); err != nil {
-			return fmt.Errorf("decode %s %s: %w", method, path, err)
-		}
-	}
-	return nil
-}
+// APIError is re-exported from httpx so existing callers keep using
+// client.APIError (asAPIError, explainCreate, the settings decode, …).
+type APIError = httpx.APIError
 
 // --- Workspace shapes (mirror the server's workspace / listing JSON) ---
 
@@ -229,7 +175,7 @@ func (c *Client) Create(ctx context.Context, repo, size, region, ref, image stri
 	if image != "" {
 		body["image"] = image
 	}
-	if err := c.do(ctx, http.MethodPost, "/api/workspaces", body, &out); err != nil {
+	if err := c.Do(ctx, http.MethodPost, "/api/workspaces", body, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -262,7 +208,7 @@ func (c *Client) ListImages(ctx context.Context, repo string, limit int) ([]Imag
 		path += "&limit=" + strconv.Itoa(limit)
 	}
 	var out []ImageItem
-	if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+	if err := c.Do(ctx, http.MethodGet, path, nil, &out); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -280,7 +226,7 @@ func (c *Client) UnpinImage(ctx context.Context, repo, commit string) error {
 func (c *Client) imagePin(ctx context.Context, repo, commit, leaf string) error {
 	path := "/api/repos/images/" + url.PathEscape(commit) + "/" + leaf +
 		"?repo=" + url.QueryEscape(repo)
-	return c.do(ctx, http.MethodPost, path, nil, nil)
+	return c.Do(ctx, http.MethodPost, path, nil, nil)
 }
 
 // --- Watched refs (GET /api/repos/watched?repo=… + watch/unwatch, FIX-202) ---
@@ -304,7 +250,7 @@ type WatchedRef struct {
 func (c *Client) ListWatched(ctx context.Context, repo string) ([]WatchedRef, error) {
 	path := "/api/repos/watched?repo=" + url.QueryEscape(repo)
 	var out []WatchedRef
-	if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+	if err := c.Do(ctx, http.MethodGet, path, nil, &out); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -323,7 +269,7 @@ func (c *Client) Unwatch(ctx context.Context, repo, ref string) error {
 
 func (c *Client) setWatch(ctx context.Context, repo, ref, leaf string) error {
 	path := "/api/repos/" + leaf + "?repo=" + url.QueryEscape(repo)
-	return c.do(ctx, http.MethodPost, path, map[string]string{"ref": ref}, nil)
+	return c.Do(ctx, http.MethodPost, path, map[string]string{"ref": ref}, nil)
 }
 
 // List does a single absolute read (no cursor → snapshot).
@@ -331,7 +277,7 @@ func (c *Client) List(ctx context.Context) ([]ListItem, error) {
 	var out struct {
 		Workspaces []ListItem `json:"workspaces"`
 	}
-	if err := c.do(ctx, http.MethodGet, "/api/workspaces", nil, &out); err != nil {
+	if err := c.Do(ctx, http.MethodGet, "/api/workspaces", nil, &out); err != nil {
 		return nil, err
 	}
 	return out.Workspaces, nil
@@ -342,7 +288,7 @@ func (c *Client) List(ctx context.Context) ([]ListItem, error) {
 // the offered sizes plus the effective default a blank `devbox new` resolves to.
 func (c *Client) Sizes(ctx context.Context) (*SizeCatalog, error) {
 	var out SizeCatalog
-	if err := c.do(ctx, http.MethodGet, "/api/workspaces/sizes", nil, &out); err != nil {
+	if err := c.Do(ctx, http.MethodGet, "/api/workspaces/sizes", nil, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -358,7 +304,7 @@ func (c *Client) Regions(ctx context.Context, repo string) (*RegionsResult, erro
 		path += "?repo=" + url.QueryEscape(repo)
 	}
 	var out RegionsResult
-	if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+	if err := c.Do(ctx, http.MethodGet, path, nil, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -453,7 +399,7 @@ func (c *Client) PoolLs(ctx context.Context, repoArg, org string) (*PoolLsResult
 		path += "?org=" + url.QueryEscape(org)
 	}
 	var out PoolLsResult
-	if err := c.do(ctx, "GET", path, nil, &out); err != nil {
+	if err := c.Do(ctx, "GET", path, nil, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -470,7 +416,7 @@ func (c *Client) PoolSet(ctx context.Context, repo, ref, region, size string, co
 		"count":  count,
 	}
 	var out PoolSetResult
-	if err := c.do(ctx, "POST", "/api/pool", body, &out); err != nil {
+	if err := c.Do(ctx, "POST", "/api/pool", body, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -481,7 +427,7 @@ func (c *Client) PoolSet(ctx context.Context, repo, ref, region, size string, co
 // "HTTP 4xx: {…json…}" APIError string; an unstructured 4xx body is surfaced
 // verbatim.
 func (c *Client) settingsPost(ctx context.Context, path string, body any) error {
-	if err := c.do(ctx, http.MethodPost, path, body, nil); err != nil {
+	if err := c.Do(ctx, http.MethodPost, path, body, nil); err != nil {
 		var ae *APIError
 		if errors.As(err, &ae) && ae.Status >= 400 && ae.Status < 500 {
 			if se, ok := DecodeSelectableError(ae.Body); ok {
@@ -540,7 +486,7 @@ func (c *Client) Get(ctx context.Context, id, cursor string) (*Workspace, string
 		Workspace Workspace `json:"workspace"`
 		Cursor    string    `json:"cursor"`
 	}
-	if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+	if err := c.Do(ctx, http.MethodGet, path, nil, &out); err != nil {
 		// Long-poll hold timed out with no change → 304. The cursor is still
 		// current, so signal "no change" by returning an empty workspace and the
 		// SAME cursor (re-poll), not an error. Uses the same 304 no-change
@@ -557,7 +503,7 @@ func (c *Client) Get(ctx context.Context, id, cursor string) (*Workspace, string
 }
 
 func (c *Client) simplePost(ctx context.Context, id, leaf string, body any) error {
-	return c.do(ctx, http.MethodPost, "/api/workspaces/"+url.PathEscape(id)+"/"+leaf, body, nil)
+	return c.Do(ctx, http.MethodPost, "/api/workspaces/"+url.PathEscape(id)+"/"+leaf, body, nil)
 }
 
 func (c *Client) Suspend(ctx context.Context, id string) error {
@@ -584,7 +530,7 @@ func (c *Client) Presence(ctx context.Context, id string) error {
 }
 
 func (c *Client) Destroy(ctx context.Context, id string) error {
-	return c.do(ctx, http.MethodDelete, "/api/workspaces/"+url.PathEscape(id), nil, nil)
+	return c.Do(ctx, http.MethodDelete, "/api/workspaces/"+url.PathEscape(id), nil, nil)
 }
 
 // --- Machine-token self-service routes (in-VM) ---
@@ -597,7 +543,7 @@ func (c *Client) Destroy(ctx context.Context, id string) error {
 // workspace may only act on itself.
 
 func (c *Client) machinePost(ctx context.Context, id, leaf string, body any) error {
-	return c.do(ctx, http.MethodPost, "/api/rift/v1/"+url.PathEscape(id)+"/"+leaf, body, nil)
+	return c.Do(ctx, http.MethodPost, "/api/rift/v1/"+url.PathEscape(id)+"/"+leaf, body, nil)
 }
 
 func (c *Client) MachineSuspend(ctx context.Context, id string) error {
@@ -652,5 +598,5 @@ func (c *Client) Detach(ctx context.Context, id, laptopWgPubkey string) error {
 }
 
 func (c *Client) simplePostOut(ctx context.Context, id, leaf string, body, out any) error {
-	return c.do(ctx, http.MethodPost, "/api/workspaces/"+url.PathEscape(id)+"/"+leaf, body, out)
+	return c.Do(ctx, http.MethodPost, "/api/workspaces/"+url.PathEscape(id)+"/"+leaf, body, out)
 }

@@ -3,7 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
+
+	"github.com/fixed-labs/oss/cli/clikit/table"
 )
 
 // cmdSizes lists the offered VM sizes (the developer read surface over the
@@ -29,13 +32,17 @@ func cmdSizes(ctx context.Context, args []string) error {
 	if cat.EffectiveDefault != nil {
 		def = *cat.EffectiveDefault
 	}
-	fmt.Printf("%-14s  %-30s  %4s  %8s  %s\n", "ID", "NAME", "CPU", "MEM(MB)", "PRICE")
+	t := table.New(os.Stdout, "ID", "NAME", "CPU", "MEM(MB)", "PRICE").
+		WithRightAlign(2, 3)
 	for _, s := range cat.Sizes {
 		id := s.ID
 		if s.ID == def {
 			id += "*" // mark the effective default row
 		}
-		fmt.Printf("%-14s  %-30s  %4d  %8d  %s\n", id, s.DisplayName, s.CPU, s.MemoryMB, s.Price)
+		t.Row(id, s.DisplayName, fmt.Sprintf("%d", s.CPU), fmt.Sprintf("%d", s.MemoryMB), s.Price)
+	}
+	if err := t.Flush(); err != nil {
+		return err
 	}
 	if def != "" {
 		fmt.Printf("\ndefault: %s\n", def)

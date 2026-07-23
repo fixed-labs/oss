@@ -24,12 +24,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/fixed-labs/oss/cli/clikit/kongx"
 	"github.com/fixed-labs/oss/cli/internal/client"
 	"github.com/fixed-labs/oss/cli/internal/config"
 	"github.com/fixed-labs/oss/cli/internal/diag"
@@ -123,6 +125,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "rift: unknown command %q\n", cmd)
 		usage()
 		os.Exit(2)
+	}
+	if errors.Is(err, kongx.ErrHelp) {
+		return // --help already printed the help text; exit 0.
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "rift: %v\n", err)

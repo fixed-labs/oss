@@ -4,12 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
+	"github.com/fixed-labs/oss/cli/clikit/kongx"
+	"github.com/fixed-labs/oss/cli/clikit/table"
 	"github.com/fixed-labs/oss/cli/internal/client"
+	"github.com/fixed-labs/oss/cli/internal/repoid"
 )
 
 // cmdPool is the `rift pool` command group: manage per-(repo, ref, region, size)
@@ -40,18 +43,17 @@ func cmdPool(ctx context.Context, args []string) error {
 // --- pool ls ---
 
 func poolLs(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("pool ls", flag.ContinueOnError)
-	org := fs.String("org", "", "show config for this org (name or id) instead of personal context")
-	if err := fs.Parse(args); err != nil {
+	var flags struct {
+		Org  string `name:"org" help:"show config for this org (name or id) instead of personal context"`
+		Repo string `arg:"" optional:"" help:"an optional REPO arg for the status (live-count) view"`
+	}
+	if err := kongx.Parse("pool ls", &flags, args); err != nil {
 		return err
 	}
 
 	// Positional: an optional REPO arg for the status (live-count) view.
-	var repoArg string
-	if fs.NArg() > 0 {
-		repoArg = fs.Arg(0)
-	}
-	if repoArg != "" && *org != "" {
+	repoArg := flags.Repo
+	if repoArg != "" && flags.Org != "" {
 		return fmt.Errorf("rift pool ls: --org and a REPO argument are mutually exclusive")
 	}
 
@@ -62,7 +64,7 @@ func poolLs(ctx context.Context, args []string) error {
 	rctx, cancel := ctxTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	result, err := c.PoolLs(rctx, repoArg, *org)
+	result, err := c.PoolLs(rctx, repoArg, flags.Org)
 	if err != nil {
 		return explainPoolError(err)
 	}
@@ -79,16 +81,18 @@ func poolLs(ctx context.Context, args []string) error {
 			fmt.Printf("No warm pools configured for %s.\n", repoArg)
 			return nil
 		}
-		fmt.Printf("%-30s  %-14s  %-12s  %-4s  %3s %3s %3s %3s  %s\n",
-			"REPO", "REF", "REGION", "SIZE", "DES", "AVL", "WRM", "POP", "STATE")
-		printPoolRows(result.Repos, true)
-		return nil
+		t := table.New(os.Stdout,
+			"REPO", "REF", "REGION", "SIZE", "DES", "AVL", "WRM", "POP", "STATE").
+			WithMaxWidths(30, 14, 12, 4).
+			WithRightAlign(4, 5, 6, 7)
+		addPoolRows(t, result.Repos, true)
+		return t.Flush()
 	}
 
 	// ---- config view (personal or --org) ----
 	scope := "personal"
-	if *org != "" {
-		scope = "org " + *org
+	if flags.Org != "" {
+		scope = "org " + flags.Org
 	}
 	if len(result.Repos) == 0 {
 		fmt.Printf("No warm pools configured (%s).\n", scope)
@@ -96,13 +100,18 @@ func poolLs(ctx context.Context, args []string) error {
 		if result.Cap > 0 {
 			fmt.Printf("Cap: %d used / %d total\n\n", result.Total, result.Cap)
 		}
-		fmt.Printf("%-30s  %-14s  %-12s  %-4s  %3s\n",
-			"REPO", "REF", "REGION", "SIZE", "DES")
-		printPoolRows(result.Repos, false)
+		t := table.New(os.Stdout,
+			"REPO", "REF", "REGION", "SIZE", "DES").
+			WithMaxWidths(30, 14, 12, 4).
+			WithRightAlign(4)
+		addPoolRows(t, result.Repos, false)
+		if err := t.Flush(); err != nil {
+			return err
+		}
 	}
 
 	// ---- admin-org listing (personal view only, for --org discovery) ----
-	if *org == "" && repoArg == "" && len(result.AdminOf) > 0 {
+	if flags.Org == "" && repoArg == "" && len(result.AdminOf) > 0 {
 		fmt.Println()
 		fmt.Println("Orgs you admin (use --org <name-or-id> to view their pools):")
 		for _, m := range result.AdminOf {
@@ -112,21 +121,24 @@ func poolLs(ctx context.Context, args []string) error {
 	return nil
 }
 
-// printPoolRows renders the repos map.  showLive adds the available/warming/popped/state columns.
-func printPoolRows(repos map[string]client.PoolRepoEntry, showLive bool) {
+// addPoolRows appends the repos map as table rows. showLive adds the
+// available/warming/popped/state columns. Repo/ref/region/size columns are
+// capped by the table's WithMaxWidths (30/14/12/4), matching the prior trunc().
+func addPoolRows(t *table.Table, repos map[string]client.PoolRepoEntry, showLive bool) {
 	for repo, refs := range repos {
 		for ref, regions := range refs {
 			for region, sizes := range regions {
 				for size, entry := range sizes {
 					if showLive {
-						fmt.Printf("%-30s  %-14s  %-12s  %-4s  %3d %3d %3d %3d  %s\n",
-							trunc(repo, 30), trunc(ref, 14), trunc(region, 12), trunc(size, 4),
-							entry.Desired, entry.Available, entry.Warming, entry.Popped,
+						t.Row(repo, ref, region, size,
+							fmt.Sprintf("%d", entry.Desired),
+							fmt.Sprintf("%d", entry.Available),
+							fmt.Sprintf("%d", entry.Warming),
+							fmt.Sprintf("%d", entry.Popped),
 							entry.State)
 					} else {
-						fmt.Printf("%-30s  %-14s  %-12s  %-4s  %3d\n",
-							trunc(repo, 30), trunc(ref, 14), trunc(region, 12), trunc(size, 4),
-							entry.Desired)
+						t.Row(repo, ref, region, size,
+							fmt.Sprintf("%d", entry.Desired))
 					}
 				}
 			}
@@ -134,30 +146,24 @@ func printPoolRows(repos map[string]client.PoolRepoEntry, showLive bool) {
 	}
 }
 
-// trunc truncates s to at most n runes, adding "…" if shortened.
-func trunc(s string, n int) string {
-	runes := []rune(s)
-	if len(runes) <= n {
-		return s
-	}
-	if n <= 1 {
-		return string(runes[:n])
-	}
-	return string(runes[:n-1]) + "…"
-}
-
 // --- pool set ---
 
 func poolSet(ctx context.Context, args []string) error {
 	const usage = "usage: rift pool set <repo> <ref> <region> <size> <count>"
-	fs := flag.NewFlagSet("pool set", flag.ContinueOnError)
-	if err := fs.Parse(args); err != nil {
+	var flags struct {
+		Repo   string `arg:"" optional:"" help:"repo (owner/name, a clone URL, or forge:host/owner/name)"`
+		Ref    string `arg:"" optional:"" help:"git ref"`
+		Region string `arg:"" optional:"" help:"placement/region"`
+		Size   string `arg:"" optional:"" help:"guest size"`
+		Count  string `arg:"" optional:"" help:"desired warm count (non-negative integer)"`
+	}
+	if err := kongx.Parse("pool set", &flags, args); err != nil {
 		return err
 	}
-	if fs.NArg() < 5 {
+	if flags.Repo == "" || flags.Ref == "" || flags.Region == "" || flags.Size == "" || flags.Count == "" {
 		return fmt.Errorf(usage)
 	}
-	repoRaw, ref, region, size, countStr := fs.Arg(0), fs.Arg(1), fs.Arg(2), fs.Arg(3), fs.Arg(4)
+	repoRaw, ref, region, size, countStr := flags.Repo, flags.Ref, flags.Region, flags.Size, flags.Count
 	// Watched refs are stored in full "refs/heads/<branch>" form (what the
 	// server's ref-watched check + claim pop key on), so normalize a bare
 	// branch here too — matches `rift new --ref` and the server's own normalize.
@@ -166,7 +172,7 @@ func poolSet(ctx context.Context, args []string) error {
 	if _, err := fmt.Sscanf(countStr, "%d", &count); err != nil || count < 0 {
 		return fmt.Errorf("count must be a non-negative integer (got %q)\n%s", countStr, usage)
 	}
-	repo, err := resolveRepoIdentity(repoRaw, "")
+	repo, err := repoid.ResolveIdentity(repoRaw, "")
 	if err != nil {
 		return err
 	}
@@ -192,18 +198,23 @@ func poolSet(ctx context.Context, args []string) error {
 
 func poolRm(ctx context.Context, args []string) error {
 	const usage = "usage: rift pool rm <repo> <ref> <region> <size>"
-	fs := flag.NewFlagSet("pool rm", flag.ContinueOnError)
-	if err := fs.Parse(args); err != nil {
+	var flags struct {
+		Repo   string `arg:"" optional:"" help:"repo (owner/name, a clone URL, or forge:host/owner/name)"`
+		Ref    string `arg:"" optional:"" help:"git ref"`
+		Region string `arg:"" optional:"" help:"placement/region"`
+		Size   string `arg:"" optional:"" help:"guest size"`
+	}
+	if err := kongx.Parse("pool rm", &flags, args); err != nil {
 		return err
 	}
-	if fs.NArg() < 4 {
+	if flags.Repo == "" || flags.Ref == "" || flags.Region == "" || flags.Size == "" {
 		return fmt.Errorf(usage)
 	}
-	repoRaw, ref, region, size := fs.Arg(0), fs.Arg(1), fs.Arg(2), fs.Arg(3)
+	repoRaw, ref, region, size := flags.Repo, flags.Ref, flags.Region, flags.Size
 	// Normalize the ref to full "refs/heads/<branch>" form so a removal keyed on
 	// a bare branch still matches the stored (normalized) tuple key.
 	ref = normalizeRef(ref)
-	repo, err := resolveRepoIdentity(repoRaw, "")
+	repo, err := repoid.ResolveIdentity(repoRaw, "")
 	if err != nil {
 		return err
 	}

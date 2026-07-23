@@ -1,10 +1,14 @@
 go_mod(name="mod")
 
 # The shared canonical-repo test vectors — single source of truth for the
-# repo-identity grammar, consumed by BOTH the Go CLI test (package-relative
-# `testdata/canonical-repo-vectors.json`, so the oss/ subtree and its nix
-# build stay self-contained) and the Clojure lib/ids test (via this files()
-# target, materialized at its repo-relative path in the pants test sandbox).
+# repo-identity grammar. This one `cmd/rift/testdata/` copy is read by BOTH the
+# Go fixtures test (cmd/rift/repoid_fixtures_test.go, which drives the exported
+# repoid.CanonicalRepo; package-relative, wired into the go_package below so the
+# pants sandbox materializes it) and the Clojure lib/ids test (via this files()
+# target, materialized at its repo-relative path in the pants sandbox). The
+# resolver itself moved to internal/repoid, but its fixtures test stays here so
+# this remains the single cross-language vectors copy (no drift-prone second
+# copy under internal/repoid/testdata).
 files(
     name="repo-fixtures",
     sources=["cmd/rift/testdata/canonical-repo-vectors.json"],

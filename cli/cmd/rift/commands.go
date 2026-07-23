@@ -5,52 +5,25 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"golang.org/x/term"
 
+	"github.com/fixed-labs/oss/cli/clikit/deviceflow"
+	"github.com/fixed-labs/oss/cli/clikit/httpx"
+	"github.com/fixed-labs/oss/cli/clikit/kongx"
+	"github.com/fixed-labs/oss/cli/clikit/login"
+	"github.com/fixed-labs/oss/cli/clikit/table"
 	"github.com/fixed-labs/oss/cli/internal/client"
 	"github.com/fixed-labs/oss/cli/internal/config"
+	"github.com/fixed-labs/oss/cli/internal/repoid"
 )
-
-// resolveLoginAPIURL picks the control-plane base URL for `rift login` under
-// the active env. Precedence: the typed --api flag (flagVal), then the
-// RIFT_API_URL override var (envURL), then the active env's saved config URL,
-// then — ONLY for env "prod" — the hosted production default. For a non-prod
-// env with none of the first three, there is no safe default: returning prod's
-// URL would persist a prod credential under a staging label, so it errors
-// instead. DefaultAPIBaseURL is a non-empty compiled-in constant, so prod never
-// reaches an empty result and the guard is unreachable for prod.
-//
-// url is empty iff err != nil. fromOverrideVar is true when the override var
-// (source 2) won — the one case the success line must disclose, since an
-// ambient RIFT_API_URL is the only path that can seed a wrong-plane URL+token
-// into a non-prod profile while the guard is satisfied by design.
-func resolveLoginAPIURL(flagVal, envURL, env string) (url string, fromOverrideVar bool, err error) {
-	if flagVal != "" {
-		return flagVal, false, nil
-	}
-	if envURL != "" {
-		return envURL, true, nil
-	}
-	if prev, _ := config.Load(); prev != nil && prev.APIBaseURL != "" {
-		return prev.APIBaseURL, false, nil
-	}
-	if env != "prod" {
-		// No URL from any source and no safe default off prod — never fall
-		// back to the prod endpoint under a non-prod profile name.
-		return "", false, fmt.Errorf("no API URL saved for env %q — run rift login --api <url>", env)
-	}
-	return config.DefaultAPIBaseURL, false, nil
-}
 
 // cmdLogin runs the device flow and persists the minted bearer. The session
 // proves identity only; every command derives the owning/billing context from
@@ -62,24 +35,34 @@ func cmdLogin(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	fs := flag.NewFlagSet("login", flag.ContinueOnError)
 	// --api defaults to empty (NOT RIFT_API_URL) so a typed flag and the ambient
 	// override var stay distinguishable; RIFT_API_URL is read explicitly below.
-	apiFlag := fs.String("api", "", "rift API base URL")
-	noBrowser := fs.Bool("no-browser", false, "do not auto-open the verification URL in a browser")
-	if err := fs.Parse(args); err != nil {
+	var c struct {
+		API       string `name:"api" help:"rift API base URL"`
+		NoBrowser bool   `name:"no-browser" help:"do not auto-open the verification URL in a browser"`
+	}
+	if err := kongx.Parse("login", &c, args); err != nil {
 		return err
 	}
 	envURL := os.Getenv("RIFT_API_URL")
-	apiURL, fromOverrideVar, err := resolveLoginAPIURL(*apiFlag, envURL, env)
+	// Source 3 of the FIX-246 precedence: the active env's previously-saved URL.
+	savedURL := ""
+	if prev, _ := config.Load(); prev != nil {
+		savedURL = prev.APIBaseURL
+	}
+	apiURL, fromOverrideVar, err := login.ResolveURL(c.API, envURL, savedURL, env, config.DefaultAPIBaseURL)
 	if err != nil {
+		if errors.Is(err, login.ErrNoURLForEnv) {
+			// Render rift's own guard wording (the shared sentinel carries none).
+			return fmt.Errorf("no API URL saved for env %q — run rift login --api <url>", env)
+		}
 		return err
 	}
 
-	c := client.New(apiURL, "")
+	hc := httpx.New(apiURL, "")
 	startCtx, cancelStart := ctxTimeout(ctx, 30*time.Second)
 	defer cancelStart()
-	start, err := c.DeviceStart(startCtx)
+	start, err := deviceflow.Start(startCtx, hc)
 	if err != nil {
 		return fmt.Errorf("starting login: %w", err)
 	}
@@ -90,8 +73,8 @@ func cmdLogin(ctx context.Context, args []string) error {
 		url, start.UserCode)
 
 	interactive := term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd()))
-	if shouldAutoOpen(os.Getenv, interactive, *noBrowser) {
-		if err := openBrowser(url); err != nil {
+	if login.ShouldAutoOpen(os.Getenv, interactive, c.NoBrowser) {
+		if err := login.OpenBrowser(url); err != nil {
 			slog.Warn("rift login: could not open browser", "err", err) // → diag logfile
 		}
 	}
@@ -99,14 +82,14 @@ func cmdLogin(ctx context.Context, args []string) error {
 	pollCtx, cancelPoll := ctxTimeout(ctx, 10*time.Minute)
 	defer cancelPoll()
 
-	var tok *client.DeviceToken
+	var tok *deviceflow.DeviceToken
 	if interactive {
-		tok, err = pollInteractive(pollCtx, cancelPoll, c, start, url)
+		tok, err = login.PollInteractive(pollCtx, cancelPoll, hc, start, url)
 	} else {
-		tok, err = c.PollUntilToken(pollCtx, start) // today's behavior exactly
+		tok, err = deviceflow.PollUntilToken(pollCtx, hc, start) // today's behavior exactly
 	}
 	if err != nil {
-		if errors.Is(err, errLoginCanceled) {
+		if errors.Is(err, login.ErrLoginCanceled) {
 			return err // main renders "rift: login canceled", exit 1
 		}
 		return fmt.Errorf("login: %w", err) // keep today's wrap for timeout/network errors
@@ -139,8 +122,8 @@ func cmdLogin(ctx context.Context, args []string) error {
 // see (owner-scoped, server-side). There is no context filter: context is
 // derived from the repo, never a user-facing selector.
 func cmdList(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("ls", flag.ContinueOnError)
-	if err := fs.Parse(args); err != nil {
+	var flags struct{}
+	if err := kongx.Parse("ls", &flags, args); err != nil {
 		return err
 	}
 	c, _, err := authedClient()
@@ -157,219 +140,33 @@ func cmdList(ctx context.Context, args []string) error {
 		fmt.Println("No workspaces.")
 		return nil
 	}
-	fmt.Printf("%-38s  %-12s  %-10s  %s\n", "WORKSPACE", "STATUS", "SIZE", "REPO")
+	t := table.New(os.Stdout, "WORKSPACE", "STATUS", "SIZE", "REPO")
 	for _, it := range items {
-		fmt.Printf("%-38s  %-12s  %-10s  %s\n", it.WorkspaceID, it.Status, it.Size, it.Repo)
+		t.Row(it.WorkspaceID, it.Status, it.Size, it.Repo)
 	}
-	return nil
-}
-
-// --- Repo identity: canonical grammar + offline forge resolution (flow 1) ---
-//
-// A repo is identified by the canonical forge-qualified string
-// "<forge>:<host>/<owner>/<name>" (e.g. "github:github.com/acme/widget") — the
-// identical grammar the server validates at ingress. The checked-in fixtures
-// (testdata/canonical-repo-vectors.json, shared with the server's Clojure
-// tests) are the executable contract. Only forge "github" on host github.com
-// is serviced this phase; everything else is rejected, never guessed.
-
-// forgeEnum is the closed set of forge-type tokens the grammar recognizes
-// (pinned identically in the server implementation). Membership drives the
-// already-canonical (form-2) input classification; it does NOT mean the forge
-// is serviceable — only "github" validates this phase.
-var forgeEnum = map[string]bool{
-	"github":       true,
-	"gitlab":       true,
-	"bitbucket":    true,
-	"gitea":        true,
-	"forgejo":      true,
-	"azure-devops": true,
-	"sourcehut":    true,
-}
-
-// saasForges is the closed built-in table of well-known SaaS hosts → forge
-// type: one of the two explicit forge sources (the other is --forge). An
-// unrecognized host is an error, never a guess. github.com only this phase.
-var saasForges = map[string]string{"github.com": "github"}
-
-// implementedForges is the set --forge accepts this phase: only "github" is
-// serviced end to end. Distinct from forgeEnum (grammar-recognized tokens) —
-// an in-enum-but-unimplemented --forge (e.g. gitlab) is rejected with the
-// unknown/unsupported-forge error, never passed through to canonicalization
-// (which would mis-report a shape problem the input doesn't have).
-var implementedForges = map[string]bool{"github": true}
-
-// defaultRepoHost is the host a host-less bare "owner/name" pair resolves to.
-const defaultRepoHost = "github.com"
-
-// errRepoInvalid is the pinned rejection for any input canonicalRepo cannot
-// parse or validate.
-var errRepoInvalid = errors.New("invalid repo — use owner/repo or the full forge:host/owner/repo form")
-
-// GitHub segment character rules, applied after lowercasing: owner has no
-// leading/trailing/consecutive hyphens and is ≤39 chars; name is ≤100 chars of
-// [a-z0-9._-] and not "." or "..".
-var (
-	githubOwnerRe = regexp.MustCompile(`^[a-z0-9](-?[a-z0-9])*$`)
-	githubNameRe  = regexp.MustCompile(`^[a-z0-9._-]+$`)
-)
-
-// decomposeRepo classifies a raw repo input into one of the grammar's four
-// forms and splits it into a host authority and a repo path. The order is
-// load-bearing (the forms collide on ':'):
-//
-//  1. contains "://"             → URL: authority up to the first '/', path after.
-//  2. leading "<forge-enum>:"    → already-canonical: strip the prefix (the
-//     caller's resolved forge is authoritative); authority up to the first '/'.
-//  3. a ':' before the first '/' → scp "[user@]host:path" — the colon is a path
-//     separator, scp carries NO port ("git@host:2021/repo" is path "2021/repo").
-//  4. else                       → bare "owner/name" pair (no host).
-//
-// hasHost is false only for form 4.
-func decomposeRepo(in string) (authority string, hasHost bool, path string) {
-	// splitAuthority: authority up to the first '/', path after it.
-	splitAuthority := func(rest string) (string, bool, string) {
-		if j := strings.IndexByte(rest, '/'); j >= 0 {
-			return rest[:j], true, rest[j+1:]
-		}
-		return rest, true, ""
-	}
-	if i := strings.Index(in, "://"); i >= 0 {
-		return splitAuthority(in[i+3:])
-	}
-	if i := strings.IndexByte(in, ':'); i >= 0 && forgeEnum[strings.ToLower(in[:i])] {
-		return splitAuthority(in[i+1:])
-	}
-	ci := strings.IndexByte(in, ':')
-	si := strings.IndexByte(in, '/')
-	if ci >= 0 && (si < 0 || ci < si) {
-		return in[:ci], true, in[ci+1:]
-	}
-	return "", false, in
-}
-
-// canonicalHost normalizes a host authority — the single host canonicalizer
-// used at every parse/compare site: strip an embedded "user[:pass]@",
-// lowercase, drop a trailing "/", drop a ":443".
-func canonicalHost(authority string) string {
-	if i := strings.LastIndexByte(authority, '@'); i >= 0 {
-		authority = authority[i+1:]
-	}
-	h := strings.ToLower(authority)
-	h = strings.TrimSuffix(h, "/")
-	h = strings.TrimSuffix(h, ":443")
-	return h
-}
-
-// canonicalRepo normalizes a repo input (URL, scp, bare pair, or an
-// already-canonical string) to the canonical "<forge>:<host>/<owner>/<name>"
-// the whole pipeline keys on. forge is the pre-resolved forge type (see
-// resolveRepoIdentity); defaultHost applies only when the input carries no
-// host (the bare-pair case). Idempotent on canonical "github" input. Only
-// forge "github" on host github.com validates this phase — anything else is
-// errRepoInvalid.
-func canonicalRepo(input, forge, defaultHost string) (string, error) {
-	authority, hasHost, path := decomposeRepo(strings.TrimSpace(input))
-	host := canonicalHost(defaultHost)
-	if hasHost {
-		host = canonicalHost(authority)
-	}
-	f := strings.ToLower(strings.TrimSpace(forge))
-	if f != "github" || host != "github.com" {
-		return "", errRepoInvalid
-	}
-	path = strings.TrimRight(path, "/")
-	path = strings.TrimSuffix(path, ".git")
-	segs := strings.Split(path, "/")
-	for i, s := range segs {
-		if s == "" {
-			return "", errRepoInvalid
-		}
-		segs[i] = strings.ToLower(s)
-	}
-	if len(segs) != 2 { // github namespace depth is exactly 1 (owner + name)
-		return "", errRepoInvalid
-	}
-	owner, name := segs[0], segs[1]
-	if len(owner) > 39 || !githubOwnerRe.MatchString(owner) {
-		return "", errRepoInvalid
-	}
-	if len(name) > 100 || name == "." || name == ".." || !githubNameRe.MatchString(name) {
-		return "", errRepoInvalid
-	}
-	return f + ":" + host + "/" + owner + "/" + name, nil
-}
-
-// resolveRepoIdentity is the CLI's offline flow-1: decompose the input just
-// enough to learn the host (a bare pair defaults to defaultRepoHost), resolve
-// the forge from exactly one explicit source — (a) the built-in SaaS table,
-// (b) an explicit --forge — and then canonicalize. A --forge that conflicts
-// with a known SaaS host is an error; an unrecognized host with no --forge is
-// an error. Never a guess, never a network call.
-func resolveRepoIdentity(input, forgeFlag string) (string, error) {
-	in := strings.TrimSpace(input)
-	authority, hasHost, _ := decomposeRepo(in)
-	host := defaultRepoHost
-	if hasHost {
-		host = canonicalHost(authority)
-	}
-	flag := strings.ToLower(strings.TrimSpace(forgeFlag))
-	forge, known := saasForges[host]
-	switch {
-	case known:
-		if flag != "" && flag != forge {
-			return "", fmt.Errorf("--forge %s conflicts with %s (a %s host)", flag, host, forge)
-		}
-	case flag != "" && implementedForges[flag]:
-		forge = flag
-	default:
-		// No forge source, or a --forge this phase doesn't service ("this
-		// phase accepts only :github") — same pinned error either way.
-		return "", fmt.Errorf("unknown/unsupported forge for host %s — pass --forge or register the instance", host)
-	}
-	return canonicalRepo(in, forge, defaultRepoHost)
-}
-
-// resolveRepo returns the canonical repo id: the --repo flag if set, else
-// inferred from the cwd git remote — both through the same flow-1 resolution.
-func resolveRepo(flagRepo, forgeFlag string) (string, error) {
-	if flagRepo != "" {
-		return resolveRepoIdentity(flagRepo, forgeFlag)
-	}
-	return inferRepo(forgeFlag)
-}
-
-// inferRepo derives the canonical repo from the cwd git remote origin. Any
-// remote shape decomposes (https/ssh URL, scp, already-canonical); whether
-// the host is serviceable is flow-1's call — e.g. a gitlab.com remote fails
-// with the unknown-forge error, not a URL-shape error.
-func inferRepo(forgeFlag string) (string, error) {
-	out, err := exec.Command("git", "remote", "get-url", "origin").Output()
-	if err != nil {
-		return "", fmt.Errorf("no git remote (run in a repo, or pass --repo): %w", err)
-	}
-	return resolveRepoIdentity(strings.TrimSpace(string(out)), forgeFlag)
+	return t.Flush()
 }
 
 func cmdNew(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("new", flag.ContinueOnError)
-	size := fs.String("size", "", "guest size (e.g. shared-2x)")
-	region := fs.String("region", "", "Region (see 'rift regions')")
-	repo := fs.String("repo", "", "repo (owner/name, a clone URL, or forge:host/owner/name); inferred from cwd if absent")
-	forge := fs.String("forge", "", "forge type of the repo's host (only github this phase); required when the host isn't a known SaaS forge")
-	ref := fs.String("ref", "", "boot the head image of this branch (e.g. main); mutually exclusive with --image")
-	image := fs.String("image", "", "boot this exact commit's image (full SHA or ≥7-char prefix); mutually exclusive with --ref")
-	if err := fs.Parse(args); err != nil {
+	var flags struct {
+		Size   string `help:"guest size (e.g. shared-2x)"`
+		Region string `help:"Region (see 'rift regions')"`
+		Repo   string `help:"repo (owner/name, a clone URL, or forge:host/owner/name); inferred from cwd if absent"`
+		Forge  string `help:"forge type of the repo's host (only github this phase); required when the host isn't a known SaaS forge"`
+		Ref    string `help:"boot the head image of this branch (e.g. main); mutually exclusive with --image"`
+		Image  string `help:"boot this exact commit's image (full SHA or ≥7-char prefix); mutually exclusive with --ref"`
+	}
+	if err := kongx.Parse("new", &flags, args); err != nil {
 		return err
 	}
-	if *ref != "" && *image != "" {
+	if flags.Ref != "" && flags.Image != "" {
 		return fmt.Errorf("--ref and --image are mutually exclusive")
 	}
 	c, _, err := authedClient()
 	if err != nil {
 		return err
 	}
-	if *repo, err = resolveRepo(*repo, *forge); err != nil {
+	if flags.Repo, err = repoid.Resolve(flags.Repo, flags.Forge); err != nil {
 		return err
 	}
 	// The billing context is derived server-side from the repo's owning GitHub
@@ -385,10 +182,10 @@ func cmdNew(ctx context.Context, args []string) error {
 	var sendRef string
 	var fallback bool
 	switch {
-	case *image != "":
+	case flags.Image != "":
 		// no ref; fallback inert
-	case *ref != "":
-		sendRef = normalizeRef(*ref)
+	case flags.Ref != "":
+		sendRef = normalizeRef(flags.Ref)
 		fallback = false
 	default:
 		sendRef = inferBranchRef()
@@ -403,20 +200,20 @@ func cmdNew(ctx context.Context, args []string) error {
 	// dimension (a dimension re-reported after its pick means the server
 	// rejected the re-issue — surface it rather than loop). Non-TTY (CI):
 	// list the selectable values and exit non-zero, never substituting.
-	pickedRegion, pickedSize := *region, *size
+	pickedRegion, pickedSize := flags.Region, flags.Size
 	picked := map[string]bool{}
 	var stdin *bufio.Reader
 	var res *client.CreateResult
 	for {
 		rctx, cancel := ctxTimeout(ctx, 30*time.Second)
-		res, err = c.Create(rctx, *repo, pickedSize, pickedRegion, sendRef, *image, fallback)
+		res, err = c.Create(rctx, flags.Repo, pickedSize, pickedRegion, sendRef, flags.Image, fallback)
 		cancel()
 		if err == nil {
 			break
 		}
 		dim, se, ok := requiredCreateDimension(err)
 		if !ok {
-			return explainCreate(err, *repo)
+			return explainCreate(err, flags.Repo)
 		}
 		if !isTTY() || len(se.Selectable) == 0 || picked[dim] {
 			return requiredDimensionErr(dim, se)
@@ -437,7 +234,7 @@ func cmdNew(ctx context.Context, args []string) error {
 			pickedSize = choice
 		}
 	}
-	fmt.Printf("Created %s (%s, %s). Connecting…\n", res.WorkspaceID, *repo, describeResolved(res))
+	fmt.Printf("Created %s (%s, %s). Connecting…\n", res.WorkspaceID, flags.Repo, describeResolved(res))
 	if line := describeSpawnDefaults(res); line != "" {
 		fmt.Println(line)
 	}
@@ -593,21 +390,28 @@ func cmdSetDefaultSize(ctx context.Context, args []string) error {
 // surfaced either way.
 func setDefaultSetting(ctx context.Context, args []string, setting string) error {
 	dim := strings.TrimPrefix(setting, "default-") // "region" | "size"
-	fs := flag.NewFlagSet("set-"+setting, flag.ContinueOnError)
-	repoFlag := fs.String("repo", "", "set the default for this repo (owner/name, a clone URL, or forge:host/owner/name); targets the repo's owning account, owner/admin-gated server-side")
-	clear := fs.Bool("clear", false, "clear the default")
-	pos, err := parseInterleaved(fs, args)
-	if err != nil {
+	var flags struct {
+		Repo  string `name:"repo" help:"set the default for this repo (owner/name, a clone URL, or forge:host/owner/name); targets the repo's owning account, owner/admin-gated server-side"`
+		Clear bool   `name:"clear" help:"clear the default"`
+		Value string `arg:"" optional:"" help:"the default value to set (a region slug or size); omit (or use --clear) to clear"`
+	}
+	if err := kongx.Parse("set-"+setting, &flags, args); err != nil {
 		return err
 	}
-	if *repoFlag == "" {
+	// parseInterleaved returned all positionals; kong exposes just the single
+	// value positional. Reconstruct the same "any positional present?" shape.
+	var pos []string
+	if flags.Value != "" {
+		pos = []string{flags.Value}
+	}
+	if flags.Repo == "" {
 		return fmt.Errorf("--repo is required")
 	}
 	c, _, err := authedClient()
 	if err != nil {
 		return err
 	}
-	repo, err := resolveRepoIdentity(*repoFlag, "")
+	repo, err := repoid.ResolveIdentity(flags.Repo, "")
 	if err != nil {
 		return err
 	}
@@ -615,7 +419,7 @@ func setDefaultSetting(ctx context.Context, args []string, setting string) error
 	defer cancel()
 
 	// Clear: an explicit --clear, or no value argument.
-	if *clear || len(pos) < 1 {
+	if flags.Clear || len(pos) < 1 {
 		if err := c.SetDevboxSetting(rctx, repo, setting, "", true); err != nil {
 			return err
 		}
@@ -677,11 +481,22 @@ func warnUnknownSettingValue(ctx context.Context, c *client.Client, dim, repo, v
 // authoritative server-side.
 func cmdSetRepoBuilderSize(ctx context.Context, args []string) error {
 	const usage = "rift set-repo-builder-size <repo> [SIZE | --clear]"
-	fs := flag.NewFlagSet("set-repo-builder-size", flag.ContinueOnError)
-	clear := fs.Bool("clear", false, "clear the repo's builder size (revert to the global default)")
-	pos, err := parseInterleaved(fs, args)
-	if err != nil {
+	var flags struct {
+		Clear bool   `name:"clear" help:"clear the repo's builder size (revert to the global default)"`
+		Repo  string `arg:"" optional:"" help:"repo (owner/name, a clone URL, or forge:host/owner/name)"`
+		Size  string `arg:"" optional:"" help:"builder size to set; omit (or use --clear) to revert to the global default"`
+	}
+	if err := kongx.Parse("set-repo-builder-size", &flags, args); err != nil {
 		return err
+	}
+	// parseInterleaved returned the positionals in order; rebuild that shape from
+	// kong's two positional fields (repo, then optional size).
+	var pos []string
+	if flags.Repo != "" {
+		pos = append(pos, flags.Repo)
+	}
+	if flags.Size != "" {
+		pos = append(pos, flags.Size)
 	}
 	if len(pos) < 1 {
 		return fmt.Errorf("usage: %s", usage)
@@ -690,7 +505,7 @@ func cmdSetRepoBuilderSize(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	repo, err := resolveRepoIdentity(pos[0], "")
+	repo, err := repoid.ResolveIdentity(pos[0], "")
 	if err != nil {
 		return err
 	}
@@ -698,7 +513,7 @@ func cmdSetRepoBuilderSize(ctx context.Context, args []string) error {
 	defer cancel()
 
 	// Clear: an explicit --clear, or no size argument.
-	if *clear || len(pos) < 2 {
+	if flags.Clear || len(pos) < 2 {
 		if err := c.SetRepoBuilderSize(rctx, repo, "", true); err != nil {
 			return err
 		}
@@ -711,29 +526,6 @@ func cmdSetRepoBuilderSize(ctx context.Context, args []string) error {
 	}
 	fmt.Printf("Builder size for %s set to %s.\n", repo, size)
 	return nil
-}
-
-// parseInterleaved parses fs's flags wherever they appear in args — before,
-// between, or after positionals — and returns the positionals in order. The
-// stdlib flag package stops flag parsing at the first positional, which would
-// silently IGNORE a trailing flag (`rift set-default-region iad --repo r`
-// writing the wrong scope); the documented grammar puts flags after the
-// positionals (`rift set-repo-builder-size <REPO> [--clear] <SIZE>`), so this
-// loop re-parses past each positional instead. An unknown flag still errors
-// loudly wherever it sits — fs.Parse rejects it on the pass that reaches it.
-func parseInterleaved(fs *flag.FlagSet, args []string) ([]string, error) {
-	var pos []string
-	for {
-		if err := fs.Parse(args); err != nil {
-			return nil, err
-		}
-		rest := fs.Args()
-		if len(rest) == 0 {
-			return pos, nil
-		}
-		pos = append(pos, rest[0])
-		args = rest[1:]
-	}
 }
 
 // describeResolved renders the api's resolved-selection echo for the `new`
@@ -844,20 +636,22 @@ func explainCreate(err error, repo string) error {
 }
 
 func cmdConnect(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("connect", flag.ContinueOnError)
-	newSession := fs.Bool("new", false, "create a fresh session instead of attaching an existing one")
-	sessionName := fs.String("session", "", "attach (or create) the session with this name")
-	if err := fs.Parse(args); err != nil {
+	var flags struct {
+		New     bool   `name:"new" help:"create a fresh session instead of attaching an existing one"`
+		Session string `name:"session" help:"attach (or create) the session with this name"`
+		ID      string `arg:"" optional:"" help:"workspace id to connect to"`
+	}
+	if err := kongx.Parse("connect", &flags, args); err != nil {
 		return err
 	}
-	if fs.NArg() < 1 {
+	if flags.ID == "" {
 		return fmt.Errorf("usage: rift connect [--new] [--session NAME] <id>")
 	}
 	c, _, err := authedClient()
 	if err != nil {
 		return err
 	}
-	return connect(ctx, c, fs.Arg(0), connectOpts{newSession: *newSession, sessionName: *sessionName})
+	return connect(ctx, c, flags.ID, connectOpts{newSession: flags.New, sessionName: flags.Session})
 }
 
 // machineTarget resolves the workspace a lifecycle verb acts on when the CLI
@@ -909,10 +703,18 @@ func lifecycle(ctx context.Context, args []string, verb string) error {
 }
 
 func cmdResize(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("resize", flag.ContinueOnError)
-	size := fs.String("size", "", "new guest size (required)")
-	if err := fs.Parse(args); err != nil {
+	var flags struct {
+		Size string `name:"size" help:"new guest size (required)"`
+		ID   string `arg:"" optional:"" help:"workspace id to resize"`
+	}
+	if err := kongx.Parse("resize", &flags, args); err != nil {
 		return err
+	}
+	// machineTarget wants the raw positional args; kong exposes just the single
+	// optional id positional, so reconstruct the equivalent slice.
+	var posArgs []string
+	if flags.ID != "" {
+		posArgs = []string{flags.ID}
 	}
 	c, cfg, err := authedClient()
 	if err != nil {
@@ -922,32 +724,40 @@ func cmdResize(ctx context.Context, args []string) error {
 	defer cancel()
 	var id string
 	if cfg.MachineWorkspaceID != "" {
-		if *size == "" {
+		if flags.Size == "" {
 			return fmt.Errorf("usage: rift resize [<id>] --size S")
 		}
-		if id, err = machineTarget(cfg.MachineWorkspaceID, fs.Args()); err != nil {
+		if id, err = machineTarget(cfg.MachineWorkspaceID, posArgs); err != nil {
 			return err
 		}
-		err = c.MachineResize(rctx, id, *size)
+		err = c.MachineResize(rctx, id, flags.Size)
 	} else {
-		if fs.NArg() < 1 || *size == "" {
+		if flags.ID == "" || flags.Size == "" {
 			return fmt.Errorf("usage: rift resize <id> --size S")
 		}
-		id = fs.Arg(0)
-		err = c.Resize(rctx, id, *size)
+		id = flags.ID
+		err = c.Resize(rctx, id, flags.Size)
 	}
 	if err != nil {
 		return err
 	}
-	fmt.Printf("%s: resizing to %s (reboots; reconnect when running)\n", id, *size)
+	fmt.Printf("%s: resizing to %s (reboots; reconnect when running)\n", id, flags.Size)
 	return nil
 }
 
 func cmdKeepalive(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("keepalive", flag.ContinueOnError)
-	for_ := fs.Duration("for", 8*time.Hour, "keep alive for this long")
-	if err := fs.Parse(args); err != nil {
+	var flags struct {
+		For time.Duration `name:"for" default:"8h" help:"keep alive for this long"`
+		ID  string        `arg:"" optional:"" help:"workspace id to keep alive"`
+	}
+	if err := kongx.Parse("keepalive", &flags, args); err != nil {
 		return err
+	}
+	// machineTarget wants the raw positional args; kong exposes just the single
+	// optional id positional, so reconstruct the equivalent slice.
+	var posArgs []string
+	if flags.ID != "" {
+		posArgs = []string{flags.ID}
 	}
 	c, cfg, err := authedClient()
 	if err != nil {
@@ -957,20 +767,20 @@ func cmdKeepalive(ctx context.Context, args []string) error {
 	defer cancel()
 	var id string
 	if cfg.MachineWorkspaceID != "" {
-		if id, err = machineTarget(cfg.MachineWorkspaceID, fs.Args()); err != nil {
+		if id, err = machineTarget(cfg.MachineWorkspaceID, posArgs); err != nil {
 			return err
 		}
-		err = c.MachineKeepalive(rctx, id, for_.Milliseconds())
+		err = c.MachineKeepalive(rctx, id, flags.For.Milliseconds())
 	} else {
-		if fs.NArg() < 1 {
+		if flags.ID == "" {
 			return fmt.Errorf("usage: rift keepalive <id> [--for 8h]")
 		}
-		id = fs.Arg(0)
-		err = c.Keepalive(rctx, id, for_.Milliseconds())
+		id = flags.ID
+		err = c.Keepalive(rctx, id, flags.For.Milliseconds())
 	}
 	if err != nil {
 		return err
 	}
-	fmt.Printf("%s: kept alive for %s\n", id, for_)
+	fmt.Printf("%s: kept alive for %s\n", id, flags.For)
 	return nil
 }

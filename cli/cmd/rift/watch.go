@@ -2,17 +2,21 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
+	"os"
 	"time"
+
+	"github.com/fixed-labs/oss/cli/clikit/kongx"
+	"github.com/fixed-labs/oss/cli/clikit/table"
+	"github.com/fixed-labs/oss/cli/internal/repoid"
 )
 
 // cmdWatch / cmdUnwatch / cmdWatched are the `rift watch` family (FIX-202
 // build-queue throttle): manage which git refs of a repo build devbox images.
 // Presence in the watched set is the gate — a pushed ref builds an image iff it
 // is watched. All three resolve the repo from the cwd git remote (the canonical
-// forge:host/owner/name id, via the shared flow-1 resolution — see resolveRepo
-// in commands.go), overridable with --repo/--forge.
+// forge:host/owner/name id, via the shared flow-1 resolution — see
+// repoid.Resolve in internal/repoid), overridable with --repo/--forge.
 //
 //	watch <ref>     start watching a ref (builds its tip immediately)
 //	unwatch <ref>   stop watching a ref (future pushes stop building)
@@ -35,21 +39,23 @@ func setWatch(ctx context.Context, args []string, watch bool) error {
 	if watch {
 		verb = "watch"
 	}
-	fs := flag.NewFlagSet(verb, flag.ContinueOnError)
-	repo := fs.String("repo", "", "repo (owner/name, a clone URL, or forge:host/owner/name); inferred from cwd if absent")
-	forge := fs.String("forge", "", "forge type of the repo's host (only github this phase)")
-	if err := fs.Parse(args); err != nil {
+	var flags struct {
+		Repo  string `name:"repo" help:"repo (owner/name, a clone URL, or forge:host/owner/name); inferred from cwd if absent"`
+		Forge string `name:"forge" help:"forge type of the repo's host (only github this phase)"`
+		Ref   string `arg:"" optional:"" help:"the git ref to watch/unwatch"`
+	}
+	if err := kongx.Parse(verb, &flags, args); err != nil {
 		return err
 	}
-	if fs.NArg() < 1 {
+	if flags.Ref == "" {
 		return fmt.Errorf("usage: rift %s <ref>", verb)
 	}
-	ref := fs.Arg(0)
+	ref := flags.Ref
 	c, _, err := authedClient()
 	if err != nil {
 		return err
 	}
-	r, err := resolveRepo(*repo, *forge)
+	r, err := repoid.Resolve(flags.Repo, flags.Forge)
 	if err != nil {
 		return err
 	}
@@ -73,17 +79,18 @@ func setWatch(ctx context.Context, args []string, watch bool) error {
 
 // cmdWatched handles `rift watched [--repo ..] [--forge ..]`.
 func cmdWatched(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("watched", flag.ContinueOnError)
-	repo := fs.String("repo", "", "repo (owner/name, a clone URL, or forge:host/owner/name); inferred from cwd if absent")
-	forge := fs.String("forge", "", "forge type of the repo's host (only github this phase)")
-	if err := fs.Parse(args); err != nil {
+	var flags struct {
+		Repo  string `name:"repo" help:"repo (owner/name, a clone URL, or forge:host/owner/name); inferred from cwd if absent"`
+		Forge string `name:"forge" help:"forge type of the repo's host (only github this phase)"`
+	}
+	if err := kongx.Parse("watched", &flags, args); err != nil {
 		return err
 	}
 	c, _, err := authedClient()
 	if err != nil {
 		return err
 	}
-	r, err := resolveRepo(*repo, *forge)
+	r, err := repoid.Resolve(flags.Repo, flags.Forge)
 	if err != nil {
 		return err
 	}
@@ -97,13 +104,13 @@ func cmdWatched(ctx context.Context, args []string) error {
 		fmt.Printf("No watched refs for %s.\n", r)
 		return nil
 	}
-	fmt.Printf("%-28s  %-10s  %-24s  %s\n", "REF", "STATUS", "ADDED-BY", "AGE")
+	t := table.New(os.Stdout, "REF", "STATUS", "ADDED-BY", "AGE")
 	for _, it := range items {
-		fmt.Printf("%-28s  %-10s  %-24s  %s\n",
+		t.Row(
 			it.Ref,
 			it.Status,
 			it.AddedBy,
 			humanizeAge(it.AddedAt))
 	}
-	return nil
+	return t.Flush()
 }

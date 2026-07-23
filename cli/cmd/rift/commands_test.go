@@ -13,138 +13,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/fixed-labs/oss/cli/clikit/login"
 	"github.com/fixed-labs/oss/cli/internal/client"
 	"github.com/fixed-labs/oss/cli/internal/config"
 )
-
-// TestCanonicalRepoFixtures drives canonicalRepo through the checked-in
-// fixtures shared with the server's Clojure canonicalizer — the executable
-// contract for the grammar. Each row carries the raw input, the pre-resolved
-// forge arg, the default-host arg (applied only to host-less bare pairs), and
-// the expected canonical string (null → expected reject).
-func TestCanonicalRepoFixtures(t *testing.T) {
-	raw, err := os.ReadFile(filepath.Join("testdata", "canonical-repo-vectors.json"))
-	if err != nil {
-		t.Fatalf("read fixtures: %v", err)
-	}
-	var rows []struct {
-		Input     string  `json:"input"`
-		Forge     string  `json:"forge"`
-		Host      string  `json:"host"`
-		Canonical *string `json:"canonical"`
-	}
-	if err := json.Unmarshal(raw, &rows); err != nil {
-		t.Fatalf("decode fixtures: %v", err)
-	}
-	if len(rows) == 0 {
-		t.Fatal("fixtures file decoded to zero rows")
-	}
-	for _, row := range rows {
-		got, err := canonicalRepo(row.Input, row.Forge, row.Host)
-		if row.Canonical == nil {
-			if err == nil {
-				t.Errorf("canonicalRepo(%q, %q, %q) = %q, want reject", row.Input, row.Forge, row.Host, got)
-			}
-			continue
-		}
-		if err != nil {
-			t.Errorf("canonicalRepo(%q, %q, %q): %v, want %q", row.Input, row.Forge, row.Host, err, *row.Canonical)
-			continue
-		}
-		if got != *row.Canonical {
-			t.Errorf("canonicalRepo(%q, %q, %q) = %q, want %q", row.Input, row.Forge, row.Host, got, *row.Canonical)
-			continue
-		}
-		// Fixed point: every canonical string the CLI emits must survive a
-		// round trip unchanged — a non-fixed-point output is exactly the
-		// string the server ingress would 400.
-		again, err := canonicalRepo(*row.Canonical, row.Forge, row.Host)
-		if err != nil {
-			t.Errorf("canonicalRepo(%q, %q, %q) (fixed point): %v", *row.Canonical, row.Forge, row.Host, err)
-			continue
-		}
-		if again != *row.Canonical {
-			t.Errorf("canonicalRepo(%q, %q, %q) = %q, want the fixed point %q", *row.Canonical, row.Forge, row.Host, again, *row.Canonical)
-		}
-	}
-}
-
-// The rejection message is pinned by the design (the CLI surfaces every
-// canonicalizer reject with this exact wording).
-func TestCanonicalRepoRejectionMessage(t *testing.T) {
-	_, err := canonicalRepo("widget", "github", "github.com")
-	want := "invalid repo — use owner/repo or the full forge:host/owner/repo form"
-	if err == nil || err.Error() != want {
-		t.Fatalf("error = %v, want %q", err, want)
-	}
-}
-
-// --- flow-1 forge/host resolution (offline; INV-5) ---
-//
-// The forge comes from exactly one explicit source: (a) the built-in SaaS
-// table (github.com only this phase) — a conflicting --forge is an error;
-// (b) an explicit --forge; else (c) an error naming the host. Never a guess.
-func TestResolveRepoIdentityFlow1(t *testing.T) {
-	canonical := "github:github.com/acme/widget"
-	cases := []struct {
-		name    string
-		in      string
-		forge   string
-		want    string // "" → expect error
-		wantErr string // substring the error must carry
-	}{
-		// (a) SaaS-table hits, across decomposition forms, no --forge needed.
-		{"saas-bare", "Acme/Widget", "", canonical, ""},
-		{"saas-url", "https://github.com/Acme/Widget.git", "", canonical, ""},
-		{"saas-scp", "git@github.com:Acme/Widget.git", "", canonical, ""},
-		{"saas-already-canonical", "github:github.com/acme/widget", "", canonical, ""},
-		// Case-skewed HOSTS still hit the SaaS table — the lookup happens on
-		// the canonicalized host, not the raw authority.
-		{"saas-scp-case-skewed-host", "git@GitHub.com:Acme/Widget.git", "", canonical, ""},
-		{"saas-url-upper-host", "https://GITHUB.COM/Org/Name", "", "github:github.com/org/name", ""},
-		// --forge agreeing with the SaaS table is not a conflict.
-		{"forge-agrees", "acme/widget", "github", canonical, ""},
-		{"forge-agrees-case", "acme/widget", "GitHub", canonical, ""},
-		// (a) beats (b): a --forge conflicting with a known SaaS host errors.
-		{"forge-conflict-url", "https://github.com/acme/widget", "gitlab", "", "conflicts"},
-		{"forge-conflict-bare", "acme/widget", "gitlab", "", "conflicts"},
-		// (c) unknown host, no --forge → the pinned register-the-instance error.
-		{"unknown-host", "https://git.corp.net/o/r", "",
-			"", "unknown/unsupported forge for host git.corp.net — pass --forge or register the instance"},
-		{"unknown-host-gitlab-saas", "git@gitlab.com:group/proj", "",
-			"", "unknown/unsupported forge for host gitlab.com"},
-		// (b) --forge github on a non-github.com host resolves the forge but
-		// still errors in canonicalRepo (GHES is deferred).
-		{"forge-github-nongithub-host", "https://ghes.corp.net/acme/widget", "github", "", "invalid repo"},
-		// (b) an unsupported --forge ("this phase accepts only :github")
-		// gets the pinned register-the-instance error, not a misleading
-		// repo-shape error — in-enum and out-of-enum values alike.
-		{"forge-unsupported-inenum", "https://gitlab.corp.net/g/p", "gitlab",
-			"", "unknown/unsupported forge for host gitlab.corp.net — pass --forge or register the instance"},
-		{"forge-unsupported-bogus", "https://git.corp.net/o/r", "bogus",
-			"", "unknown/unsupported forge for host git.corp.net — pass --forge or register the instance"},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			got, err := resolveRepoIdentity(c.in, c.forge)
-			if c.want == "" {
-				if err == nil {
-					t.Fatalf("resolveRepoIdentity(%q, %q) = %q, want error", c.in, c.forge, got)
-				}
-				if !strings.Contains(err.Error(), c.wantErr) {
-					t.Fatalf("error = %v, want it to contain %q", err, c.wantErr)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("resolveRepoIdentity(%q, %q): %v", c.in, c.forge, err)
-			}
-			if got != c.want {
-				t.Fatalf("resolveRepoIdentity(%q, %q) = %q, want %q", c.in, c.forge, got, c.want)
-			}
-		})
-	}
-}
 
 func TestMachineTarget(t *testing.T) {
 	if id, err := machineTarget("ws-self", nil); err != nil || id != "ws-self" {
@@ -423,9 +295,10 @@ func TestCmdNewSendsNoContextID(t *testing.T) {
 
 // --- cmdNew --forge plumbing (command level) ---
 //
-// Unit tables pin resolveRepoIdentity itself; these drive cmdNew's actual
-// flagset so a --forge mis-registration ("flag provided but not defined") or
-// a dropped pass-through into resolveRepo cannot hide. Same harness as the
+// Unit tables pin repoid.ResolveIdentity itself (see internal/repoid); these
+// drive cmdNew's actual flagset so a --forge mis-registration ("flag provided
+// but not defined") or a dropped pass-through into repoid.Resolve cannot hide.
+// Same harness as the
 // context tests: --repo avoids the git-remote inference, --ref the branch
 // shell-out, and the connect-time Get answers "failed" so cmdNew unwinds.
 
@@ -614,21 +487,21 @@ func loginHappyHandler() http.HandlerFunc {
 //
 // The test captures stdout, so os.Stdout is a pipe → term.IsTerminal is false →
 // cmdLogin's `interactive` is false, and shouldAutoOpen short-circuits at
-// !interactive BEFORE it ever consults --no-browser. So the openBrowser var is
-// guaranteed un-invoked by the interactive gate alone.
+// !interactive BEFORE it ever consults --no-browser. So the login.OpenBrowser
+// var is guaranteed un-invoked by the interactive gate alone.
 //
 // Honest scope (per the plan): this exercises only the SUPPRESSED direction. Its
-// real signal is a regression guard against someone hoisting the openBrowser
+// real signal is a regression guard against someone hoisting the OpenBrowser
 // call ABOVE the interactive gate; the --no-browser repeat's only added signal
 // is that a known flag parses without error. It is NOT proof that --no-browser
 // suppresses the browser — that decision is covered non-vacuously by
-// TestShouldAutoOpen. No t.Parallel: this swaps the openBrowser package var.
+// TestShouldAutoOpen. No t.Parallel: this swaps the login.OpenBrowser package var.
 func TestCmdLoginNoAutoOpenInNonTTY(t *testing.T) {
-	// Swap the openBrowser package var for a recorder; restore on cleanup.
+	// Swap the login.OpenBrowser package var for a recorder; restore on cleanup.
 	var opened int
-	orig := openBrowser
-	openBrowser = func(string) error { opened++; return nil }
-	t.Cleanup(func() { openBrowser = orig })
+	orig := login.OpenBrowser
+	login.OpenBrowser = func(string) error { opened++; return nil }
+	t.Cleanup(func() { login.OpenBrowser = orig })
 
 	run := func(name string, args []string) {
 		opened = 0
@@ -1506,52 +1379,6 @@ func TestSetCommandsUnknownFlagAnywhereErrors(t *testing.T) {
 	if len(byPath) != 0 {
 		t.Fatalf("an unknown flag must not POST: %+v", byPath)
 	}
-}
-
-// resolveLoginAPIURL's precedence: the typed --api flag > the RIFT_API_URL
-// override var (envURL) > the active env's saved config URL > — ONLY for env
-// "prod" — the hosted production default. fromOverrideVar is true iff the
-// override var (source 2) wins. hermeticEnv clears RIFT_API_URL and points
-// config at an empty temp dir, so a seeded/unseeded config is deterministic.
-//
-// §2.1 precedence + fromOverrideVar; §2.3 prod fallback (no saved config).
-func TestResolveLoginAPIURL(t *testing.T) {
-	// §2.1: flag > envURL > saved > default, and fromOverrideVar true ONLY
-	// when envURL wins.
-	t.Run("flag wins over envURL and saved", func(t *testing.T) {
-		_ = hermeticEnv(t, func(http.ResponseWriter, *http.Request) {})
-		seedConfig(t, &config.Config{APIBaseURL: "https://saved.example", Token: "t"})
-		url, from, err := resolveLoginAPIURL("https://flag.example", "https://env.example", "staging")
-		if err != nil || url != "https://flag.example" || from {
-			t.Fatalf("flag must win with fromOverrideVar=false, got url=%q from=%v err=%v", url, from, err)
-		}
-	})
-	t.Run("envURL wins over saved, fromOverrideVar true", func(t *testing.T) {
-		_ = hermeticEnv(t, func(http.ResponseWriter, *http.Request) {})
-		seedConfig(t, &config.Config{APIBaseURL: "https://saved.example", Token: "t"})
-		url, from, err := resolveLoginAPIURL("", "https://env.example", "staging")
-		if err != nil || url != "https://env.example" || !from {
-			t.Fatalf("envURL must win with fromOverrideVar=true, got url=%q from=%v err=%v", url, from, err)
-		}
-	})
-	t.Run("saved config used when no flag/envURL, fromOverrideVar false", func(t *testing.T) {
-		_ = hermeticEnv(t, func(http.ResponseWriter, *http.Request) {})
-		seedConfig(t, &config.Config{APIBaseURL: "https://saved.example", Token: "t"})
-		url, from, err := resolveLoginAPIURL("", "", "staging")
-		if err != nil || url != "https://saved.example" || from {
-			t.Fatalf("saved config must be reused with fromOverrideVar=false, got url=%q from=%v err=%v", url, from, err)
-		}
-	})
-	// §2.3: prod fallback intact — no saved config, empty flag/envURL, env
-	// "prod" → DefaultAPIBaseURL, fromOverrideVar=false, no error.
-	t.Run("prod default when neither flag/envURL nor config", func(t *testing.T) {
-		_ = hermeticEnv(t, func(http.ResponseWriter, *http.Request) {})
-		url, from, err := resolveLoginAPIURL("", "", "prod")
-		if err != nil || url != config.DefaultAPIBaseURL || from {
-			t.Fatalf("prod first login must default to %q with fromOverrideVar=false, got url=%q from=%v err=%v",
-				config.DefaultAPIBaseURL, url, from, err)
-		}
-	})
 }
 
 // deviceStartFatalHandler fails the test if the device flow is ever started —

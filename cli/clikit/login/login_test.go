@@ -1,4 +1,4 @@
-package main
+package login
 
 import (
 	"bytes"
@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-// These tests swap package-level vars (writeClipboard) with save + t.Cleanup
+// These tests swap package-level vars (WriteClipboard) with save + t.Cleanup
 // restore, so they must NOT run in parallel.
 
 func TestWriteClipboard(t *testing.T) {
@@ -20,7 +20,7 @@ func TestWriteClipboard(t *testing.T) {
 	t.Run("plain", func(t *testing.T) {
 		t.Setenv("TMUX", "")
 		var buf bytes.Buffer
-		writeClipboard(&buf, url)
+		WriteClipboard(&buf, url)
 		want := "\x1b]52;c;" + b64 + "\x07"
 		if got := buf.String(); got != want {
 			t.Fatalf("plain OSC 52 bytes\n got %q\nwant %q", got, want)
@@ -30,10 +30,10 @@ func TestWriteClipboard(t *testing.T) {
 	t.Run("tmux-wrapped", func(t *testing.T) {
 		t.Setenv("TMUX", "/tmp/tmux-1000/default,1234,0")
 		var buf bytes.Buffer
-		writeClipboard(&buf, url)
+		WriteClipboard(&buf, url)
 		inner := "\x1b]52;c;" + b64 + "\x07"
 		// Build the tmux DCS-wrapped expectation with an independent doubling
-		// loop (an independent oracle) — do NOT call writeClipboard to derive it.
+		// loop (an independent oracle) — do NOT call WriteClipboard to derive it.
 		doubled := ""
 		for _, r := range inner {
 			if r == '\x1b' {
@@ -52,7 +52,7 @@ func TestWriteClipboard(t *testing.T) {
 func TestKeyLoop(t *testing.T) {
 	const url = "https://fixedlabs.dev/activate?code=WXYZP-QRSTU"
 
-	// clipboardRecorder counts writeClipboard invocations and records every URL
+	// clipboardRecorder counts WriteClipboard invocations and records every URL
 	// it was handed (not last-write-wins), so multi-copy cases like {'c','c'}
 	// have signal.
 	type clipboardRecorder struct {
@@ -60,17 +60,17 @@ func TestKeyLoop(t *testing.T) {
 		urls  []string
 	}
 
-	// swapWriteClipboard replaces the package-level writeClipboard with a stub
+	// swapWriteClipboard replaces the package-level WriteClipboard with a stub
 	// backed by a clipboardRecorder, restoring the original on cleanup.
 	swapWriteClipboard := func(t *testing.T) *clipboardRecorder {
 		t.Helper()
-		orig := writeClipboard
+		orig := WriteClipboard
 		rec := &clipboardRecorder{}
-		writeClipboard = func(w io.Writer, s string) {
+		WriteClipboard = func(w io.Writer, s string) {
 			rec.count++
 			rec.urls = append(rec.urls, s)
 		}
-		t.Cleanup(func() { writeClipboard = orig })
+		t.Cleanup(func() { WriteClipboard = orig })
 		return rec
 	}
 
@@ -83,10 +83,10 @@ func TestKeyLoop(t *testing.T) {
 			t.Fatalf("keyLoop returned true on EOF after 'c'; want false")
 		}
 		if rec.count != 1 {
-			t.Fatalf("writeClipboard called %d times; want 1", rec.count)
+			t.Fatalf("WriteClipboard called %d times; want 1", rec.count)
 		}
 		if len(rec.urls) != 1 || rec.urls[0] != url {
-			t.Fatalf("writeClipboard got %v; want [%q]", rec.urls, url)
+			t.Fatalf("WriteClipboard got %v; want [%q]", rec.urls, url)
 		}
 		if canceled {
 			t.Fatalf("cancel fired on 'c'; it should not")
@@ -102,10 +102,10 @@ func TestKeyLoop(t *testing.T) {
 			t.Fatalf("keyLoop returned true on EOF after 'C'; want false")
 		}
 		if rec.count != 1 {
-			t.Fatalf("writeClipboard called %d times; want 1", rec.count)
+			t.Fatalf("WriteClipboard called %d times; want 1", rec.count)
 		}
 		if len(rec.urls) != 1 || rec.urls[0] != url {
-			t.Fatalf("writeClipboard got %v; want [%q]", rec.urls, url)
+			t.Fatalf("WriteClipboard got %v; want [%q]", rec.urls, url)
 		}
 		if canceled {
 			t.Fatalf("cancel fired on 'C'; it should not")
@@ -124,7 +124,7 @@ func TestKeyLoop(t *testing.T) {
 			t.Fatalf("cancel did not fire on 'q'")
 		}
 		if rec.count != 0 {
-			t.Fatalf("writeClipboard called %d times on 'q'; want 0", rec.count)
+			t.Fatalf("WriteClipboard called %d times on 'q'; want 0", rec.count)
 		}
 	})
 
@@ -140,7 +140,7 @@ func TestKeyLoop(t *testing.T) {
 			t.Fatalf("cancel did not fire on 'Q'")
 		}
 		if rec.count != 0 {
-			t.Fatalf("writeClipboard called %d times on 'Q'; want 0", rec.count)
+			t.Fatalf("WriteClipboard called %d times on 'Q'; want 0", rec.count)
 		}
 	})
 
@@ -156,7 +156,7 @@ func TestKeyLoop(t *testing.T) {
 			t.Fatalf("cancel did not fire on Ctrl-C")
 		}
 		if rec.count != 0 {
-			t.Fatalf("writeClipboard called %d times on Ctrl-C; want 0", rec.count)
+			t.Fatalf("WriteClipboard called %d times on Ctrl-C; want 0", rec.count)
 		}
 	})
 
@@ -174,7 +174,7 @@ func TestKeyLoop(t *testing.T) {
 			t.Fatalf("cancel fired on unmapped byte; it should not")
 		}
 		if rec.count != 0 {
-			t.Fatalf("writeClipboard called %d times on unmapped byte; want 0", rec.count)
+			t.Fatalf("WriteClipboard called %d times on unmapped byte; want 0", rec.count)
 		}
 	})
 
@@ -190,7 +190,7 @@ func TestKeyLoop(t *testing.T) {
 			t.Fatalf("cancel fired on EOF; it should not")
 		}
 		if rec.count != 0 {
-			t.Fatalf("writeClipboard called %d times on EOF; want 0", rec.count)
+			t.Fatalf("WriteClipboard called %d times on EOF; want 0", rec.count)
 		}
 	})
 
@@ -208,10 +208,10 @@ func TestKeyLoop(t *testing.T) {
 			t.Fatalf("cancel did not fire on {'c','q'}")
 		}
 		if rec.count != 1 {
-			t.Fatalf("writeClipboard called %d times on {'c','q'}; want 1", rec.count)
+			t.Fatalf("WriteClipboard called %d times on {'c','q'}; want 1", rec.count)
 		}
 		if len(rec.urls) != 1 || rec.urls[0] != url {
-			t.Fatalf("writeClipboard got %v; want [%q]", rec.urls, url)
+			t.Fatalf("WriteClipboard got %v; want [%q]", rec.urls, url)
 		}
 	})
 
@@ -229,10 +229,10 @@ func TestKeyLoop(t *testing.T) {
 			t.Fatalf("cancel fired on {'c','c'}; it should not")
 		}
 		if rec.count != 2 {
-			t.Fatalf("writeClipboard called %d times on {'c','c'}; want 2", rec.count)
+			t.Fatalf("WriteClipboard called %d times on {'c','c'}; want 2", rec.count)
 		}
 		if len(rec.urls) != 2 || rec.urls[0] != url || rec.urls[1] != url {
-			t.Fatalf("writeClipboard got %v; want [%q %q]", rec.urls, url, url)
+			t.Fatalf("WriteClipboard got %v; want [%q %q]", rec.urls, url, url)
 		}
 	})
 }
@@ -276,9 +276,9 @@ func TestShouldAutoOpen(t *testing.T) {
 			if tc.nonLinuxOnly && runtime.GOOS == "linux" {
 				t.Skip("non-linux-only case on linux")
 			}
-			got := shouldAutoOpen(envFrom(tc.env), tc.interactive, tc.noBrowser)
+			got := ShouldAutoOpen(envFrom(tc.env), tc.interactive, tc.noBrowser)
 			if got != tc.want {
-				t.Fatalf("shouldAutoOpen(env=%v, interactive=%v, noBrowser=%v) = %v; want %v",
+				t.Fatalf("ShouldAutoOpen(env=%v, interactive=%v, noBrowser=%v) = %v; want %v",
 					tc.env, tc.interactive, tc.noBrowser, got, tc.want)
 			}
 		})
@@ -286,11 +286,62 @@ func TestShouldAutoOpen(t *testing.T) {
 }
 
 func TestErrLoginCanceled(t *testing.T) {
-	if got := errLoginCanceled.Error(); got != "login canceled" {
-		t.Fatalf("errLoginCanceled.Error() = %q; want %q", got, "login canceled")
+	if got := ErrLoginCanceled.Error(); got != "login canceled" {
+		t.Fatalf("ErrLoginCanceled.Error() = %q; want %q", got, "login canceled")
 	}
-	wrapped := fmt.Errorf("wrap: %w", errLoginCanceled)
-	if !errors.Is(wrapped, errLoginCanceled) {
-		t.Fatalf("errors.Is(fmt.Errorf(\"wrap: %%w\", errLoginCanceled), errLoginCanceled) = false; want true")
+	wrapped := fmt.Errorf("wrap: %w", ErrLoginCanceled)
+	if !errors.Is(wrapped, ErrLoginCanceled) {
+		t.Fatalf("errors.Is(fmt.Errorf(\"wrap: %%w\", ErrLoginCanceled), ErrLoginCanceled) = false; want true")
 	}
+}
+
+// ResolveURL's precedence: the typed --api flag (flagVal) > the RIFT_API_URL
+// override var (envURL) > the active env's saved config URL (savedURL) > — ONLY
+// for env "prod" — the hosted production default (defaultURL). fromOverrideVar
+// is true iff the override var (source 2) wins. A non-prod env with none of the
+// first three returns ErrNoURLForEnv.
+//
+// §2.1 precedence + fromOverrideVar; §2.3 prod fallback (no saved config).
+func TestResolveURL(t *testing.T) {
+	const defaultURL = "https://fixedlabs.dev"
+
+	// §2.1: flag > envURL > saved > default, and fromOverrideVar true ONLY
+	// when envURL wins.
+	t.Run("flag wins over envURL and saved", func(t *testing.T) {
+		url, from, err := ResolveURL("https://flag.example", "https://env.example", "https://saved.example", "staging", defaultURL)
+		if err != nil || url != "https://flag.example" || from {
+			t.Fatalf("flag must win with fromOverrideVar=false, got url=%q from=%v err=%v", url, from, err)
+		}
+	})
+	t.Run("envURL wins over saved, fromOverrideVar true", func(t *testing.T) {
+		url, from, err := ResolveURL("", "https://env.example", "https://saved.example", "staging", defaultURL)
+		if err != nil || url != "https://env.example" || !from {
+			t.Fatalf("envURL must win with fromOverrideVar=true, got url=%q from=%v err=%v", url, from, err)
+		}
+	})
+	t.Run("saved config used when no flag/envURL, fromOverrideVar false", func(t *testing.T) {
+		url, from, err := ResolveURL("", "", "https://saved.example", "staging", defaultURL)
+		if err != nil || url != "https://saved.example" || from {
+			t.Fatalf("saved config must be reused with fromOverrideVar=false, got url=%q from=%v err=%v", url, from, err)
+		}
+	})
+	// Non-prod with all three sources empty → ErrNoURLForEnv, empty url.
+	t.Run("non-prod with nothing returns ErrNoURLForEnv", func(t *testing.T) {
+		url, from, err := ResolveURL("", "", "", "staging", defaultURL)
+		if !errors.Is(err, ErrNoURLForEnv) {
+			t.Fatalf("non-prod first login must return ErrNoURLForEnv, got err=%v", err)
+		}
+		if url != "" || from {
+			t.Fatalf("ErrNoURLForEnv must carry an empty url and fromOverrideVar=false, got url=%q from=%v", url, from)
+		}
+	})
+	// §2.3: prod fallback intact — no saved config, empty flag/envURL, env
+	// "prod" → defaultURL, fromOverrideVar=false, no error.
+	t.Run("prod default when neither flag/envURL nor config", func(t *testing.T) {
+		url, from, err := ResolveURL("", "", "", "prod", defaultURL)
+		if err != nil || url != defaultURL || from {
+			t.Fatalf("prod first login must default to %q with fromOverrideVar=false, got url=%q from=%v err=%v",
+				defaultURL, url, from, err)
+		}
+	})
 }

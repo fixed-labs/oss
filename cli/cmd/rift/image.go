@@ -2,18 +2,21 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
+	"github.com/fixed-labs/oss/cli/clikit/kongx"
+	"github.com/fixed-labs/oss/cli/clikit/table"
 	"github.com/fixed-labs/oss/cli/internal/client"
+	"github.com/fixed-labs/oss/cli/internal/repoid"
 )
 
 // cmdImage is the `devbox image` command group: inspect and pin the per-repo
 // base images CI builds (boot-selection's catalog). All subcommands resolve
 // the repo from the cwd git remote (the canonical forge:host/owner/name id,
-// via the shared flow-1 resolution — see resolveRepo in commands.go).
+// via the shared flow-1 resolution — see repoid.Resolve in internal/repoid).
 //
 //	image ls           newest-first table: COMMIT REFS AGE BOXES FLAGS
 //	image pin <sha>    mark an image never-reap
@@ -36,24 +39,25 @@ func cmdImage(ctx context.Context, args []string) error {
 }
 
 func imageLs(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("image ls", flag.ContinueOnError)
-	repo := fs.String("repo", "", "repo (owner/name, a clone URL, or forge:host/owner/name); inferred from cwd if absent")
-	forge := fs.String("forge", "", "forge type of the repo's host (only github this phase)")
-	limit := fs.Int("limit", 0, "max images to list (0 = server default)")
-	if err := fs.Parse(args); err != nil {
+	var flags struct {
+		Repo  string `name:"repo" help:"repo (owner/name, a clone URL, or forge:host/owner/name); inferred from cwd if absent"`
+		Forge string `name:"forge" help:"forge type of the repo's host (only github this phase)"`
+		Limit int    `name:"limit" help:"max images to list (0 = server default)"`
+	}
+	if err := kongx.Parse("image ls", &flags, args); err != nil {
 		return err
 	}
 	c, _, err := authedClient()
 	if err != nil {
 		return err
 	}
-	r, err := resolveRepo(*repo, *forge)
+	r, err := repoid.Resolve(flags.Repo, flags.Forge)
 	if err != nil {
 		return err
 	}
 	rctx, cancel := ctxTimeout(ctx, 30*time.Second)
 	defer cancel()
-	items, err := c.ListImages(rctx, r, *limit)
+	items, err := c.ListImages(rctx, r, flags.Limit)
 	if err != nil {
 		return err
 	}
@@ -61,42 +65,44 @@ func imageLs(ctx context.Context, args []string) error {
 		fmt.Printf("No images for %s.\n", r)
 		return nil
 	}
-	fmt.Printf("%-14s  %-24s  %-8s  %-5s  %s\n", "COMMIT", "REFS", "AGE", "BOXES", "FLAGS")
+	t := table.New(os.Stdout, "COMMIT", "REFS", "AGE", "BOXES", "FLAGS")
 	for _, it := range items {
 		commit := it.Commit
 		if len(commit) > 12 {
 			commit = commit[:12]
 		}
-		fmt.Printf("%-14s  %-24s  %-8s  %-5d  %s\n",
+		t.Row(
 			commit,
 			strings.Join(it.Heads, ","),
 			humanizeAge(it.CreatedAt),
-			it.BoxCount,
+			fmt.Sprintf("%d", it.BoxCount),
 			imageFlags(it))
 	}
-	return nil
+	return t.Flush()
 }
 
 func imagePin(ctx context.Context, args []string, pin bool) error {
-	fs := flag.NewFlagSet("image pin", flag.ContinueOnError)
-	repo := fs.String("repo", "", "repo (owner/name, a clone URL, or forge:host/owner/name); inferred from cwd if absent")
-	forge := fs.String("forge", "", "forge type of the repo's host (only github this phase)")
-	if err := fs.Parse(args); err != nil {
+	var flags struct {
+		Repo  string `name:"repo" help:"repo (owner/name, a clone URL, or forge:host/owner/name); inferred from cwd if absent"`
+		Forge string `name:"forge" help:"forge type of the repo's host (only github this phase)"`
+		SHA   string `arg:"" optional:"" help:"the image commit SHA to pin/unpin"`
+	}
+	if err := kongx.Parse("image pin", &flags, args); err != nil {
 		return err
 	}
 	verb := "pin"
 	if !pin {
 		verb = "unpin"
 	}
-	if fs.NArg() < 1 {
+	if flags.SHA == "" {
 		return fmt.Errorf("usage: rift image %s <sha>", verb)
 	}
-	commit := fs.Arg(0)
+	commit := flags.SHA
 	c, _, err := authedClient()
 	if err != nil {
 		return err
 	}
-	r, err := resolveRepo(*repo, *forge)
+	r, err := repoid.Resolve(flags.Repo, flags.Forge)
 	if err != nil {
 		return err
 	}

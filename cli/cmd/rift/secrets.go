@@ -10,7 +10,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fixed-labs/oss/cli/clikit/kongx"
 	"github.com/fixed-labs/oss/cli/internal/broker"
+	"github.com/fixed-labs/oss/cli/internal/repoid"
 	"github.com/fixed-labs/oss/cli/internal/secrets"
 	"github.com/fixed-labs/oss/cli/internal/tunnel"
 )
@@ -205,11 +207,18 @@ func cmdSecrets(ctx context.Context, args []string) error {
 // secretsStatus previews the resolution against the LOCAL .rift/secrets.json
 // (no box needed) — what would be pushed, and which keys still need a source.
 func secretsStatus(_ context.Context, args []string) error {
-	repoFlag, forgeFlag, pos, err := splitRepoFlag(args)
-	if err != nil {
+	var flags struct {
+		Repo  string `name:"repo" help:"repo (owner/name, a clone URL, or forge:host/owner/name); inferred from cwd if absent"`
+		Forge string `name:"forge" help:"forge type of the repo's host (only github this phase)"`
+		Key   string `arg:"" optional:"" help:"(status takes no positional args)"`
+		Src   string `arg:"" optional:"" help:"(status takes no positional args)"`
+	}
+	if err := kongx.Parse("secrets status", &flags, args); err != nil {
 		return err
 	}
-	if len(pos) != 0 {
+	repoFlag, forgeFlag := flags.Repo, flags.Forge
+	// splitRepoFlag returned all positionals; status accepts none.
+	if flags.Key != "" || flags.Src != "" {
 		return fmt.Errorf("usage: rift secrets status [--repo REPO] [--forge F]")
 	}
 	repo, err := resolveRepoArg(repoFlag, forgeFlag)
@@ -280,15 +289,22 @@ func secretsStatus(_ context.Context, args []string) error {
 
 // secretsMap writes a key→source mapping into the user config.
 func secretsMap(_ context.Context, args []string) error {
-	repoFlag, forgeFlag, pos, err := splitRepoFlag(args)
-	if err != nil {
+	var flags struct {
+		Repo  string `name:"repo" help:"repo (owner/name, a clone URL, or forge:host/owner/name); inferred from cwd if absent"`
+		Forge string `name:"forge" help:"forge type of the repo's host (only github this phase)"`
+		Key   string `arg:"" optional:"" help:"the secret key to map"`
+		Src   string `arg:"" optional:"" help:"a path, the literal 'forward', or 'cmd:<command>'"`
+	}
+	if err := kongx.Parse("secrets map", &flags, args); err != nil {
 		return err
 	}
-	if len(pos) != 2 {
+	repoFlag, forgeFlag := flags.Repo, flags.Forge
+	// splitRepoFlag returned all positionals; map needs exactly two (key, source).
+	if flags.Key == "" || flags.Src == "" {
 		return fmt.Errorf("usage: rift secrets map <key> <source> [--repo REPO] [--forge F]\n" +
 			"  <source> is a path, the literal `forward`, or `cmd:<command>`")
 	}
-	key, err := secrets.ParseKey(pos[0])
+	key, err := secrets.ParseKey(flags.Key)
 	if err != nil {
 		return err
 	}
@@ -296,10 +312,10 @@ func secretsMap(_ context.Context, args []string) error {
 	// almost certainly meant the std: key (the std registry is keyed by bare name)
 	// — that would create a mapping no manifest references. Make the user qualify
 	// it. An explicit `local:aws` is honored as-is.
-	if !strings.Contains(pos[0], ":") && secrets.IsStdName(key.Name) {
-		return fmt.Errorf("%q parses as local:%s, which no manifest declares — did you mean std:%s? (bare names default to local:)", pos[0], key.Name, key.Name)
+	if !strings.Contains(flags.Key, ":") && secrets.IsStdName(key.Name) {
+		return fmt.Errorf("%q parses as local:%s, which no manifest declares — did you mean std:%s? (bare names default to local:)", flags.Key, key.Name, key.Name)
 	}
-	src, err := parseSourceArg(pos[1])
+	src, err := parseSourceArg(flags.Src)
 	if err != nil {
 		return err
 	}
@@ -321,55 +337,13 @@ func secretsMap(_ context.Context, args []string) error {
 	return nil
 }
 
-// splitRepoFlag pulls --repo/-repo and --forge/-forge (space- or =-separated)
-// out of args and returns them plus the remaining positionals. Go's flag
-// package stops at the first positional, so the documented
-// `map <key> <source> --repo R` order would otherwise silently ignore --repo.
-func splitRepoFlag(args []string) (repo, forge string, pos []string, err error) {
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		switch {
-		case a == "--": // end of flags: the rest are positionals (e.g. a -dash source)
-			pos = append(pos, args[i+1:]...)
-			return repo, forge, pos, nil
-		case a == "--repo" || a == "-repo":
-			if i+1 >= len(args) {
-				return "", "", nil, fmt.Errorf("--repo needs a value")
-			}
-			repo = args[i+1]
-			i++
-		case strings.HasPrefix(a, "--repo=") || strings.HasPrefix(a, "-repo="):
-			repo = a[strings.IndexByte(a, '=')+1:]
-			if repo == "" {
-				return "", "", nil, fmt.Errorf("--repo needs a non-empty value")
-			}
-		case a == "--forge" || a == "-forge":
-			if i+1 >= len(args) {
-				return "", "", nil, fmt.Errorf("--forge needs a value")
-			}
-			forge = args[i+1]
-			i++
-		case strings.HasPrefix(a, "--forge=") || strings.HasPrefix(a, "-forge="):
-			forge = a[strings.IndexByte(a, '=')+1:]
-			if forge == "" {
-				return "", "", nil, fmt.Errorf("--forge needs a non-empty value")
-			}
-		case strings.HasPrefix(a, "-"):
-			return "", "", nil, fmt.Errorf("unknown flag %q (only --repo/--forge; use -- before a source that starts with -)", a)
-		default:
-			pos = append(pos, a)
-		}
-	}
-	return repo, forge, pos, nil
-}
-
 // secretsRepoID reduces a canonical "forge:host/owner/name" repo id to the
 // secrets layer's qualified "host/owner/name" form by dropping the "<forge>:"
 // prefix — the one-seam conversion at the secrets boundary (the secrets
 // config-key grammar itself is unchanged and knows no forge). Strings without
 // a forge-enum prefix pass through untouched.
 func secretsRepoID(repo string) string {
-	if i := strings.IndexByte(repo, ':'); i > 0 && forgeEnum[strings.ToLower(repo[:i])] {
+	if i := strings.IndexByte(repo, ':'); i > 0 && repoid.IsForgeToken(repo[:i]) {
 		return repo[i+1:]
 	}
 	return repo
@@ -380,7 +354,7 @@ func secretsRepoID(repo string) string {
 // through the same flow-1 + canonicalizer as every other repo ingress, then
 // reduced to the secrets-qualified host/owner/name form.
 func resolveRepoArg(flag, forgeFlag string) (string, error) {
-	canonical, err := resolveRepo(flag, forgeFlag)
+	canonical, err := repoid.Resolve(flag, forgeFlag)
 	if err != nil {
 		return "", err
 	}

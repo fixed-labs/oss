@@ -3,6 +3,7 @@ module github.com/fixed-labs/oss/cli
 go 1.25.0
 
 require (
+	github.com/alecthomas/kong v1.16.0
 	github.com/charmbracelet/ultraviolet v0.0.0-20260615092913-2399af76d5b1
 	github.com/charmbracelet/x/term v0.2.2
 	github.com/charmbracelet/x/vt v0.0.0-20260615092313-b57e5e6d29bb
