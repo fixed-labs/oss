@@ -408,14 +408,14 @@ func TestLifecycleVerbsHitRightPaths(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 	})
 	ctx := context.Background()
-	_ = c.Suspend(ctx, "ws-1")
-	_ = c.Resume(ctx, "ws-1")
+	_ = c.Stop(ctx, "ws-1")
+	_ = c.Start(ctx, "ws-1")
 	_ = c.Resize(ctx, "ws-1", "shared-4x")
 	_ = c.Keepalive(ctx, "ws-1", 60000)
 	_ = c.Destroy(ctx, "ws-1")
 	want := []string{
-		"POST /api/workspaces/ws-1/suspend",
-		"POST /api/workspaces/ws-1/resume",
+		"POST /api/workspaces/ws-1/stop",
+		"POST /api/workspaces/ws-1/start",
 		"POST /api/workspaces/ws-1/resize",
 		"POST /api/workspaces/ws-1/keepalive",
 		"DELETE /api/workspaces/ws-1",
@@ -439,11 +439,11 @@ func TestMachineVerbsHitAgentRoutes(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 	})
 	ctx := context.Background()
-	_ = c.MachineSuspend(ctx, "ws-1")
+	_ = c.MachineStop(ctx, "ws-1")
 	_ = c.MachineResize(ctx, "ws-1", "shared-4x")
 	_ = c.MachineKeepalive(ctx, "ws-1", 60000)
 	want := []string{
-		"POST /api/rift/v1/ws-1/suspend",
+		"POST /api/rift/v1/ws-1/stop",
 		"POST /api/rift/v1/ws-1/resize",
 		"POST /api/rift/v1/ws-1/keepalive",
 	}

@@ -506,11 +506,11 @@ func (c *Client) simplePost(ctx context.Context, id, leaf string, body any) erro
 	return c.Do(ctx, http.MethodPost, "/api/workspaces/"+url.PathEscape(id)+"/"+leaf, body, nil)
 }
 
-func (c *Client) Suspend(ctx context.Context, id string) error {
-	return c.simplePost(ctx, id, "suspend", nil)
+func (c *Client) Stop(ctx context.Context, id string) error {
+	return c.simplePost(ctx, id, "stop", nil)
 }
-func (c *Client) Resume(ctx context.Context, id string) error {
-	return c.simplePost(ctx, id, "resume", nil)
+func (c *Client) Start(ctx context.Context, id string) error {
+	return c.simplePost(ctx, id, "start", nil)
 }
 
 func (c *Client) Resize(ctx context.Context, id, size string) error {
@@ -546,8 +546,8 @@ func (c *Client) machinePost(ctx context.Context, id, leaf string, body any) err
 	return c.Do(ctx, http.MethodPost, "/api/rift/v1/"+url.PathEscape(id)+"/"+leaf, body, nil)
 }
 
-func (c *Client) MachineSuspend(ctx context.Context, id string) error {
-	return c.machinePost(ctx, id, "suspend", nil)
+func (c *Client) MachineStop(ctx context.Context, id string) error {
+	return c.machinePost(ctx, id, "stop", nil)
 }
 
 func (c *Client) MachineResize(ctx context.Context, id, size string) error {

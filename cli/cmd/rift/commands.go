@@ -675,23 +675,23 @@ func lifecycle(ctx context.Context, args []string, verb string) error {
 	var id string
 	if cfg.MachineWorkspaceID != "" {
 		// In-VM: the machine token only opens the self-service agent routes.
-		if verb != "suspend" {
-			return fmt.Errorf("rift %s is not available in-VM — run it from your laptop (machine tokens may only suspend/resize/keepalive their own workspace)", verb)
+		if verb != "stop" {
+			return fmt.Errorf("rift %s is not available in-VM — run it from your laptop (machine tokens may only stop/resize/keepalive their own workspace)", verb)
 		}
 		if id, err = machineTarget(cfg.MachineWorkspaceID, args); err != nil {
 			return err
 		}
-		err = c.MachineSuspend(rctx, id)
+		err = c.MachineStop(rctx, id)
 	} else {
 		if len(args) < 1 {
 			return fmt.Errorf("usage: rift %s <id>", verb)
 		}
 		id = args[0]
 		switch verb {
-		case "suspend":
-			err = c.Suspend(rctx, id)
-		case "resume":
-			err = c.Resume(rctx, id)
+		case "stop":
+			err = c.Stop(rctx, id)
+		case "start":
+			err = c.Start(rctx, id)
 		case "rm":
 			err = c.Destroy(rctx, id)
 		}

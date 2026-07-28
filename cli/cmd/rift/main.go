@@ -1,6 +1,6 @@
 // devbox — the developer CLI for devboxes. A single static
 // binary, distributed to laptops AND baked into the workspace image so the
-// same binary runs the in-VM resize/keepalive/suspend (config.FromEnvOrFile
+// same binary runs the in-VM resize/keepalive/stop (config.FromEnvOrFile
 // picks up the machine credentials there; the machine bearer only opens the
 // self-service agent routes, so in-VM those verbs act on the VM's own
 // workspace and the rest of the surface needs a developer login).
@@ -8,11 +8,11 @@
 // login   device-flow magic-link login (mints the developer bearer)
 // new     create + connect (infers repo/commit from the cwd git remote)
 // ls      live list
-// connect resume-if-stopped, attach a persistent session over SSH-over-WireGuard
+// connect start-if-stopped, attach a persistent session over SSH-over-WireGuard
 //
 //	(sessions outlive the connection; a reconnect re-attaches the same one)
 //
-// suspend/resume/rm/keepalive/resize  lifecycle
+// stop/start/rm/keepalive/resize  lifecycle
 //
 // The connect/new tunnel bring-up (userspace wireguard-go netstack + the SSH
 // bridge) is wired in internal/tunnel; the interactive session rides a Go SSH
@@ -89,10 +89,14 @@ func main() {
 		err = cmdNew(ctx, args)
 	case "connect":
 		err = cmdConnect(ctx, args)
+	case "stop":
+		err = lifecycle(ctx, args, "stop")
+	case "start":
+		err = lifecycle(ctx, args, "start")
 	case "suspend":
-		err = lifecycle(ctx, args, "suspend")
+		err = fmt.Errorf("rift suspend was renamed — use: rift stop")
 	case "resume":
-		err = lifecycle(ctx, args, "resume")
+		err = fmt.Errorf("rift resume was renamed — use: rift start")
 	case "rm", "destroy":
 		err = lifecycle(ctx, args, "rm")
 	case "resize":
@@ -147,7 +151,7 @@ func usage() {
 		"  rift sizes\n"+
 		"  rift regions\n"+
 		"  rift connect [--new] [--session NAME] <id>\n"+
-		"  rift suspend|resume|rm <id>\n"+
+		"  rift stop|start|rm <id>\n"+
 		"  rift resize <id> --size S\n"+
 		"  rift keepalive <id> [--for DURATION]\n"+
 		"  rift image ls|pin <sha>|unpin <sha>\n"+
@@ -163,7 +167,7 @@ func usage() {
 		"RIFT_ENV=<name> selects a named login session (default \"prod\"); create one\n"+
 		"by running rift login under that RIFT_ENV.\n"+
 		"In-VM the provisioner injects a machine token via RIFT_API_URL/RIFT_TOKEN/\n"+
-		"RIFT_WORKSPACE_ID; there only suspend/resize/keepalive are available, acting\n"+
+		"RIFT_WORKSPACE_ID; there only stop/resize/keepalive are available, acting\n"+
 		"on the VM's own workspace, and <id> may be omitted.\n")
 }
 

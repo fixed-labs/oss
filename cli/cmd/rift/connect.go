@@ -27,7 +27,7 @@ func asAPIError(err error, target **client.APIError) bool {
 	return errors.As(err, target)
 }
 
-// connect is the heart of the CLI: resume the box if stopped, wait for it to be
+// connect is the heart of the CLI: start the box if stopped, wait for it to be
 // running, open an attachment, bring up the userspace tunnel, select a session
 // (default-session selection: create-or-attach the single default session), and
 // attach to it under the chrome compositor. Background
@@ -308,7 +308,7 @@ func presenceLoop(ctx context.Context, c *client.Client, id string) {
 	}
 }
 
-// waitRunning resumes a stopped box and polls (via the live long-poll) until it
+// waitRunning starts a stopped box and polls (via the live long-poll) until it
 // reaches running (or a terminal failure).
 func waitRunning(ctx context.Context, c *client.Client, id string) (*client.Workspace, error) {
 	gctx, cancel := ctxTimeout(ctx, 30*time.Second)
@@ -319,12 +319,12 @@ func waitRunning(ctx context.Context, c *client.Client, id string) (*client.Work
 	}
 	if ws.Status == "stopped" {
 		rctx, rcancel := ctxTimeout(ctx, 30*time.Second)
-		err := c.Resume(rctx, id)
+		err := c.Start(rctx, id)
 		rcancel()
 		if err != nil {
-			return nil, fmt.Errorf("resume: %w", err)
+			return nil, fmt.Errorf("start: %w", err)
 		}
-		fmt.Printf("%s is stopped — resuming…\n", id)
+		fmt.Printf("%s is stopped — starting…\n", id)
 	}
 	deadline := time.Now().Add(5 * time.Minute)
 	for ws.Status != "running" {
