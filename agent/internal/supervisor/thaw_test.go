@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -25,6 +26,7 @@ type thawMockAPI struct {
 	mu sync.Mutex
 
 	hbCalls int      // total Heartbeat invocations
+	hbFails int      // fail the first N heartbeats (0 ⇒ never) — exercises beat retry
 	pulls   []string // cursors received, in order
 
 	steadyCounter int // advances the steady-state cursor "h:1","h:2",…
@@ -37,6 +39,9 @@ func (m *thawMockAPI) Heartbeat(_ context.Context, _ bool, _ int, _ api.Identity
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.hbCalls++
+	if m.hbCalls <= m.hbFails {
+		return fmt.Errorf("api down")
+	}
 	return nil
 }
 
@@ -346,6 +351,43 @@ func TestThawNoFalsePositiveOnNormalTick(t *testing.T) {
 	syncMu.Unlock()
 	if gotSyncs == 0 {
 		t.Fatal("SyncSessions never fired on the normal cadence (harness wired wrong)")
+	}
+}
+
+// T8 — the thaw-forced beat inherits the retry (warm-resume path, §4.1). Because
+// the retry lives INSIDE beat() (thaw() calls s.beat directly), thaw()'s forced
+// heartbeat retries a transient failure exactly as the steady loop's beat does.
+// This guards against a future refactor hoisting the retry up into heartbeatLoop,
+// which would silently drop retry on resume — the exact mistake §4.1 warns
+// against. Distinct from T4 (which calls beat() directly): T8 proves the THAW
+// caller benefits.
+//
+// Injection: the two-clock driver's now() stays frozen across one sendHeartbeat
+// (that call reads only s.now(), never monoNow(), so the driver never advances) →
+// with a 10s HeartbeatInterval the deadline is never approached, so the K retries
+// run to the mock's success. Backoff is thawSupervisor's ms-scale BackoffMin/Max.
+func TestThawForcedBeatInheritsRetry(t *testing.T) {
+	const K = 3
+	m := &thawMockAPI{
+		hbFails:   K, // fail K times then succeed — exercises the in-beat() retry
+		thawPeers: []api.Peer{{LaptopWgPubkey: "THAW", LaptopWgIP: "fd::z"}},
+	}
+	rec := &recordingReconciler{}
+	// jumpStep 0 ⇒ no wall jump: we drive thaw() directly, so the detector never
+	// runs; the clock just needs to be present and frozen-per-sendHeartbeat.
+	d := newTwoClockDriver(time.Second, 0, 0)
+	s := thawSupervisor(m, rec, d)
+	// thaw() is called directly (bypassing Run→defaults), and the failing beats
+	// log via s.Log — install a discarding logger so those warns don't nil-panic.
+	s.Log = discardLogger()
+
+	// Drive the thaw hook directly: thaw() → s.beat() → sendHeartbeat(), which
+	// must retry the transient failures.
+	s.thaw(context.Background())
+
+	hb, _ := m.snapshot()
+	if hb != K+1 {
+		t.Fatalf("thaw-forced beat Heartbeat calls = %d, want %d (K=%d fails then success) — retry not inherited by thaw", hb, K+1, K)
 	}
 }
 

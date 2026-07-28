@@ -219,21 +219,15 @@ func (s *Supervisor) heartbeatLoop(ctx context.Context) {
 	}
 }
 
-// beat sends one heartbeat and fires the piggybacked session/peer refreshes. It
-// is the loop body factored out so the thaw hook can force one out of cadence.
+// beat sends one heartbeat (retrying a transient failure, §4.1 Lever 1) and
+// fires the piggybacked session/peer refreshes. It is the loop body factored out
+// so the thaw hook can force one out of cadence — the retry lives HERE so the
+// warm-resume thaw-forced beat (thaw() calls s.beat) is covered for free.
 func (s *Supervisor) beat(ctx context.Context) {
-	// interactive_live folds session liveness (attached clients, or a held PTY
-	// within the keep-warm window) — the box-observed signal driving idle-suspend.
-	// ssh_sessions rides along as the raw authorized-connection count (the api
-	// re-folds it defensively). Every beat also re-asserts s.Identity so the
-	// cluster can flip the row to running (provisioned/starting) idempotently — a
-	// dropped beat self-heals next tick.
-	ssh := s.SSHSessions()
-	if err := s.API.Heartbeat(ctx, s.interactiveLive(), ssh, s.Identity); err != nil {
-		s.Log.Warn("heartbeat failed", "err", err)
-	}
+	s.sendHeartbeat(ctx)
 	// SyncSessions piggybacks the heartbeat cadence (the Manager also fires it on
-	// attach/detach). A snapshot of all live sessions, no terminal bytes.
+	// attach/detach). A snapshot of all live sessions, no terminal bytes. Fires
+	// once, after the retry loop settles.
 	if s.SyncSessions != nil {
 		s.SyncSessions()
 	}
@@ -242,6 +236,49 @@ func (s *Supervisor) beat(ctx context.Context) {
 	// peer-set change).
 	if s.RefreshLivePeers != nil {
 		s.RefreshLivePeers()
+	}
+}
+
+// sendHeartbeat sends one heartbeat, retrying a transient failure with the same
+// jittered-exponential backoff the pull loop uses (BackoffMin→BackoffMax). The
+// retry is bounded by a deadline captured ONCE at entry — the shape waitOrThaw
+// uses (now.Add(HeartbeatInterval)) — so retries can never slide into the next
+// scheduled beat (preserving at-most-one-append-in-flight-per-box). It stops
+// when the next backoff sleep would cross that deadline, logging a DISTINCT
+// "heartbeat retries exhausted" line for recurrence alerting. A ctx cancellation
+// during a backoff sleep returns promptly via the select on ctx.Done().
+func (s *Supervisor) sendHeartbeat(ctx context.Context) {
+	// interactive_live folds session liveness (attached clients, or a held PTY
+	// within the keep-warm window) — the box-observed signal driving idle-suspend.
+	// ssh_sessions rides along as the raw authorized-connection count (the api
+	// re-folds it defensively). Every beat also re-asserts s.Identity so the
+	// cluster can flip the row to running (provisioned/starting) idempotently.
+	deadline := s.now().Add(s.HeartbeatInterval)
+	backoff := s.BackoffMin
+	for {
+		ssh := s.SSHSessions()
+		err := s.API.Heartbeat(ctx, s.interactiveLive(), ssh, s.Identity)
+		if err == nil {
+			return
+		}
+		s.Log.Warn("heartbeat failed", "err", err)
+		// Jitter the re-arm so a fleet of agents doesn't thundering-herd a
+		// recovering API (same idiom as pullLoop).
+		jitter := time.Duration(rand.Int63n(int64(backoff) / 2))
+		// Stop before a sleep that would cross the deadline captured at entry —
+		// a retry must not overlap the next scheduled beat. The steady loop's
+		// waitOrThaw then waits its own fresh interval, and INV-R heals the box
+		// on the next successful beat.
+		if s.now().Add(backoff + jitter).After(deadline) {
+			s.Log.Warn("heartbeat retries exhausted", "err", err)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff + jitter):
+		}
+		backoff = min(backoff*2, s.BackoffMax)
 	}
 }
 

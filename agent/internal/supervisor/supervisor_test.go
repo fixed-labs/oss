@@ -1,8 +1,11 @@
 package supervisor
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -327,5 +330,240 @@ func TestPullErrorBacksOffThenRecovers(t *testing.T) {
 	defer rec.mu.Unlock()
 	if len(rec.sets) == 0 {
 		t.Fatal("never recovered to a successful reconcile after errors")
+	}
+}
+
+// --- Lever 1 (§4.1) — sendHeartbeat retry helpers -----------------------------
+//
+// The retry loop in sendHeartbeat bounds itself against a deadline captured ONCE
+// at entry (deadline := s.now().Add(s.HeartbeatInterval)) and re-reads s.now()
+// each iteration to decide whether the next backoff would cross it. The tests
+// below inject s.now directly (an unexported field, set in-package as thaw_test.go
+// does) to make the deadline deterministic:
+//
+//   - a FROZEN now (retry-then-succeed, ctx-cancel): now never advances, so the
+//     deadline never trips early — the loop is bounded only by the mock finally
+//     succeeding, or by ctx cancellation. HeartbeatInterval is sized so K+1
+//     attempts' worth of backoff never crosses it.
+//   - a STEPPING now (exhaustion): now advances a fixed step on every read, so the
+//     s.now()-relative deadline is eventually crossed — a frozen clock here would
+//     loop forever because the deadline is never reached.
+
+// frozenClock returns the same wall time on every read.
+func frozenClock(at time.Time) func() time.Time {
+	return func() time.Time { return at }
+}
+
+// steppingClock advances by step on every read (thread-safe). The FIRST read
+// (sendHeartbeat's deadline capture) returns base; each subsequent read is
+// base + n*step, so the s.now()-relative deadline is eventually crossed.
+type steppingClock struct {
+	mu   sync.Mutex
+	cur  time.Time
+	step time.Duration
+}
+
+func newSteppingClock(base time.Time, step time.Duration) *steppingClock {
+	return &steppingClock{cur: base, step: step}
+}
+
+func (c *steppingClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	t := c.cur
+	c.cur = c.cur.Add(c.step)
+	return t
+}
+
+// bufferLogger returns a slog.Logger writing to a buffer plus the buffer, so a
+// test can assert on the exact message keys emitted (the §4.4 observability
+// contract keys recurrence alerting on "heartbeat retries exhausted"). The mutex
+// guards concurrent Handle calls; countMsg reads under the same lock.
+type bufferLogger struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func newBufferLogger() (*slog.Logger, *bufferLogger) {
+	bl := &bufferLogger{}
+	h := slog.NewTextHandler(&syncWriter{bl: bl}, &slog.HandlerOptions{Level: slog.LevelDebug})
+	return slog.New(h), bl
+}
+
+type syncWriter struct{ bl *bufferLogger }
+
+func (w *syncWriter) Write(p []byte) (int, error) {
+	w.bl.mu.Lock()
+	defer w.bl.mu.Unlock()
+	return w.bl.buf.Write(p)
+}
+
+// countMsg counts how many log records carry msg=<want>. slog's TextHandler
+// renders the message as msg="...", so we match that exact token to avoid
+// substring collisions between the two distinct lines.
+func (bl *bufferLogger) countMsg(want string) int {
+	bl.mu.Lock()
+	defer bl.mu.Unlock()
+	token := `msg="` + want + `"`
+	n := 0
+	for _, line := range strings.Split(bl.buf.String(), "\n") {
+		if strings.Contains(line, token) {
+			n++
+		}
+	}
+	return n
+}
+
+// discardLogger is a no-op logger for tests that don't assert on log output.
+// beat()/sendHeartbeat call s.Log.Warn unconditionally, and calling beat()
+// directly (not via Run) skips defaults(), which would otherwise install
+// slog.Default() — so a nil s.Log would panic.
+func discardLogger() *slog.Logger {
+	return slog.New(slog.DiscardHandler)
+}
+
+// retrySupervisor builds a Supervisor wired for the sendHeartbeat-retry tests:
+// the given mock, ms-scale backoff, and a caller-supplied now clock. No session
+// accessors beyond fastSupervisor's, so beat()'s piggybacks are observable. A nil
+// log gets a discarding logger (beat() is called directly, bypassing defaults()).
+func retrySupervisor(m *mockAPI, now func() time.Time, log *slog.Logger) *Supervisor {
+	s := fastSupervisor(m, &recordingReconciler{})
+	s.now = now
+	if log != nil {
+		s.Log = log
+	} else {
+		s.Log = discardLogger()
+	}
+	return s
+}
+
+// T4 — sendHeartbeat retries a transient failure and lands within the interval.
+// The mock fails K times then succeeds; a FROZEN now keeps the entry-captured
+// deadline out of reach (HeartbeatInterval ≫ the ms-scale backoff budget), so the
+// loop is bounded only by the mock finally succeeding. Asserts Heartbeat was
+// called exactly K+1 times (retried, not once-and-give-up) AND that the beat's
+// piggybacks (SyncSessions/RefreshLivePeers) fired EXACTLY once — the retry loop
+// must not multiply them (they live in beat(), after sendHeartbeat returns).
+func TestSendHeartbeatRetriesThenSucceeds(t *testing.T) {
+	const K = 3
+	m := &mockAPI{hbFails: K}
+	// Frozen clock: deadline = now + HeartbeatInterval is fixed and, with a 1s
+	// interval vs a ~1+2+4ms backoff budget, never crossed — so exhaustion can't
+	// pre-empt the K retries.
+	s := retrySupervisor(m, frozenClock(time.Now()), nil)
+	s.HeartbeatInterval = time.Second
+
+	var syncs, refreshes atomic.Int32
+	s.SyncSessions = func() { syncs.Add(1) }
+	s.RefreshLivePeers = func() { refreshes.Add(1) }
+
+	// Call beat() directly (not Run) so we observe exactly ONE beat.
+	s.beat(context.Background())
+
+	m.mu.Lock()
+	got := m.hbCalls
+	landed := len(m.heartbeats)
+	m.mu.Unlock()
+	if got != K+1 {
+		t.Fatalf("Heartbeat calls = %d, want %d (K=%d fails then success)", got, K+1, K)
+	}
+	if landed != 1 {
+		t.Fatalf("landed heartbeats = %d, want 1 (only the successful attempt records)", landed)
+	}
+	if s := syncs.Load(); s != 1 {
+		t.Fatalf("SyncSessions fired %d times, want exactly 1 (retry must not multiply piggybacks)", s)
+	}
+	if r := refreshes.Load(); r != 1 {
+		t.Fatalf("RefreshLivePeers fired %d times, want exactly 1 (retry must not multiply piggybacks)", r)
+	}
+}
+
+// T5(a) — sendHeartbeat bounds retries at the deadline and logs exhaustion
+// distinctly. The mock ALWAYS errors; a STEPPING now advances every read so the
+// s.now()-relative deadline is eventually crossed (a frozen clock would loop
+// forever). Asserts: exactly one "heartbeat retries exhausted" record; "heartbeat
+// failed" appears once per attempt and is a DISTINCT message key from the
+// exhaustion line; the call returns (no hang); attempt count is bounded by the
+// deadline budget.
+func TestSendHeartbeatExhaustionLogsDistinctly(t *testing.T) {
+	m := &mockAPI{hbFails: 1 << 30} // always fails
+	log, bl := newBufferLogger()
+	// Step the clock by BackoffMin each read so the deadline is reached after a
+	// bounded number of iterations. HeartbeatInterval sized to admit several
+	// attempts (each iteration reads now() at least once → advances the step).
+	step := 2 * time.Millisecond
+	s := retrySupervisor(m, newSteppingClock(time.Now(), step).now, log)
+	s.HeartbeatInterval = 40 * time.Millisecond // ~ a handful of stepped reads
+
+	done := make(chan struct{})
+	go func() {
+		s.sendHeartbeat(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("sendHeartbeat hung (deadline never tripped) — exhaustion not bounded")
+	}
+
+	exhausted := bl.countMsg("heartbeat retries exhausted")
+	if exhausted != 1 {
+		t.Fatalf(`"heartbeat retries exhausted" logged %d times, want exactly 1`, exhausted)
+	}
+	failed := bl.countMsg("heartbeat failed")
+	m.mu.Lock()
+	attempts := m.hbCalls
+	m.mu.Unlock()
+	// Every attempt logs one "heartbeat failed" (the mock always errors), so the
+	// count matches the attempt count — proving the two lines are DISTINCT keys
+	// (not collapsed into one) and that "failed" fires per attempt.
+	if failed != attempts {
+		t.Fatalf(`"heartbeat failed" logged %d times, want %d (once per attempt)`, failed, attempts)
+	}
+	if failed == exhausted {
+		t.Fatalf("the per-attempt and exhaustion lines must be distinct keys (failed=%d exhausted=%d)", failed, exhausted)
+	}
+	// Bounded: the deadline budget caps attempts well under a runaway loop.
+	if attempts < 1 || attempts > 100 {
+		t.Fatalf("attempts = %d, expected a small deadline-bounded count", attempts)
+	}
+}
+
+// T5(b) — a ctx-cancelled beat returns promptly and emits ZERO "heartbeat retries
+// exhausted" records (the exhaustion line is a genuine recurrence signal, never
+// shutdown noise — §4.4). The mock always errors; a FROZEN now held BELOW the
+// deadline keeps the deadline-cross check (which sendHeartbeat evaluates BEFORE
+// the select on ctx.Done()) from firing, so the cancel — not exhaustion — is what
+// ends the loop.
+func TestSendHeartbeatCtxCancelNoExhaustionLog(t *testing.T) {
+	m := &mockAPI{hbFails: 1 << 30} // always fails
+	log, bl := newBufferLogger()
+	// Frozen now + a large interval ⇒ the deadline is never approached, so the
+	// only way out of the loop is ctx.Done() during the backoff sleep.
+	s := retrySupervisor(m, frozenClock(time.Now()), log)
+	s.HeartbeatInterval = time.Hour
+	// Larger min backoff so the first attempt reliably parks in the select on
+	// ctx.Done() (rather than racing a sub-ms cancel).
+	s.BackoffMin = 20 * time.Millisecond
+	s.BackoffMax = 40 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		s.sendHeartbeat(ctx)
+		close(done)
+	}()
+	// Let the first attempt fail and enter the backoff sleep, then cancel.
+	time.Sleep(5 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sendHeartbeat did not return promptly on ctx cancel")
+	}
+
+	if got := bl.countMsg("heartbeat retries exhausted"); got != 0 {
+		t.Fatalf(`ctx-cancelled beat emitted %d "heartbeat retries exhausted" records, want 0 (no shutdown noise)`, got)
 	}
 }
