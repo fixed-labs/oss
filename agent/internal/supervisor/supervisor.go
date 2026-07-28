@@ -80,11 +80,36 @@ type Supervisor struct {
 	// triggers a rewrite otherwise. Optional: nil ⇒ no wg net (tests).
 	RefreshLivePeers func()
 
+	// now is the injected WALL clock (defaults time.Now); monoNow is the injected
+	// MONOTONIC-elapsed source (defaults time.Since(process-start)). The thaw
+	// detector (thaw.go) compares the wall delta (from now, monotonic stripped via
+	// .Round(0)) against the monotonic delta (from monoNow): a Fly RAM-snapshot
+	// resume pauses the monotonic clock while wall-clock jumps, so wallDelta −
+	// monoDelta spikes. They are SEPARATE injectables — NOT one time.Time read via
+	// the .Round(0)/.Sub trick — precisely so a test can make wall and monotonic
+	// DIVERGE: Go exposes no way to build a time.Time whose embedded monotonic
+	// reading differs independently from its wall reading, so a single-clock fake
+	// could never express a suspend. With two clocks a test advances now by a jump
+	// while advancing monoNow by only the poll interval (and, for the no-false-
+	// positive case, advances both together).
+	now     func() time.Time
+	monoNow func() time.Duration
+
 	// Tunables (defaulted by Run; overridden in tests).
 	HeartbeatInterval time.Duration
 	PollFloor         time.Duration
 	BackoffMin        time.Duration
 	BackoffMax        time.Duration
+	// ThawPoll is the short monotonic sub-interval the heartbeat loop wakes on to
+	// check for a resume-from-suspend clock jump (default 3s). It is well below
+	// HeartbeatInterval so detection is prompt, and its per-sample wall≈monotonic
+	// delta stays far under ThawThreshold under normal operation (no false
+	// positive). See thaw.go.
+	ThawPoll time.Duration
+	// ThawThreshold is how much unaccounted WALL time (wallDelta − monoDelta)
+	// across one ThawPoll sample marks a warm resume from a Fly RAM snapshot
+	// (default 10s). See thaw.go for the rationale.
+	ThawThreshold time.Duration
 	// DetachedKeepWarm is how long a fully-detached box with a held PTY still
 	// reports interactive liveness (so a detached job keeps the box warm before
 	// it idle-parks). Measured from LastDetachAt. Default ~3h.
@@ -112,6 +137,19 @@ func (s *Supervisor) defaults() {
 	}
 	if s.DetachedKeepWarm == 0 {
 		s.DetachedKeepWarm = 3 * time.Hour
+	}
+	if s.now == nil {
+		s.now = time.Now
+	}
+	if s.monoNow == nil {
+		start := time.Now()
+		s.monoNow = func() time.Duration { return time.Since(start) }
+	}
+	if s.ThawPoll == 0 {
+		s.ThawPoll = 3 * time.Second
+	}
+	if s.ThawThreshold == 0 {
+		s.ThawThreshold = 10 * time.Second
 	}
 }
 
@@ -167,35 +205,43 @@ func (s *Supervisor) heartbeatLoop(ctx context.Context) {
 			s.Log.Error("heartbeat loop panic recovered", "panic", r)
 		}
 	}()
-	t := time.NewTicker(s.HeartbeatInterval)
-	defer t.Stop()
 	for {
-		// interactive_live folds session liveness (attached clients, or a held
-		// PTY within the keep-warm window) — the box-observed signal driving idle-
-		// suspend. ssh_sessions rides along as the raw authorized-connection count
-		// (the api re-folds it defensively). Every beat also re-asserts s.Identity
-		// so the cluster can flip the row to running (provisioned/starting)
-		// idempotently — a dropped beat self-heals next tick.
-		ssh := s.SSHSessions()
-		if err := s.API.Heartbeat(ctx, s.interactiveLive(), ssh, s.Identity); err != nil {
-			s.Log.Warn("heartbeat failed", "err", err)
-		}
-		// SyncSessions piggybacks the heartbeat cadence (the Manager also fires it
-		// on attach/detach). A snapshot of all live sessions, no terminal bytes.
-		if s.SyncSessions != nil {
-			s.SyncSessions()
-		}
-		// Prune strands from the broker discovery file: re-publish only live
-		// connections. Rides the heartbeat cadence (the pull loop only rewrites on a
-		// peer-set change).
-		if s.RefreshLivePeers != nil {
-			s.RefreshLivePeers()
-		}
-		select {
-		case <-ctx.Done():
+		s.beat(ctx)
+		// Instead of a single monotonic ticker (which pauses across a Fly RAM-
+		// snapshot suspend, leaving the box up to a full interval before its next
+		// beat), wait on a short sub-poll that also watches the clock. On a warm
+		// resume waitOrThaw returns early having already handled the thaw (immediate
+		// heartbeat + relay/attachment resync), so the loop re-beats at once and the
+		// cluster flips starting → running promptly.
+		if !s.waitOrThaw(ctx) {
 			return
-		case <-t.C:
 		}
+	}
+}
+
+// beat sends one heartbeat and fires the piggybacked session/peer refreshes. It
+// is the loop body factored out so the thaw hook can force one out of cadence.
+func (s *Supervisor) beat(ctx context.Context) {
+	// interactive_live folds session liveness (attached clients, or a held PTY
+	// within the keep-warm window) — the box-observed signal driving idle-suspend.
+	// ssh_sessions rides along as the raw authorized-connection count (the api
+	// re-folds it defensively). Every beat also re-asserts s.Identity so the
+	// cluster can flip the row to running (provisioned/starting) idempotently — a
+	// dropped beat self-heals next tick.
+	ssh := s.SSHSessions()
+	if err := s.API.Heartbeat(ctx, s.interactiveLive(), ssh, s.Identity); err != nil {
+		s.Log.Warn("heartbeat failed", "err", err)
+	}
+	// SyncSessions piggybacks the heartbeat cadence (the Manager also fires it on
+	// attach/detach). A snapshot of all live sessions, no terminal bytes.
+	if s.SyncSessions != nil {
+		s.SyncSessions()
+	}
+	// Prune strands from the broker discovery file: re-publish only live
+	// connections. Rides the heartbeat cadence (the pull loop only rewrites on a
+	// peer-set change).
+	if s.RefreshLivePeers != nil {
+		s.RefreshLivePeers()
 	}
 }
 
