@@ -15,8 +15,7 @@ need to build against, connect to, and customize a Rift devbox. It contains:
   to over the tunnel.
 - **`nix/devboxes-base/`** — the NixOS base module every devbox image builds on.
   Your custom image imports it and layers your tools on top.
-- **`examples/`** — a sample client flake (`flake.nix`) and a sample secrets
-  manifest (`secrets.json`) to copy from.
+- **`examples/`** — a sample client flake (`flake.nix`) to copy from.
 - **`docs/`** — integration guides (see below).
 
 The control plane, the relay data plane, and the service's internal libraries
@@ -57,7 +56,6 @@ nix build .#agent
 | Guide | What it covers |
 |---|---|
 | [docs/getting-started.md](docs/getting-started.md) | Install → `login` → `new` → `connect`, and the connection model. |
-| [docs/secrets.md](docs/secrets.md) | The `.rift/secrets.json` manifest, your `~/.config/rift/secrets.json`, and the `std:`/`local:`/`org:` key model. |
 | [docs/image-config.md](docs/image-config.md) | Customizing the base image: `nixosModules.devboxes-base` + `lib.mkDevimage`. |
 | [docs/api-reference.md](docs/api-reference.md) | The developer-surface HTTP endpoints the CLI calls. |
 

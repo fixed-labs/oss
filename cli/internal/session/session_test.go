@@ -140,7 +140,7 @@ func (a *fakeAgent) dialClient(t *testing.T) *Client {
 	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return cConn, nil
 	}
-	cl, err := Dial(context.Background(), dial, "10.0.0.1", 22, "dev", a.hostPub, false)
+	cl, err := Dial(context.Background(), dial, "10.0.0.1", 22, "dev", a.hostPub)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -303,7 +303,7 @@ func TestWrongHostKeyRejected(t *testing.T) {
 	cConn, sConn := pipePair(t)
 	go a.serve(t, sConn)
 	dial := func(ctx context.Context, network, addr string) (net.Conn, error) { return cConn, nil }
-	if _, err := Dial(context.Background(), dial, "10.0.0.1", 22, "dev", other.hostPub, false); err == nil {
+	if _, err := Dial(context.Background(), dial, "10.0.0.1", 22, "dev", other.hostPub); err == nil {
 		t.Fatal("dial must reject a mismatched host key")
 	}
 }

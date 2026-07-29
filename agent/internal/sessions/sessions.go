@@ -77,11 +77,6 @@ type Manager struct {
 	genEpoch int64
 	log      *slog.Logger
 
-	// agentSockDir is where per-session SSH_AUTH_SOCK proxy sockets live (the
-	// box half of agent forwarding). Empty disables forwarding
-	// (no SSH_AUTH_SOCK exported) — e.g. tests that don't exercise it.
-	agentSockDir string
-
 	// lastDetachAt is the most-recent detach timestamp across ALL held PTYs —
 	// the keep-warm clock the supervisor's interactiveLive computation reads.
 	lastDetachAt time.Time
@@ -98,9 +93,6 @@ type Config struct {
 	API      SessionAPI
 	GenEpoch int64
 	Log      *slog.Logger
-	// AgentSockDir is the directory for per-session SSH_AUTH_SOCK proxy sockets
-	// (agent forwarding). Empty disables forwarding.
-	AgentSockDir string
 }
 
 // NewManager builds a Manager. genEpoch is the post-bump epoch (see Reconcile);
@@ -111,16 +103,15 @@ func NewManager(c Config) *Manager {
 		log = slog.Default()
 	}
 	return &Manager{
-		sessions:     map[string]*Session{},
-		byName:       map[string]string{},
-		shell:        c.Shell,
-		home:         c.Home,
-		login:        c.Login,
-		cred:         c.Cred,
-		api:          c.API,
-		genEpoch:     c.GenEpoch,
-		log:          log,
-		agentSockDir: c.AgentSockDir,
+		sessions: map[string]*Session{},
+		byName:   map[string]string{},
+		shell:    c.Shell,
+		home:     c.Home,
+		login:    c.Login,
+		cred:     c.Cred,
+		api:      c.API,
+		genEpoch: c.GenEpoch,
+		log:      log,
 	}
 }
 
@@ -168,9 +159,8 @@ func (m *Manager) List() (genEpoch int64, entries []ListEntry) {
 
 // startShell spawns a login shell on a fresh PTY. PTY mechanics by design:
 // set ONLY SysProcAttr.Credential and let pty.Start own Setsid/Setctty; read
-// the pgid AFTER start for kill(-pgid). authSock, when non-empty, is exported as
-// the shell's stable SSH_AUTH_SOCK (the session's agent-forward proxy path).
-func (m *Manager) startShell(authSock string) (master *os.File, cmd *exec.Cmd, pgid int, err error) {
+// the pgid AFTER start for kill(-pgid).
+func (m *Manager) startShell() (master *os.File, cmd *exec.Cmd, pgid int, err error) {
 	cmd = exec.Command(m.shell, "-l")
 	cmd.Dir = m.home
 	cmd.Env = append(os.Environ(),
@@ -178,13 +168,6 @@ func (m *Manager) startShell(authSock string) (master *os.File, cmd *exec.Cmd, p
 		"USER="+m.userEnv(),
 		"TERM=xterm-256color",
 	)
-	if authSock != "" {
-		// A STABLE per-session socket the Manager owns; its backing agent is the
-		// currently-attached forwarding client. Set even though no
-		// client is forwarding yet — the path is fixed at spawn, the source is
-		// swapped in/out as forwarding attaches come and go.
-		cmd.Env = append(cmd.Env, "SSH_AUTH_SOCK="+authSock)
-	}
 	if m.cred != nil {
 		// Only the Credential — pty.Start adds Setsid + Setctty itself; setting
 		// them here would conflict.
@@ -224,17 +207,6 @@ func (m *Manager) userEnv() string {
 		}
 	}
 	return home
-}
-
-// credIDs returns the login user's uid/gid from the setuid credential, used to
-// chown the agent-forward proxy socket so the unprivileged shell can reach it.
-// Returns (-1, -1) when no credential applies (the shell runs as the agent/root,
-// so no chown is needed) — newAgentProxy treats that as "skip the chown".
-func (m *Manager) credIDs() (uid, gid int) {
-	if m.cred == nil {
-		return -1, -1
-	}
-	return int(m.cred.Uid), int(m.cred.Gid)
 }
 
 // CreateOrAttachDefault implements default-session selection (create-or-attach
@@ -325,38 +297,23 @@ func (m *Manager) newSessionLocked(name string) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	// A stable per-session SSH_AUTH_SOCK proxy for agent forwarding.
-	// Best-effort: a proxy setup failure must not block the shell — the
-	// session just lacks forwarding (warned, not fatal). nil when forwarding is
-	// disabled (no sock dir configured) or on error.
-	var proxy *agentProxy
-	if m.agentSockDir != "" {
-		uid, gid := m.credIDs()
-		if p, perr := newAgentProxy(m.agentSockDir, id, uid, gid, m.log); perr != nil {
-			m.log.Warn("sessions: agent-forward proxy setup failed; session has no SSH_AUTH_SOCK", "id", id, "err", perr)
-		} else {
-			proxy = p
-		}
-	}
-	master, cmd, pgid, err := m.startShell(proxy.SockPath())
+	master, cmd, pgid, err := m.startShell()
 	if err != nil {
-		proxy.Close()
 		return nil, err
 	}
 	s := &Session{
-		id:         id,
-		name:       name,
-		createdAt:  nowMs(),
-		genEpoch:   m.genEpoch,
-		master:     master,
-		cmd:        cmd,
-		pgid:       pgid,
-		clients:    map[*Client]struct{}{},
-		done:       make(chan struct{}),
-		ring:       newRing(ringSize),
-		mgr:        m,
-		log:        m.log,
-		agentProxy: proxy,
+		id:        id,
+		name:      name,
+		createdAt: nowMs(),
+		genEpoch:  m.genEpoch,
+		master:    master,
+		cmd:       cmd,
+		pgid:      pgid,
+		clients:   map[*Client]struct{}{},
+		done:      make(chan struct{}),
+		ring:      newRing(ringSize),
+		mgr:       m,
+		log:       m.log,
 	}
 	m.sessions[id] = s
 	m.byName[name] = id

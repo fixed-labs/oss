@@ -28,7 +28,6 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/agent"
 )
 
 // subsystemName is the SSH subsystem the agent registers for session control.
@@ -55,16 +54,6 @@ type Client struct {
 	conn ssh.Conn
 	cl   *ssh.Client
 
-	// forwardAgent is set when SSH agent forwarding is active on this connection
-	// (a std:ssh key resolved AND a local agent was reachable). When true,
-	// openStream sends the per-channel auth-agent-req on attach/new so the box
-	// vends an SSH_AUTH_SOCK; the connection-level auth-agent@openssh.com handler
-	// is already registered (agent.ForwardToAgent in Dial).
-	forwardAgent bool
-
-	// localAgentConn is the dialed laptop agent socket, closed on Close.
-	localAgentConn net.Conn
-
 	// keepaliveDone stops the dead-peer keepalive goroutine on Close.
 	keepaliveDone chan struct{}
 	closeOnce     sync.Once
@@ -86,14 +75,7 @@ const (
 // host key (hostPubkeyAuthorizedKey is the authorized_keys-format line the attach
 // bundle carries as ssh_host_pubkey). user is the box login user; the server is
 // NoClientAuth, so no client key is offered.
-//
-// When forwardAgent is true AND a local agent is reachable (SSH_AUTH_SOCK is set
-// and dials), the connection-level auth-agent@openssh.com handler is registered
-// (agent.ForwardToAgent) so the box's forwarded agent channels route to the
-// laptop's agent — the std:ssh real-forwarding path. When no
-// local agent is reachable, forwarding is silently skipped (forwardAgent stays
-// false on the returned Client).
-func Dial(ctx context.Context, dial Dialer, wgIP string, port int, user, hostPubkeyAuthorizedKey string, forwardAgent bool) (*Client, error) {
+func Dial(ctx context.Context, dial Dialer, wgIP string, port int, user, hostPubkeyAuthorizedKey string) (*Client, error) {
 	hostKey, _, _, _, err := ssh.ParseAuthorizedKey([]byte(hostPubkeyAuthorizedKey))
 	if err != nil {
 		return nil, fmt.Errorf("parse box host key: %w", err)
@@ -129,33 +111,8 @@ func Dial(ctx context.Context, dial Dialer, wgIP string, port int, user, hostPub
 		cl:            ssh.NewClient(sshConn, chans, reqs),
 		keepaliveDone: make(chan struct{}),
 	}
-	if forwardAgent {
-		c.setupAgentForward()
-	}
 	go c.keepaliveLoop()
 	return c, nil
-}
-
-// setupAgentForward dials the laptop's local SSH agent and registers a
-// connection-level handler so the box's auth-agent@openssh.com channels route to
-// it. Best-effort: with no reachable local agent (SSH_AUTH_SOCK unset or the
-// dial fails) forwarding is skipped silently and c.forwardAgent stays false, so
-// openStream won't request a (dead) SSH_AUTH_SOCK on the box.
-func (c *Client) setupAgentForward() {
-	sock := os.Getenv("SSH_AUTH_SOCK")
-	if sock == "" {
-		return
-	}
-	conn, err := net.Dial("unix", sock)
-	if err != nil {
-		return
-	}
-	if err := agent.ForwardToAgent(c.cl, agent.NewClient(conn)); err != nil {
-		_ = conn.Close()
-		return
-	}
-	c.localAgentConn = conn
-	c.forwardAgent = true
 }
 
 // keepaliveLoop probes the peer on keepaliveInterval with an OpenSSH keepalive
@@ -205,9 +162,6 @@ func (c *Client) Close() error {
 	c.closeOnce.Do(func() {
 		if c.keepaliveDone != nil {
 			close(c.keepaliveDone)
-		}
-		if c.localAgentConn != nil {
-			_ = c.localAgentConn.Close()
 		}
 	})
 	if c.cl != nil {
@@ -311,14 +265,6 @@ func (c *Client) openStream(ctx context.Context, frame controlFrame, cols, rows 
 	if ok, err := ch.SendRequest("pty-req", true, marshalPtyReq(termType(), cols, rows)); err != nil || !ok {
 		ch.Close()
 		return nil, fmt.Errorf("pty-req: %v (ok=%v)", err, ok)
-	}
-	// Agent forwarding: request it on THIS channel BEFORE the subsystem request.
-	// gliderlabs processes channel requests in order on one goroutine and launches
-	// the subsystem handler when it sees `subsystem`; sending auth-agent-req first
-	// guarantees the box's AgentRequested(sess) is true when the handler reads it.
-	// Best-effort: a refusal just means no forwarded SSH_AUTH_SOCK on the box.
-	if c.forwardAgent {
-		_, _ = ch.SendRequest("auth-agent-req@openssh.com", true, nil)
 	}
 	if ok, err := ch.SendRequest("subsystem", true, marshalSubsystem(subsystemName)); err != nil || !ok {
 		ch.Close()

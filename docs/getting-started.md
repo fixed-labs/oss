@@ -119,8 +119,6 @@ Run `rift --help` (or `rift <command> --help`) for the full set.
 
 ## Where to go next
 
-- [secrets.md](secrets.md) — get credentials (AWS, npm, GitHub, SSH agent, …)
-  into your box safely.
 - [image-config.md](image-config.md) — customize the base image with your own
   tools and dotfiles.
 - [api-reference.md](api-reference.md) — the HTTP endpoints the CLI calls, if you

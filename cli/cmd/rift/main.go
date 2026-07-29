@@ -103,8 +103,6 @@ func main() {
 		err = cmdResize(ctx, args)
 	case "keepalive":
 		err = cmdKeepalive(ctx, args)
-	case "secrets":
-		err = cmdSecrets(ctx, args)
 	case "image":
 		err = cmdImage(ctx, args)
 	case "watch":
@@ -113,8 +111,6 @@ func main() {
 		err = cmdUnwatch(ctx, args)
 	case "watched":
 		err = cmdWatched(ctx, args)
-	case "run":
-		err = cmdRun(ctx, args)
 	case "init":
 		err = cmdInit(ctx, args)
 	case "pool":
@@ -156,10 +152,6 @@ func usage() {
 		"  rift keepalive <id> [--for DURATION]\n"+
 		"  rift image ls|pin <sha>|unpin <sha>\n"+
 		"  rift watch <ref> | unwatch <ref> | watched\n"+
-		"  rift secrets status|map <key> <source>\n"+
-		"  rift run --secret NAME [--secret NAME...] -- CMD   (in-VM: inject a secret)\n"+
-		"  rift run --shell --secret NAME ...                 (subshell with secrets)\n"+
-		"  rift run --secret NAME --materialize-to PATH       (write secret to a file)\n"+
 		"  rift init | rift init emit --packages LIST [--option k=v ...]\n"+
 		"  rift pool ls [REPO] [--org ORG] | set <repo> <ref> <region> <size> <count> | rm <repo> <ref> <region> <size>\n"+
 		"  rift version\n\n"+

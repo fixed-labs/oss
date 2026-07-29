@@ -26,25 +26,6 @@
 
 let
   cfg = config.rift.devboxes-base;
-
-  # devbox-secrets `env`-strategy secrets (e.g. std:claude → CLAUDE_CODE_OAUTH_TOKEN)
-  # each land one file under ~/.config/rift/env.d/, named for the variable;
-  # export every one as an environment variable in interactive shells. Generic by
-  # design: a new env-var secret needs no change here — just an `env` declaration
-  # in the CLI's secrets registry. The secrets layer can't
-  # write shell-rc files (its deniedDest denylist blocks them), so the trusted image
-  # owns the export. The filenames are validated identifiers ([A-Za-z_][A-Za-z0-9_]*)
-  # and the dest is tool-derived, never manifest-supplied — so `export "$name=…"` is
-  # injection-safe; `-s` follows the tmpfs symlink and skips an absent/dangling/empty
-  # value. A variable is identical on every push, so a tmpfs re-push is idempotent.
-  envSecretsInit = ''
-    if [ -d "$HOME/.config/rift/env.d" ]; then
-      for _f in "$HOME"/.config/rift/env.d/*; do
-        [ -s "$_f" ] || continue
-        export "$(basename "$_f")=$(cat "$_f")"
-      done
-    fi
-  '';
 in
 {
   options.rift.devboxes-base = {
@@ -206,14 +187,6 @@ in
       esac
     '';
 
-    # Export devbox-secrets `env`-strategy secrets (envSecretsInit, in the `let`
-    # above). interactiveShellInit lands in /etc/bashrc, which every interactive
-    # shell sources — including the agent's `$SHELL -l` login session (NixOS's
-    # /etc/profile sources /etc/bashrc when interactive) and any subshell/tmux pane
-    # the user spawns. `$SHELL -c` (exec/scp/sftp) is non-interactive and sources
-    # neither, so secrets are never baked into a subprocess env.
-    environment.interactiveShellInit = envSecretsInit;
-
     # No public listeners: the agent's SSH server binds wg0's address; wg
     # itself initiates outbound to the relay (conntrack admits replies). The
     # NixOS firewall adds nothing here but boot-time nftables surface.
@@ -227,29 +200,6 @@ in
       enable = true;
       dockerCompat = true;
     };
-
-    # tmpfs store for pushed secrets. The
-    # unprivileged `rift` push can't create a mount, so the image provisions
-    # one: a small, hardened, login-user-owned tmpfs. Secret bytes land here
-    # (never on the persistent /persist overlay), so they vanish on reboot and
-    # are re-pushed on the next connect; a `~/.*` dest is a symlink into this
-    # store. systemd.mounts (not fileSystems) because the image skips initrd and
-    # execs stage-2 systemd directly — a stage-2 mount unit is the predictable
-    # path, and /run is already a systemd tmpfs. noexec/nosuid/nodev harden it;
-    # noswap (Linux ≥6.4, which Fly's microVM kernel is) keeps pages off disk —
-    # belt-and-suspenders, the image also configures no swap/zram.
-    systemd.mounts = [
-      {
-        what = "tmpfs";
-        where = "/run/devbox-secrets";
-        type = "tmpfs";
-        options = "mode=0700,uid=${
-          toString config.users.users.${cfg.loginUser}.uid
-        },gid=100,size=32M,noexec,nosuid,nodev,noswap";
-        wantedBy = [ "multi-user.target" ];
-        before = [ "devboxes-agent.service" ];
-      }
-    ];
 
     systemd.services.devboxes-agent = {
       description = "devboxes-agent — control-plane liaison (wg0, WG-identity SSH, heartbeat, config pull)";

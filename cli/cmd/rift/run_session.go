@@ -28,10 +28,7 @@ import (
 // alongside `--new`); empty means let the server auto-name. It is only consulted
 // the first time a session is created (sessionID == ""); once created, the minted
 // id drives reconnects.
-//
-// forwardAgent enables SSH agent forwarding: each (re)dial sets
-// up forwarding over the new connection, so forwarding survives reconnect.
-func runSessionLoop(ctx context.Context, t *tunnel.Tunnel, bundle *client.AttachBundle, workspaceID, sessionID, newName string, forwardAgent bool) error {
+func runSessionLoop(ctx context.Context, t *tunnel.Tunnel, bundle *client.AttachBundle, workspaceID, sessionID, newName string) error {
 	const (
 		maxConsecutiveFailures = 6
 		backoffBase            = 2 * time.Second
@@ -87,7 +84,7 @@ func runSessionLoop(ctx context.Context, t *tunnel.Tunnel, bundle *client.Attach
 		// (Re)dial the box if we have no live SSH connection.
 		if sc == nil {
 			dctx, dcancel := ctxTimeout(ctx, 30*time.Second)
-			c, err := dialSessionFn(dctx, t, bundle, forwardAgent)
+			c, err := dialSessionFn(dctx, t, bundle)
 			dcancel()
 			if err != nil {
 				failures++

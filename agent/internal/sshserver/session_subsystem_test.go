@@ -3,11 +3,8 @@ package sshserver
 import (
 	"bufio"
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
 	"encoding/json"
 	"net"
-	"os/exec"
 	"strings"
 	"sync"
 	"testing"
@@ -16,7 +13,6 @@ import (
 	"github.com/fixed-labs/oss/agent/internal/api"
 	"github.com/fixed-labs/oss/agent/internal/sessions"
 	gossh "golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/agent"
 )
 
 // nullAPI is a no-op SessionAPI for server tests (POSTs are exercised in the
@@ -33,13 +29,6 @@ func (n *nullAPI) TombstoneStaleSessions(context.Context, int64) error { return 
 // startServerWithSessions starts a server with a Sessions Manager wired in on a
 // fresh ephemeral loopback port; returns the addr and the Manager.
 func startServerWithSessions(t *testing.T, table *Table) (addr string, mgr *sessions.Manager) {
-	return startServerWithSessionsDir(t, table, "")
-}
-
-// startServerWithSessionsDir is startServerWithSessions with an explicit
-// AgentSockDir (non-empty enables the per-session SSH_AUTH_SOCK agent-forward
-// proxy).
-func startServerWithSessionsDir(t *testing.T, table *Table, agentSockDir string) (addr string, mgr *sessions.Manager) {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -49,11 +38,10 @@ func startServerWithSessionsDir(t *testing.T, table *Table, agentSockDir string)
 	_ = l.Close()
 
 	mgr = sessions.NewManager(sessions.Config{
-		Shell:        "/bin/bash",
-		Home:         t.TempDir(),
-		API:          &nullAPI{},
-		GenEpoch:     9,
-		AgentSockDir: agentSockDir,
+		Shell:    "/bin/bash",
+		Home:     t.TempDir(),
+		API:      &nullAPI{},
+		GenEpoch: 9,
 	})
 	s := &Server{
 		Addr:       addr,
@@ -301,109 +289,4 @@ func tMarshalPtyReq(term string, cols, rows int) []byte {
 	b = put(b, uint32(rows*8))
 	b = append(b, tMarshalString("\x00")...)
 	return b
-}
-
-// TestSessionSubsystemAgentForward proves agent forwarding end-to-end: a
-// client that registers agent forwarding (agent.ForwardToAgent) and sends
-// auth-agent-req on the attach channel gets a working SSH_AUTH_SOCK in the
-// session SHELL — `ssh-add -l` over that socket reaches the LAPTOP keyring and
-// lists the forwarded key. This exercises the full chain: client ForwardToAgent
-// + auth-agent-req → server AgentRequested → setupAgentForward + NewAgentListener
-// → the session's stable agentProxy → shell's SSH_AUTH_SOCK.
-func TestSessionSubsystemAgentForward(t *testing.T) {
-	if _, err := exec.LookPath("ssh-add"); err != nil {
-		t.Skip("ssh-add not available; skipping agent-forward e2e")
-	}
-
-	// Laptop-side keyring with one ed25519 key (the "agent").
-	_, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	keyring := agent.NewKeyring()
-	const keyComment = "devbox-forward-test-key"
-	if err := keyring.Add(agent.AddedKey{PrivateKey: priv, Comment: keyComment}); err != nil {
-		t.Fatal(err)
-	}
-
-	srv, _ := startServerWithSessionsDir(t, authorizedTable(t), t.TempDir())
-	client := dial(t, srv)
-
-	// Register the connection-level forwarding handler (what the CLI does in Dial).
-	if err := agent.ForwardToAgent(client, keyring); err != nil {
-		t.Fatalf("ForwardToAgent: %v", err)
-	}
-
-	// Open the session channel directly so we control request ORDER: pty-req,
-	// then auth-agent-req (BEFORE subsystem, so the server's AgentRequested is set
-	// before the subsystem handler launches), then subsystem.
-	ch, reqs, err := client.OpenChannel("session", nil)
-	if err != nil {
-		t.Fatalf("OpenChannel: %v", err)
-	}
-	defer ch.Close()
-	go gossh.DiscardRequests(reqs)
-
-	if ok, err := ch.SendRequest("pty-req", true, tMarshalPtyReq("xterm", 80, 24)); err != nil || !ok {
-		t.Fatalf("pty-req: %v (ok=%v)", err, ok)
-	}
-	if ok, err := ch.SendRequest("auth-agent-req@openssh.com", true, nil); err != nil || !ok {
-		t.Fatalf("auth-agent-req: %v (ok=%v)", err, ok)
-	}
-	if ok, err := ch.SendRequest("subsystem", true, tMarshalString("devbox-session")); err != nil || !ok {
-		t.Fatalf("subsystem: %v (ok=%v)", err, ok)
-	}
-	if _, err := ch.Write([]byte(`{"op":"new","name":""}` + "\n")); err != nil {
-		t.Fatal(err)
-	}
-
-	r := bufio.NewReader(ch)
-	ackLine, err := r.ReadBytes('\n')
-	if err != nil {
-		t.Fatalf("read ack: %v", err)
-	}
-	var ack struct {
-		OK bool `json:"ok"`
-	}
-	if jerr := json.Unmarshal(ackLine, &ack); jerr != nil || !ack.OK {
-		t.Fatalf("attach not ok: %q (%v)", ackLine, jerr)
-	}
-
-	// In the shell, list the forwarded agent's keys. If SSH_AUTH_SOCK reaches the
-	// laptop keyring, the output carries our key comment. The PTY read is moved to
-	// a goroutine so the test bounds it (gossh.Channel has no read deadline).
-	if _, err := ch.Write([]byte("ssh-add -l\n")); err != nil {
-		t.Fatal(err)
-	}
-	seenCh := make(chan string, 1)
-	go func() {
-		var seen strings.Builder
-		buf := make([]byte, 4096)
-		for {
-			n, rerr := r.Read(buf)
-			if n > 0 {
-				seen.Write(buf[:n])
-				if strings.Contains(seen.String(), keyComment) || strings.Contains(seen.String(), "no identities") {
-					seenCh <- seen.String()
-					return
-				}
-			}
-			if rerr != nil {
-				seenCh <- seen.String()
-				return
-			}
-		}
-	}()
-	select {
-	case got := <-seenCh:
-		if strings.Contains(got, keyComment) {
-			return // success: the forwarded key is visible in the session shell
-		}
-		if strings.Contains(got, "no identities") {
-			t.Fatalf("agent reachable but empty — forwarding bridged to the wrong/empty source:\n%q", got)
-		}
-		t.Fatalf("forwarded key never visible via SSH_AUTH_SOCK in the shell:\n%q", got)
-	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for ssh-add -l output (forwarding likely not reaching the shell)")
-	}
 }

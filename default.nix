@@ -209,11 +209,12 @@ let
       # toplevel) rides in via the config reference; no explicit contents.
       #
       # When repoSrc is set, bake it into the dev user's home at
-      # /home/dev/<repoDirName>. repoSrc is a ready-to-use depth-1 clone WITH
-      # its .git (origin pinned to the canonical ssh URL so the box's git
-      # pull/push rides the forwarded ssh-agent, the built commit on a tracked
-      # branch, shallow boundary set) — every bit of git setup happens before
-      # `builtins.path` ingests it, so here we only place the tree and fix
+      # /home/dev/<repoDirName>. repoSrc is a ready-to-use tree; a caller that
+      # passes a depth-1 clone WITH its .git (origin set, the built commit on a
+      # tracked branch, shallow boundary set) gets every bit of git setup done
+      # before `builtins.path` ingests it. The box carries no forge credential
+      # of its own, so pushing from a box is the owner's to wire up — pick an
+      # origin URL accordingly. Here we only place the tree and fix
       # ownership/perms. It lands in the image's RO lower; the overlay-root
       # boot makes it writable and edits persist to the /persist volume (like
       # any other path). Runs under fakeroot so the chown to the dev user

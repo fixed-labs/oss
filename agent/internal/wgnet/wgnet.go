@@ -11,13 +11,9 @@ package wgnet
 import (
 	"fmt"
 	"net"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
 
 	"github.com/fixed-labs/oss/agent/internal/api"
 )
@@ -59,26 +55,6 @@ const (
 	overlayMTU = "1280"
 )
 
-// laptopIPFile is where we publish the currently-authorized laptop overlay
-// IP(s) — one bare IP per line, world-readable on tmpfs — so the unprivileged
-// in-VM `devbox run` broker client can discover where to dial WITHOUT `wg show`
-// (which needs CAP_NET_ADMIN and so fails for the `dev` run user). The cluster
-// owns the peer set and the agent is the only root component that sees it, so it
-// exposes the set here on every Reconcile. Kept in sync with the CLI's
-// broker.LaptopIPFile (separate Go module — can't share the constant). /run is
-// tmpfs, so this never persists to the workspace volume.
-const laptopIPFile = "/run/devbox/laptop-wg-ips"
-
-// livePeerWindow is how recently a peer must have completed a WireGuard handshake
-// to count as a LIVE connection for the broker discovery file. A peer that handshook
-// longer ago than this — i.e. a `devbox connect` whose laptop went away — is a
-// strand and is dropped from the file (though it stays authorized in wg0 for its
-// lease). The window must exceed WG's rekey (~120s) and the CLI's ssh keepalive
-// cadence (oss/cli/internal/session: probe every 15s) so a live-but-idle
-// connection is never falsely pruned; persistent-keepalive (25s) keeps a live
-// peer's handshake fresh well inside it, while a vanished laptop ages past it.
-const livePeerWindow = 3 * time.Minute
-
 // Runner executes a command, returning combined output on error. Injectable
 // for tests; exec in production.
 type Runner func(name string, args ...string) (string, error)
@@ -94,13 +70,10 @@ func ExecRunner(name string, args ...string) (string, error) {
 type Net struct {
 	run            Runner
 	privateKeyPath string
-	laptopIPPath   string           // where the broker discovery file is written; overridable in tests
-	now            func() time.Time // injectable clock for liveness; defaults time.Now
-	mu             sync.Mutex       // serializes the file write (Reconcile + heartbeat tick both publish)
 }
 
 func New(run Runner, privateKeyPath string) *Net {
-	return &Net{run: run, privateKeyPath: privateKeyPath, laptopIPPath: laptopIPFile, now: time.Now}
+	return &Net{run: run, privateKeyPath: privateKeyPath}
 }
 
 // Up creates + configures + raises wg0 (idempotent: link-exists errors are
@@ -197,123 +170,6 @@ func (n *Net) Reconcile(desired []api.Peer) error {
 		if _, err := n.run("wg", "set", iface, "peer", pk, "remove"); err != nil {
 			return err
 		}
-	}
-	// Publish the LIVE laptop IP(s) for the unprivileged broker client (see
-	// laptopIPFile). Done AFTER the peer set is applied so the wg0 dump reflects
-	// the desired peers and the file never advertises a laptop that isn't yet
-	// routable. A freshly-added peer (handshake not yet completed) is published
-	// immediately by the grace rule, so a fresh connect has no gap.
-	return n.PublishLiveLaptopIPs()
-}
-
-// wgPeer is the subset of a `wg show <iface> dump` peer line we care about.
-type wgPeer struct {
-	pubkey        string
-	allowedIP     string // the laptop's overlay IP (the /128 stripped); "" if none
-	lastHandshake int64  // unix seconds; 0 = never handshaked
-}
-
-// parseWgDump parses `wg show <iface> dump`. The first line describes the
-// interface (privkey, pubkey, listen-port, fwmark) and is skipped; each remaining
-// line is a peer: pubkey, psk, endpoint, allowed-ips, latest-handshake (unix secs,
-// 0=never), rx, tx, keepalive. We keep the pubkey, the first allowed-ip (the laptop
-// /128 with its prefix stripped; "(none)" → ""), and the handshake.
-func parseWgDump(out string) []wgPeer {
-	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
-	var peers []wgPeer
-	for i, line := range lines {
-		if i == 0 || strings.TrimSpace(line) == "" { // interface line / blanks
-			continue
-		}
-		f := strings.Split(line, "\t")
-		if len(f) < 5 {
-			continue
-		}
-		ip := ""
-		if ai := strings.TrimSpace(f[3]); ai != "" && ai != "(none)" {
-			// allowed-ips may be a comma-separated list; the laptop peer has one /128.
-			first := strings.SplitN(ai, ",", 2)[0]
-			ip = strings.SplitN(strings.TrimSpace(first), "/", 2)[0]
-		}
-		hs, _ := strconv.ParseInt(strings.TrimSpace(f[4]), 10, 64)
-		peers = append(peers, wgPeer{pubkey: strings.TrimSpace(f[0]), allowedIP: ip, lastHandshake: hs})
-	}
-	return peers
-}
-
-// PublishLiveLaptopIPs rewrites the broker discovery file with the overlay IPs of
-// only the peers whose tunnel is LIVE, so a stale strand left by a closed `devbox
-// connect` no longer counts toward the broker's "exactly one connection" rule.
-// Derived purely from wg0 (`wg show <iface> dump`), so it needs no cached control-
-// plane state and is safe to call both from Reconcile and from the heartbeat tick.
-// The wg peer SET is untouched (every authorized peer stays routable for its
-// lease); only the file the unprivileged `devbox run` broker client reads is
-// narrowed.
-//
-// A peer is live iff its handshake is 0 (never handshaked yet — a peer just added
-// by Reconcile, still bringing its tunnel up; published immediately so a fresh
-// connect has no gap) OR within livePeerWindow. A non-zero handshake older than the
-// window is a peer that WAS live and went quiet — the strand — and is dropped. An
-// empty result writes an empty file (no live connection → `devbox run` reports the
-// session is down).
-func (n *Net) PublishLiveLaptopIPs() error {
-	out, err := n.run("wg", "show", iface, "dump")
-	if err != nil {
-		return err
-	}
-	now := n.now().Unix()
-	staleAfter := int64(livePeerWindow / time.Second)
-	var live []string
-	for _, p := range parseWgDump(out) {
-		if p.allowedIP == "" {
-			continue
-		}
-		if p.lastHandshake != 0 && now-p.lastHandshake > staleAfter {
-			continue // stale: was live, went quiet → strand
-		}
-		live = append(live, p.allowedIP)
-	}
-	return n.writeLaptopIPs(live)
-}
-
-// writeLaptopIPs atomically writes the given overlay IPs (one bare IP per line) to
-// n.laptopIPPath, world-readable so the unprivileged `devbox run` broker client can
-// read it. The mutex serializes the two concurrent callers (Reconcile via pullLoop,
-// and the heartbeat tick); a UNIQUE temp avoids a shared-temp clobber under that
-// concurrency. An empty list writes an empty file.
-func (n *Net) writeLaptopIPs(ips []string) error {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	var b strings.Builder
-	for _, ip := range ips {
-		b.WriteString(ip)
-		b.WriteByte('\n')
-	}
-	dir := filepath.Dir(n.laptopIPPath)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("create dir for %s: %w", n.laptopIPPath, err)
-	}
-	f, err := os.CreateTemp(dir, "laptop-wg-ips.*")
-	if err != nil {
-		return fmt.Errorf("temp for %s: %w", n.laptopIPPath, err)
-	}
-	tmp := f.Name()
-	defer os.Remove(tmp) // no-op once the rename succeeds
-	if _, err := f.WriteString(b.String()); err != nil {
-		f.Close()
-		return fmt.Errorf("write %s: %w", tmp, err)
-	}
-	// CreateTemp makes the file 0600; the broker reads it as the unprivileged `dev`
-	// user, so it must be world-readable.
-	if err := f.Chmod(0o644); err != nil {
-		f.Close()
-		return fmt.Errorf("chmod %s: %w", tmp, err)
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("close %s: %w", tmp, err)
-	}
-	if err := os.Rename(tmp, n.laptopIPPath); err != nil {
-		return fmt.Errorf("rename %s -> %s: %w", tmp, n.laptopIPPath, err)
 	}
 	return nil
 }

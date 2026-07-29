@@ -122,24 +122,6 @@ func TestFullLoop(t *testing.T) {
 	}
 }
 
-func TestHeartbeatRefreshesLivePeers(t *testing.T) {
-	// The broker-discovery file must be re-pruned on the heartbeat cadence (the
-	// pull loop only rewrites on a peer-set change), so RefreshLivePeers — when set
-	// — rides every heartbeat alongside SyncSessions.
-	m := &mockAPI{}
-	s := fastSupervisor(m, &recordingReconciler{})
-	var refreshes atomic.Int32
-	s.RefreshLivePeers = func() { refreshes.Add(1) }
-
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	s.Run(ctx)
-
-	if refreshes.Load() == 0 {
-		t.Fatal("RefreshLivePeers never invoked on the heartbeat tick")
-	}
-}
-
 func TestHeartbeatReportsIdentity(t *testing.T) {
 	m := &mockAPI{}
 	s := fastSupervisor(m, &recordingReconciler{})
@@ -442,8 +424,8 @@ func retrySupervisor(m *mockAPI, now func() time.Time, log *slog.Logger) *Superv
 // deadline out of reach (HeartbeatInterval ≫ the ms-scale backoff budget), so the
 // loop is bounded only by the mock finally succeeding. Asserts Heartbeat was
 // called exactly K+1 times (retried, not once-and-give-up) AND that the beat's
-// piggybacks (SyncSessions/RefreshLivePeers) fired EXACTLY once — the retry loop
-// must not multiply them (they live in beat(), after sendHeartbeat returns).
+// piggyback (SyncSessions) fired EXACTLY once — the retry loop must not multiply
+// it (it lives in beat(), after sendHeartbeat returns).
 func TestSendHeartbeatRetriesThenSucceeds(t *testing.T) {
 	const K = 3
 	m := &mockAPI{hbFails: K}
@@ -453,9 +435,8 @@ func TestSendHeartbeatRetriesThenSucceeds(t *testing.T) {
 	s := retrySupervisor(m, frozenClock(time.Now()), nil)
 	s.HeartbeatInterval = time.Second
 
-	var syncs, refreshes atomic.Int32
+	var syncs atomic.Int32
 	s.SyncSessions = func() { syncs.Add(1) }
-	s.RefreshLivePeers = func() { refreshes.Add(1) }
 
 	// Call beat() directly (not Run) so we observe exactly ONE beat.
 	s.beat(context.Background())
@@ -472,9 +453,6 @@ func TestSendHeartbeatRetriesThenSucceeds(t *testing.T) {
 	}
 	if s := syncs.Load(); s != 1 {
 		t.Fatalf("SyncSessions fired %d times, want exactly 1 (retry must not multiply piggybacks)", s)
-	}
-	if r := refreshes.Load(); r != 1 {
-		t.Fatalf("RefreshLivePeers fired %d times, want exactly 1 (retry must not multiply piggybacks)", r)
 	}
 }
 

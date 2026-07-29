@@ -30,12 +30,6 @@ type Session struct {
 
 	ring *ring // scrollback
 
-	// agentProxy is the session's stable SSH_AUTH_SOCK proxy for agent
-	// forwarding; nil when forwarding is disabled. Its source is
-	// (re)pointed on a forwarding-capable attach and cleared on detach; it is
-	// closed on session destroy.
-	agentProxy *agentProxy
-
 	mu       sync.Mutex
 	clients  map[*Client]struct{}
 	winW     int // current PTY window width (smallest of attached clients)
@@ -100,20 +94,6 @@ func (s *Session) GenEpoch() int64  { return s.genEpoch }
 // to the master, so mirrored clients can all type safely.
 func (s *Session) Write(p []byte) (int, error) {
 	return s.master.Write(p)
-}
-
-// SetAgentSource points this session's stable SSH_AUTH_SOCK proxy at sourceSock
-// — the socket of a forwarding-capable attach's gliderlabs agent listener.
-// A no-op when the session has no proxy (forwarding disabled).
-func (s *Session) SetAgentSource(sourceSock string) {
-	s.agentProxy.setSource(sourceSock)
-}
-
-// ClearAgentSource drops the forwarding source IFF it still points at
-// sourceSock (so a detach can't clobber a newer reconnect that already
-// re-pointed the proxy). Called on detach/teardown of a forwarding attach.
-func (s *Session) ClearAgentSource(sourceSock string) {
-	s.agentProxy.clearSource(sourceSock)
 }
 
 // attach registers a client, recomputes the window size to the smallest of
@@ -309,10 +289,6 @@ func (s *Session) waitLoop() {
 		_ = syscall.Kill(-s.pgid, syscall.SIGKILL)
 	}
 	_ = s.master.Close()
-
-	// Tear down the agent-forward proxy (stop the accept loop, unlink the stable
-	// socket) so it doesn't leak across the box's session lifetimes.
-	s.agentProxy.Close()
 
 	s.mgr.remove(s)
 

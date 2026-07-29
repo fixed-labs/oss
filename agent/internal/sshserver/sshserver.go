@@ -31,7 +31,6 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
-	"path/filepath"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -341,50 +340,6 @@ func (s *Server) handleSession(sess ssh.Session) {
 		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: cred}
 	}
 
-	// Agent forwarding: vend a unix socket bridging to the client's agent.
-	if ssh.AgentRequested(sess) {
-		if l, lerr := ssh.NewAgentListener(); lerr == nil {
-			sock := l.Addr().String()
-			dir := filepath.Dir(sock)
-			// NewAgentListener (running as the agent, root on a devbox) creates
-			// `dir` at 0700 plus listener.sock, both root-owned. The shell is
-			// exec'd as the login user via SysProcAttr.Credential, so without
-			// handing the dir+socket to that uid/gid the dropped-privilege shell
-			// can't even traverse the 0700 root dir — every agent client gets
-			// EACCES ("Error connecting to agent: Permission denied"). gliderlabs
-			// never removes `dir`, so reap it ourselves to stop a /tmp leak across
-			// reconnects. Defers run LIFO: l.Close (stop listener, unlink socket)
-			// runs before os.RemoveAll (drop the now-empty dir).
-			defer os.RemoveAll(dir)
-			defer l.Close()
-
-			ok := true
-			if cred != nil {
-				// `dir` is freshly mkdir-temp'd (CSPRNG name) and 0700-root until
-				// this chown, so no attacker can pre-plant either path — there's no
-				// symlink/TOCTOU window; Lchown is belt-and-suspenders. The dir
-				// keeps 0700, so access narrows to exactly the login user. This is
-				// safe specifically because the box is single-tenant: the only
-				// other unprivileged uid IS this login user. Re-review if a second
-				// uid is ever added to a devbox.
-				uid, gid := int(cred.Uid), int(cred.Gid)
-				if cerr := os.Lchown(dir, uid, gid); cerr != nil {
-					s.Log.Warn("ssh: chown agent socket dir", "err", cerr)
-					ok = false
-				} else if cerr := os.Lchown(sock, uid, gid); cerr != nil {
-					s.Log.Warn("ssh: chown agent socket", "err", cerr)
-					ok = false
-				}
-			}
-			// Fail closed: a misowned socket is merely unreachable (EACCES), so
-			// don't export a broken SSH_AUTH_SOCK or forward connections to it.
-			if ok {
-				go ssh.ForwardAgentConnections(l, sess)
-				cmd.Env = append(cmd.Env, "SSH_AUTH_SOCK="+sock)
-			}
-		}
-	}
-
 	ptyReq, winCh, isPty := sess.Pty()
 	// Bare interactive shell (plain pty-req + shell, no command) routes to a
 	// default-session attach (create-or-attach the single default session) so a
@@ -596,16 +551,6 @@ func (s *Server) attachDefault(sess ssh.Session, ptyReq ssh.Pty, winCh <-chan ss
 // announce + exit with the code). The per-client input goroutine is interrupted
 // by channel close, so detach is clean.
 func (s *Server) streamAttached(sess ssh.Session, target *sessions.Session, client *sessions.Client, winCh <-chan ssh.Window, in io.Reader) {
-	// Agent forwarding (`std:ssh` real-forwarding): if this attach
-	// requested it, stand up a per-attach gliderlabs agent listener bridging to
-	// the laptop's agent over THIS connection, and point the session's stable
-	// SSH_AUTH_SOCK proxy at it for the attach's duration. Cleared on detach so a
-	// fully-detached session has no live agent (parity with `ssh -A`); re-pointed
-	// when a later attach forwards again.
-	if cleanup := s.setupAgentForward(sess, target); cleanup != nil {
-		defer cleanup()
-	}
-
 	// Resize stream: list/control frames never reach here; this is a real PTY
 	// channel. Window-change requests recompute the smallest-attached size.
 	go func() {
@@ -646,49 +591,6 @@ func (s *Server) streamAttached(sess ssh.Session, target *sessions.Session, clie
 	// down (Detach closes the queue, ending PipeToClient).
 	target.Detach(client)
 	<-writerDone
-}
-
-// setupAgentForward wires this attach's SSH agent into the persistent session's
-// stable SSH_AUTH_SOCK proxy. Returns nil (no cleanup) when the
-// client didn't request forwarding, the listener can't be created, or the
-// dropped-privilege shell couldn't reach the socket. Otherwise it returns a
-// cleanup that clears the session's forwarding source and reaps the per-attach
-// listener + its temp dir.
-//
-// gliderlabs' NewAgentListener creates a 0700 root-owned dir + socket; the
-// session shell runs as the (possibly dropped-privilege) login user, so the
-// socket must be chowned to that user or the proxy's Dial of it fails. The
-// session proxy connects to this socket as the AGENT (root), so only the proxy
-// dials it — but we still chown so a direct dial from the login user works too,
-// and to keep the same fail-closed posture as the legacy per-connection path.
-func (s *Server) setupAgentForward(sess ssh.Session, target *sessions.Session) func() {
-	if !ssh.AgentRequested(sess) {
-		return nil
-	}
-	l, err := ssh.NewAgentListener()
-	if err != nil {
-		s.Log.Warn("ssh: agent listener for session forward", "err", err)
-		return nil
-	}
-	sock := l.Addr().String()
-	dir := filepath.Dir(sock)
-	// The session's agent proxy (running as the agent, root) dials this socket,
-	// so root ownership already works. Chown to the login user too (belt-and-
-	// suspenders + parity with the legacy path) when a setuid credential applies.
-	if peer, ok := s.Table.Lookup(sess.RemoteAddr()); ok {
-		if cred, cerr := resolveCredential(peer.LoginUser); cerr == nil && cred != nil {
-			uid, gid := int(cred.Uid), int(cred.Gid)
-			_ = os.Lchown(dir, uid, gid)
-			_ = os.Lchown(sock, uid, gid)
-		}
-	}
-	go ssh.ForwardAgentConnections(l, sess)
-	target.SetAgentSource(sock)
-	return func() {
-		target.ClearAgentSource(sock)
-		_ = l.Close()         // stop ForwardAgentConnections, unlink the socket
-		_ = os.RemoveAll(dir) // gliderlabs never reaps the temp dir
-	}
 }
 
 // writerToSession adapts a *sessions.Session into an io.Writer for io.Copy of

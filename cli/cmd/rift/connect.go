@@ -97,67 +97,26 @@ func connect(ctx context.Context, c *client.Client, id string, opts connectOpts)
 	go keeper.watchRelay(leaseCtx)      // follow a drain/failover to a new relay, no drop
 	go watchNetworkChanges(leaseCtx, t) // rebind the wg socket on sleep/wake/roam
 
-	// Host the secret-broker handler for the life of the session: the box's
-	// `devbox run` shim reaches it over the tunnel at the laptop's overlay IP.
-	// The handler resolves named
-	// secrets against the same user config + repo the connect-time reconcile uses
-	// and injects credentials into a `devbox run` child — the value never touches
-	// the box's disk or the agent's context. Best-effort: if the listener can't
-	// come up we warn and continue (the shell still works; `devbox run` just gets
-	// an unreachable-handler error).
-	stopBroker := startBrokerHandler(leaseCtx, t, ws.Repo)
-	defer stopBroker()
 	// Hold the box's interactive-liveness for the whole connection: the
 	// laptop-side ping keeps the cluster from idle-suspending us while attached.
 	go presenceLoop(leaseCtx, c, id)
 
-	// Bridge the in-process netstack to a localhost listener so the external
-	// `ssh` binary can run the pre-shell secrets reconcile over the tunnel. (The
-	// interactive session itself rides a Go SSH client dialed directly over the
-	// netstack — the devbox-session subsystem — not this bridge.)
-	localAddr, err := t.BridgeSSH(ctx, bundle.WorkspaceWgIP, 22)
-	if err != nil {
-		return fmt.Errorf("ssh bridge: %w", err)
-	}
-	host, port, err := splitHostPort(localAddr)
-	if err != nil {
-		return err
-	}
-	khFile, cleanup, err := writeKnownHosts(host, port, bundle.SSHHostPubkey)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-
-	// Sync declared secrets onto the box over the same tunnel, before the shell
-	// opens. Best-effort: a hiccup warns but never blocks the shell. forwardAgent
-	// is true when a std:ssh key resolved → request SSH agent forwarding on the
-	// session connection(s) below.
-	forwardAgent := reconcileSecrets(ctx, host, port, khFile, ws.Repo)
-
-	// A Ctrl-C during the secrets sync cancels ctx — abort cleanly rather than
-	// print "Opening shell…" and then fail to dial.
-	if ctx.Err() != nil {
-		return nil
-	}
-
 	// Select the session to attach (default-session selection) and report any detached loss
 	// (gen-epoch) before attaching. This opens a short-lived session.Client to
 	// `list`; the attach loop opens its own.
-	sessionID, err := selectSession(ctx, t, bundle, id, opts, forwardAgent)
+	sessionID, err := selectSession(ctx, t, bundle, id, opts)
 	if err != nil {
 		return err
 	}
 
 	fmt.Printf("Connected to %s (%s). Opening shell…\n", id, ws.Status)
-	return runSessionLoop(leaseCtx, t, bundle, id, sessionID, opts.sessionName, forwardAgent)
+	return runSessionLoop(leaseCtx, t, bundle, id, sessionID, opts.sessionName)
 }
 
 // dialSession opens an SSH connection to the box over the tunnel for the
-// devbox-session subsystem (host key pinned, NoClientAuth). forwardAgent enables
-// SSH agent forwarding over this connection when a local agent is reachable.
-func dialSession(ctx context.Context, t *tunnel.Tunnel, bundle *client.AttachBundle, forwardAgent bool) (*session.Client, error) {
-	return session.Dial(ctx, t.DialContext, bundle.WorkspaceWgIP, 22, loginUser(), bundle.SSHHostPubkey, forwardAgent)
+// devbox-session subsystem (host key pinned, NoClientAuth).
+func dialSession(ctx context.Context, t *tunnel.Tunnel, bundle *client.AttachBundle) (*session.Client, error) {
+	return session.Dial(ctx, t.DialContext, bundle.WorkspaceWgIP, 22, loginUser(), bundle.SSHHostPubkey)
 }
 
 // sessionDecision is the pure outcome of applying default-session selection (and the
@@ -209,7 +168,7 @@ func decideSession(list *session.ListResult, opts connectOpts, prevEpoch int64, 
 // selectSession applies default-session selection and the gen-epoch loss notice. It returns
 // the session id to attach (empty means "create a new one" — the attach loop
 // then calls New). When `--new` is set it skips the list and returns "" (new).
-func selectSession(ctx context.Context, t *tunnel.Tunnel, bundle *client.AttachBundle, workspaceID string, opts connectOpts, forwardAgent bool) (string, error) {
+func selectSession(ctx context.Context, t *tunnel.Tunnel, bundle *client.AttachBundle, workspaceID string, opts connectOpts) (string, error) {
 	if opts.newSession {
 		// "" → the attach loop calls New; opts.sessionName (threaded separately into
 		// runSessionLoop) becomes the new session's name, or auto-named if empty.
@@ -217,7 +176,7 @@ func selectSession(ctx context.Context, t *tunnel.Tunnel, bundle *client.AttachB
 	}
 	lctx, cancel := ctxTimeout(ctx, 30*time.Second)
 	defer cancel()
-	sc, err := dialSession(lctx, t, bundle, forwardAgent)
+	sc, err := dialSession(lctx, t, bundle)
 	if err != nil {
 		// The subsystem may be unavailable (older agent); fall back to the bare
 		// shell path, which gives the default `main` session server-side.

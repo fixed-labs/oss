@@ -31,7 +31,7 @@ func stubLoopDeps(t *testing.T, attach func() (compositor.Outcome, bool, int, bo
 	})
 
 	n := 0
-	dialSessionFn = func(_ context.Context, _ *tunnel.Tunnel, _ *client.AttachBundle, _ bool) (*session.Client, error) {
+	dialSessionFn = func(_ context.Context, _ *tunnel.Tunnel, _ *client.AttachBundle) (*session.Client, error) {
 		n++
 		return &session.Client{}, nil // non-nil sentinel; attachOnceFn never uses it
 	}
@@ -88,7 +88,7 @@ func TestRunSessionLoopRaisesDisconnectOverlay(t *testing.T) {
 		return f
 	}
 
-	if err := runSessionLoop(context.Background(), nil, bundle, "ws", "s1", "", false); err != nil {
+	if err := runSessionLoop(context.Background(), nil, bundle, "ws", "s1", ""); err != nil {
 		t.Fatalf("loop returned err: %v", err)
 	}
 	if len(raised) != 2 {
@@ -131,7 +131,7 @@ func TestRunSessionLoopConsecutiveFailureReset(t *testing.T) {
 		}
 		stubLoopDeps(t, attach)
 
-		err := runSessionLoop(context.Background(), nil, bundle, "ws", "s1", "", false)
+		err := runSessionLoop(context.Background(), nil, bundle, "ws", "s1", "")
 		if err != nil {
 			t.Fatalf("loop should survive %d successful reattach→drop cycles, got err: %v", cycles, err)
 		}
@@ -151,7 +151,7 @@ func TestRunSessionLoopConsecutiveFailureReset(t *testing.T) {
 		}
 		stubLoopDeps(t, attach)
 
-		err := runSessionLoop(context.Background(), nil, bundle, "ws", "s1", "", false)
+		err := runSessionLoop(context.Background(), nil, bundle, "ws", "s1", "")
 		if err == nil {
 			t.Fatal("loop with no successful attach must give up at the cap, got nil err")
 		}
@@ -306,7 +306,7 @@ func (a *fakeAgent) dialClient(t *testing.T) *session.Client {
 	cConn, sConn := pipePair(t)
 	go a.serve(t, sConn)
 	dial := func(ctx context.Context, network, addr string) (net.Conn, error) { return cConn, nil }
-	cl, err := session.Dial(context.Background(), dial, "10.0.0.1", 22, "dev", a.hostPub, false)
+	cl, err := session.Dial(context.Background(), dial, "10.0.0.1", 22, "dev", a.hostPub)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}

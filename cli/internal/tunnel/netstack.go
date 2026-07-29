@@ -3,7 +3,6 @@ package tunnel
 import (
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/netip"
@@ -25,10 +24,9 @@ const overlayMTU = 1280
 
 // Tunnel is a live userspace WireGuard session: a wireguard-go device on an
 // in-process gVisor netstack (no TUN, no root). Dial reaches the workspace
-// over the overlay entirely within this process; BridgeSSH exposes a TCP port
-// on the box as a localhost listener so the external `ssh` binary can use it;
-// ListenOverlayTCP accepts box→laptop connections on the laptop's overlay IP
-// (the secret-broker handler channel).
+// over the overlay entirely within this process — the interactive session rides
+// a Go SSH client dialed straight over the netstack, so nothing is bridged out
+// to a local port.
 type Tunnel struct {
 	dev    *device.Device
 	tnet   *netstack.Net
@@ -107,57 +105,6 @@ func Up(ctx context.Context, params Params, laptopWgIP string) (*Tunnel, error) 
 // DialContext dials a TCP address ON THE OVERLAY through the netstack.
 func (t *Tunnel) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	return t.tnet.DialContext(ctx, network, addr)
-}
-
-// ListenOverlayTCP listens for inbound TCP on the laptop's overlay (WireGuard)
-// IP at the given port, returning a net.Listener that accepts box→laptop
-// connections over the tunnel. This is the secret-broker handler channel: the
-// box dials
-// [laptop-overlay-ip]:port directly over the existing tunnel (the same return
-// path the shell uses). The netstack admits only the box's authorized /128, so
-// WireGuard cryptokey routing is the trust boundary — no other host can
-// reach this listener. The listener lives until it is Closed (the handler closes
-// it on session end).
-func (t *Tunnel) ListenOverlayTCP(port int) (net.Listener, error) {
-	return t.tnet.ListenTCP(&net.TCPAddr{IP: t.wgAddr.AsSlice(), Port: port})
-}
-
-// BridgeSSH listens on a loopback port and forwards each accepted connection
-// to wgIP:port over the tunnel, returning the local "127.0.0.1:N" address for
-// the ssh binary to dial. The listener lives until the tunnel closes.
-func (t *Tunnel) BridgeSSH(ctx context.Context, wgIP string, port int) (string, error) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return "", err
-	}
-	target := net.JoinHostPort(wgIP, fmt.Sprintf("%d", port))
-	go func() {
-		<-ctx.Done()
-		ln.Close()
-	}()
-	go func() {
-		for {
-			local, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go t.proxy(ctx, local, target)
-		}
-	}()
-	return ln.Addr().String(), nil
-}
-
-func (t *Tunnel) proxy(ctx context.Context, local net.Conn, target string) {
-	defer local.Close()
-	remote, err := t.tnet.DialContext(ctx, "tcp", target)
-	if err != nil {
-		return
-	}
-	defer remote.Close()
-	done := make(chan struct{}, 2)
-	go func() { _, _ = io.Copy(remote, local); done <- struct{}{} }()
-	go func() { _, _ = io.Copy(local, remote); done <- struct{}{} }()
-	<-done
 }
 
 // Rebind re-opens the underlying UDP socket (wireguard-go BindUpdate): called

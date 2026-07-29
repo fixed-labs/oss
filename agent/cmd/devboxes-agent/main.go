@@ -23,7 +23,6 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
 
@@ -153,10 +152,6 @@ func main() {
 		API:      client,
 		GenEpoch: genEpoch,
 		Log:      log,
-		// Per-session SSH_AUTH_SOCK proxies for agent forwarding.
-		// Under the state dir so the path is on a writable, non-tmpfs-cleared
-		// location; stale sockets from a prior process are removed on bind.
-		AgentSockDir: filepath.Join(cfg.StateDir, "agent-sock"),
 	})
 	// Tombstone prior generations now that the manager (carrying genEpoch) and
 	// api client exist. main is created lazily on next connect, stamped genEpoch,
@@ -222,15 +217,6 @@ func main() {
 	s.HeldLivePTYs = mgr.HeldLivePTYs
 	s.LastDetachAt = mgr.LastDetachAt
 	s.SyncSessions = mgr.SyncNow
-	if cfg.WgIP != "" {
-		// Prune broker-discovery strands on the heartbeat cadence: re-publish only
-		// the connections with a live wg handshake. Only meaningful once wg0 is up.
-		s.RefreshLivePeers = func() {
-			if err := net.PublishLiveLaptopIPs(); err != nil {
-				log.Warn("refresh live peers", "err", err)
-			}
-		}
-	}
 	s.Identity = api.Identity{
 		SSHHost:        cfg.WgIP,
 		WgPubkey:       id.WgPubkey,

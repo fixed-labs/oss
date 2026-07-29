@@ -73,13 +73,6 @@ type Supervisor struct {
 	LastDetachAt    func() time.Time
 	SyncSessions    func()
 
-	// RefreshLivePeers re-publishes the broker discovery file with only the
-	// currently-LIVE connections (recent WireGuard handshake), pruning strands left
-	// by closed `devbox connect`s. Rides the heartbeat cadence because the config-
-	// pull loop only reconciles on a peer-set CHANGE — a peer going stale never
-	// triggers a rewrite otherwise. Optional: nil ⇒ no wg net (tests).
-	RefreshLivePeers func()
-
 	// now is the injected WALL clock (defaults time.Now), used solely by
 	// sendHeartbeat to bound its retry window. The heartbeat loop's own timing
 	// uses real time.Now: its arm deadline is handed to the kernel, and the
@@ -452,12 +445,6 @@ func (s *Supervisor) beat(ctx context.Context) {
 	// once, after the retry loop settles.
 	if s.SyncSessions != nil {
 		s.SyncSessions()
-	}
-	// Prune strands from the broker discovery file: re-publish only live
-	// connections. Rides the heartbeat cadence (the pull loop only rewrites on a
-	// peer-set change).
-	if s.RefreshLivePeers != nil {
-		s.RefreshLivePeers()
 	}
 }
 

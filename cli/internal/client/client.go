@@ -558,27 +558,6 @@ func (c *Client) MachineKeepalive(ctx context.Context, id string, forMs int64) e
 	return c.machinePost(ctx, id, "keepalive", map[string]int64{"for_ms": forMs})
 }
 
-// SecretAccessEvent is the audit body the box posts after a `devbox run`.
-// The workspace identity is taken server-side from the machine token, so it is
-// NOT in the body. ExitCode is a pointer so a nil (e.g. a --shell session or a
-// never-launched child) encodes as JSON null. The contract is pinned to the
-// server — do not add fields (no `reason` until a future escalation).
-type SecretAccessEvent struct {
-	Type     string `json:"type"`    // always "secret-access"
-	Secret   string `json:"secret"`  // the secret name
-	Command  string `json:"command"` // argv joined, or "--shell session" / "--materialize-to <path>"
-	ExitCode *int   `json:"exit_code"`
-	Outcome  string `json:"outcome"` // "success" | "failure"
-}
-
-// PostSecretAccess posts one secret-access audit event for the given workspace
-// via the machine-token events endpoint. The api responds 204 on success. Audit
-// is best-effort and non-fatal at the call site; this returns the error so the
-// caller can decide (it must not fail the command).
-func (c *Client) PostSecretAccess(ctx context.Context, id string, ev SecretAccessEvent) error {
-	return c.machinePost(ctx, id, "events", ev)
-}
-
 // Attach opens an attachment for the laptop's WG pubkey and returns the
 // transport bundle (or a typed *APIError: 409 not-attachable, 503 pool-full).
 func (c *Client) Attach(ctx context.Context, id, laptopWgPubkey, loginUser string) (*AttachBundle, error) {
