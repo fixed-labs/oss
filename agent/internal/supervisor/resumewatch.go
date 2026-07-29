@@ -172,6 +172,30 @@ func (w *timerWatch) Close() error {
 // above the RTT a spin would otherwise run at.
 const minThawSpacing = 5 * time.Second
 
+// defaultResumeMinWall is the minimum NEW wall-vs-monotonic divergence a latched
+// clock step must carry before the loop calls it a resume.
+//
+// It is a MAGNITUDE gate, and deliberately not the magnitude THRESHOLD FIX-280
+// deleted. The old 10s ThawThreshold measured the whole park and so could not see
+// a park shorter than itself — the defect that made prod attach bimodal. This one
+// only has to separate "the wall clock jumped" from "the wall clock was set to
+// approximately what it already said", and those two are orders of magnitude
+// apart:
+//
+//   - Fly sets the guest clock continuously (FIX-292). Every such set measured on
+//     prod carried 0ms — under the millisecond the log line can even show.
+//   - A resume's divergence IS the park: 465254ms for a 464s park, same run.
+//
+// 100ms sits ~100x above the observed noise and 100x below the threshold FIX-280
+// removed, so a sub-second park — the case FIX-280 exists for — still thaws
+// instantly. The residual risk is a platform set that corrects more than 100ms of
+// drift in one go: that thaws spuriously, once, still floored by minThawSpacing.
+const defaultResumeMinWall = 100 * time.Millisecond
+
+// absorbSpacing is the minimum interval between two absorbed (sub-threshold)
+// clock sets. See Supervisor.pauseAbsorb for why absorbing needs a floor at all.
+const absorbSpacing = 50 * time.Millisecond
+
 // thawDelay reports how long the loop must wait before honouring another
 // detected step, given when it last thawed. Zero ⇒ thaw now.
 //

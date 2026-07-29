@@ -102,6 +102,22 @@ type Supervisor struct {
 	// production never sets it. See minThawSpacing for why the floor exists.
 	thawSpacing time.Duration
 
+	// resumeMinWall is the minimum NEW wall-vs-monotonic divergence a clock step
+	// must carry to count as a resume (defaults to defaultResumeMinWall). A field
+	// only so tests can move it — production never sets it.
+	resumeMinWall time.Duration
+
+	// divergence reports the total wall-vs-monotonic divergence accumulated since
+	// a reference time (defaults to unaccountedWall).
+	//
+	// It is injectable because no test can produce a real one: driving the two
+	// clocks apart needs CAP_SYS_TIME, and Go offers no way to synthesise a
+	// time.Time whose monotonic reading moves independently of its wall reading.
+	// That is the same reason thawDelayFrom is split out from thawDelay. Now that
+	// the figure GATES the thaw rather than merely being logged, the seam has to
+	// exist or the gate is untestable.
+	divergence func(since time.Time) time.Duration
+
 	// Tunables (defaulted by Run; overridden in tests).
 	HeartbeatInterval time.Duration
 	PollFloor         time.Duration
@@ -143,6 +159,12 @@ func (s *Supervisor) defaults() {
 	}
 	if s.thawSpacing == 0 {
 		s.thawSpacing = minThawSpacing
+	}
+	if s.resumeMinWall == 0 {
+		s.resumeMinWall = defaultResumeMinWall
+	}
+	if s.divergence == nil {
+		s.divergence = unaccountedWall
 	}
 }
 
@@ -256,22 +278,52 @@ func (s *Supervisor) heartbeatLoop(ctx context.Context) {
 
 	// Prime the watch before the first beat so cancel-latching is active: until
 	// the first Arm the kernel does not mark the fd on a clock step at all.
-	armedAt := time.Now()
 	_ = rearm()
 	pendingStep := false
-	// stepSince is the arm the pending step is measured against — necessarily the
-	// arm that was LIVE when the clock moved, which differs per channel (see the
-	// two assignments below).
-	stepSince := armedAt
 	// lastThawAt paces thaws (see thawSpacing). Zero ⇒ never thawed, so the first
 	// step is never delayed.
 	var lastThawAt time.Time
 	// stepChannel records WHICH of the two channels reported the step ("arm" or
 	// "wait"). It rides the log line because the design's expectation — that a
 	// park lands while the loop is busy, so "arm" is the common case — is
-	// otherwise unfalsifiable in production, and because picking the wrong
-	// stepSince for a channel fails silently (it logs ~0 rather than erroring).
+	// otherwise unfalsifiable in production.
 	stepChannel := ""
+	// stepMagnitude is the divergence the pending step carried — the suspend
+	// duration, and the value the detection line reports.
+	var stepMagnitude time.Duration
+
+	// A clock STEP is not a resume. CANCEL_ON_SET latches on any clock SET, and
+	// on Fly the platform sets the guest CLOCK_REALTIME continuously — measured on
+	// prod 2026-07-29, once every few seconds on every running machine, INCLUDING
+	// one that had never been suspended (FIX-292). Treating each as a resume drove
+	// a thaw — four control-plane requests — every 5s per box forever, bounded only
+	// by thawSpacing: exactly the append-rate blowup minThawSpacing exists to name.
+	//
+	// What separates the two is MAGNITUDE, not frequency. A Fly RAM-snapshot resume
+	// pauses CLOCK_MONOTONIC while the wall clock advances, so a genuine resume
+	// carries new wall-vs-monotonic divergence equal to the park (prod: 465254ms
+	// for a 464s park). A plain clock set carries none (prod: 0ms, every time).
+	//
+	// newDivergence returns the divergence accumulated since the PREVIOUS call and
+	// consumes it. Measuring incrementally rather than against the live arm is what
+	// makes the second channel honest: divergence is permanent once a suspend has
+	// happened, so any later reading taken against a pre-suspend reference still
+	// contains that suspend — which is why the arm channel re-reported an already
+	// thawed 465254ms resume on prod. Consuming also stops sub-threshold noise from
+	// accumulating across hours into a false positive.
+	epoch := time.Now()
+	var accountedWall time.Duration
+	newDivergence := func() time.Duration {
+		total := s.divergence(epoch)
+		d := total - accountedWall
+		accountedWall = total
+		return d
+	}
+	// absorbed counts sub-threshold sets since the last beat, so the rate the
+	// platform sets the clock at stays visible rather than becoming silence.
+	absorbed := 0
+	// lastAbsorbAt bounds the cost of absorbing (see absorbSpacing).
+	var lastAbsorbAt time.Time
 	for {
 		if pendingStep {
 			pendingStep = false
@@ -293,13 +345,12 @@ func (s *Supervisor) heartbeatLoop(ctx context.Context) {
 				case <-t.C:
 				}
 			}
-			// unaccountedWall is WALL minus MONOTONIC elapsed since that arm — on a
-			// resume that IS the suspend duration, the per-claim figure FIX-280's
+			// The magnitude IS the suspend duration, the per-claim figure FIX-280's
 			// prod measurement lacked.
 			s.Log.Info("resume-from-suspend detected",
 				"trigger", "realtime-clock-step",
 				"channel", stepChannel,
-				"unaccounted_wall_ms", unaccountedWall(stepSince).Milliseconds())
+				"unaccounted_wall_ms", stepMagnitude.Milliseconds())
 			// thaw's forced beat IS this iteration's beat — it is the whole point
 			// (it flips the row to `running`), so there is no second beat here.
 			s.thaw(ctx)
@@ -308,33 +359,85 @@ func (s *Supervisor) heartbeatLoop(ctx context.Context) {
 				return
 			}
 		} else {
+			if absorbed > 0 {
+				s.Log.Info("absorbed realtime-clock sets carrying no suspend",
+					"count", absorbed, "min_wall", s.resumeMinWall)
+				absorbed = 0
+			}
 			s.beat(ctx)
 		}
 
-		// liveArm is the arm that was in force throughout the work just done — the
-		// one a step during that work would have been latched against.
-		liveArm := armedAt
-		armedAt = time.Now()
 		if rearm() {
-			// A resume that landed while we were beating or thawing. Handle it now
-			// rather than waiting out an interval we already know is stale.
-			stepSince, stepChannel = liveArm, "arm"
-			pendingStep = true
-			continue
+			// A step latched while we were beating or thawing. The Fly suspend a
+			// resume undoes is triggered BY a beat, so a genuine resume lands in
+			// this window by construction — but so does every platform clock set,
+			// hence the same magnitude test as the wait channel.
+			if d := newDivergence(); d >= s.resumeMinWall {
+				stepMagnitude, stepChannel = d, "arm"
+				pendingStep = true
+				continue
+			}
+			absorbed++
 		}
 
-		switch w.Wait(ctx) {
-		case wakeCancelled:
-			return
-		case wakeBroken:
-			degrade("wait", nil) // the watch already logged the underlying error
-		case wakeClockStep:
-			// The step landed during the wait we just came out of, so it is measured
-			// against the arm that opened it.
-			stepSince, stepChannel = armedAt, "wait"
-			pendingStep = true
-		case wakeDeadline:
+		// Wait for a wake that means something. A sub-threshold set is absorbed
+		// HERE, without falling through to the top of the loop: that would beat on
+		// every clock set, turning a thaw spin into a heartbeat spin. The armed
+		// deadline is untouched by a consumed cancellation, so waiting again simply
+		// resumes the same interval.
+	waiting:
+		for {
+			switch w.Wait(ctx) {
+			case wakeCancelled:
+				return
+			case wakeBroken:
+				degrade("wait", nil) // the watch already logged the underlying error
+				break waiting
+			case wakeClockStep:
+				if d := newDivergence(); d >= s.resumeMinWall {
+					stepMagnitude, stepChannel = d, "wait"
+					pendingStep = true
+					break waiting
+				}
+				absorbed++
+				if !s.pauseAbsorb(ctx, lastAbsorbAt) {
+					return
+				}
+				lastAbsorbAt = time.Now()
+			case wakeDeadline:
+				break waiting
+			}
 		}
+	}
+}
+
+// pauseAbsorb bounds what a clock-set storm can cost. Absorbing is cheap — a read
+// and two clock reads, no I/O — but a workload stepping the clock in a tight loop
+// (the `date -s` loop minThawSpacing was written for, now with CAP_SYS_TIME inside
+// a devbox) would otherwise wake this loop as fast as it can issue the syscall, and
+// a 1-vCPU box has no headroom to spare for that.
+//
+// Spacing absorbs at absorbSpacing caps the cost at a bounded wake rate. It cannot
+// delay a resume by more than absorbSpacing, which is nothing against the 30s beat
+// it replaces — and only ever applies BETWEEN two sub-threshold sets, never before
+// the first one.
+//
+// Reports false when ctx ended, i.e. the caller must return.
+func (s *Supervisor) pauseAbsorb(ctx context.Context, lastAbsorbAt time.Time) bool {
+	if lastAbsorbAt.IsZero() {
+		return ctx.Err() == nil
+	}
+	d := absorbSpacing - time.Since(lastAbsorbAt)
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -191,6 +192,30 @@ func (f *fakeWatch) armCount() int {
 	return len(f.arms)
 }
 
+// steppedClock fakes the wall-vs-monotonic divergence a Fly RAM-snapshot resume
+// leaves behind. `add` is what a suspend of that length looks like to the loop.
+//
+// It exists for the same reason fakeWatch does: real divergence needs CAP_SYS_TIME
+// to produce, and Go cannot synthesise a time.Time whose monotonic reading moves
+// independently of its wall reading. Since FIX-292 that figure GATES the thaw, so
+// a test that cannot move it cannot reach either side of the gate.
+type steppedClock struct {
+	mu    sync.Mutex
+	total time.Duration
+}
+
+func (c *steppedClock) add(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.total += d
+}
+
+func (c *steppedClock) divergence(time.Time) time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.total
+}
+
 func thawSupervisor(m API, rec Reconciler, w resumeWatch) *Supervisor {
 	s := &Supervisor{API: m, Reconcile: rec}
 	s.Log = discardLogger()
@@ -201,6 +226,15 @@ func thawSupervisor(m API, rec Reconciler, w resumeWatch) *Supervisor {
 	s.BackoffMin = time.Millisecond
 	s.BackoffMax = 4 * time.Millisecond
 	s.newWatch = func() resumeWatch { return w }
+	// These tests predate FIX-292's magnitude gate and are about what the loop DOES
+	// with a step, not about telling a resume from a bare clock set. Hand them a
+	// clock that looks like a fresh suspend at every reading, so every scripted step
+	// still qualifies as a resume. The gate itself is covered by the tests that
+	// install their own steppedClock.
+	var auto atomic.Int64
+	s.divergence = func(time.Time) time.Duration {
+		return time.Duration(auto.Add(int64(time.Minute)))
+	}
 	return s
 }
 
@@ -617,6 +651,103 @@ func TestHeartbeatLoopFirstStepThawsWithoutDelay(t *testing.T) {
 		t.Fatalf("the first step did not thaw promptly — the thaw floor (%v) is "+
 			"being applied to it, which turns a rate limit into a detection delay",
 			s.thawSpacing)
+	}
+}
+
+// T16 — a clock SET that moves no wall time is NOT a resume (FIX-292).
+//
+// This is the prod regression. Fly sets the guest CLOCK_REALTIME continuously —
+// measured 2026-07-29 on a machine that had never been suspended, once every few
+// seconds from 4s after boot. CANCEL_ON_SET latches on every one of them, so
+// before the magnitude gate each drove a full thaw: four control-plane requests
+// per box per 5s, forever, floored only by thawSpacing.
+//
+// Every Arm reports a step here, exactly as prod behaved, and the divergence never
+// moves — which is what a clock set is. Zero thaws is the whole assertion. T14 is
+// the same harness with divergence advancing, so this is not vacuous.
+func TestHeartbeatLoopAbsorbsClockSetsThatMoveNoWallTime(t *testing.T) {
+	m := &thawMockAPI{thawPeers: []api.Peer{{LaptopWgPubkey: "SET", LaptopWgIP: "fd::7"}}}
+	rec := &recordingReconciler{}
+	w := &fakeWatch{wakes: []wake{wakeClockStep}, alwaysStepOnArm: true}
+	s := thawSupervisor(m, rec, w)
+	s.thawSpacing = 40 * time.Millisecond
+	clk := &steppedClock{} // never advances: a set, not a suspend
+	s.divergence = clk.divergence
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go s.Run(ctx)
+	waitUntil(func() bool { return false }, 400*time.Millisecond)
+	cancel()
+	waitUntil(func() bool { return false }, 30*time.Millisecond)
+
+	_, pulls := m.snapshot()
+	if thaws := emptyCursorPullsAfterIndex0(pulls); thaws != 0 {
+		t.Fatalf("thaws=%d — a clock set carrying no wall discontinuity was treated "+
+			"as a resume; on Fly that is every few seconds on every box", thaws)
+	}
+}
+
+// T17 — a SUB-SECOND suspend still thaws. The gate must not become the magnitude
+// threshold FIX-280 deleted: the bimodal prod attach it fixed was caused by parks
+// shorter than a 10s threshold going undetected entirely. 250ms is 40x below that
+// threshold and must sail through.
+func TestHeartbeatLoopThawsOnSubSecondSuspend(t *testing.T) {
+	m := &thawMockAPI{thawPeers: []api.Peer{{LaptopWgPubkey: "SHORT", LaptopWgIP: "fd::6"}}}
+	rec := &recordingReconciler{}
+	w := &fakeWatch{wakes: []wake{wakeClockStep, wakeDeadline}, waitGap: 2 * time.Millisecond}
+	s := thawSupervisor(m, rec, w)
+	clk := &steppedClock{}
+	clk.add(250 * time.Millisecond)
+	s.divergence = clk.divergence
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go s.Run(ctx)
+	ok := waitUntil(func() bool {
+		_, pulls := m.snapshot()
+		return emptyCursorPullsAfterIndex0(pulls) >= 1
+	}, 2*time.Second)
+	cancel()
+	waitUntil(func() bool { return false }, 20*time.Millisecond)
+
+	if !ok {
+		t.Fatal("a 250ms suspend did not thaw — the magnitude gate has become a " +
+			"detection threshold, which is the FIX-280 defect returning")
+	}
+}
+
+// T18 — one suspend thaws ONCE, however many channels report it.
+//
+// Divergence is permanent: once a park has happened, every later reading taken
+// against a pre-park reference still contains it. Measuring against the live arm
+// therefore re-reported an already-thawed resume — seen on prod, where the arm
+// channel repeated the same 465254ms magnitude the wait channel had just thawed
+// on. The accumulator consumes what it reports, so the second channel sees zero.
+func TestHeartbeatLoopThawsOncePerSuspend(t *testing.T) {
+	m := &thawMockAPI{thawPeers: []api.Peer{{LaptopWgPubkey: "ONCE", LaptopWgIP: "fd::5"}}}
+	rec := &recordingReconciler{}
+	// One suspend, then a clock that never moves again — but a step reported at
+	// every opportunity, both channels, forever.
+	w := &fakeWatch{wakes: []wake{wakeClockStep}, alwaysStepOnArm: true}
+	s := thawSupervisor(m, rec, w)
+	s.thawSpacing = 20 * time.Millisecond
+	clk := &steppedClock{}
+	clk.add(90 * time.Second)
+	s.divergence = clk.divergence
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go s.Run(ctx)
+	waitUntil(func() bool { return false }, 400*time.Millisecond)
+	cancel()
+	waitUntil(func() bool { return false }, 30*time.Millisecond)
+
+	_, pulls := m.snapshot()
+	thaws := emptyCursorPullsAfterIndex0(pulls)
+	if thaws == 0 {
+		t.Fatal("the suspend never thawed at all")
+	}
+	if thaws != 1 {
+		t.Fatalf("thaws=%d for ONE suspend — the magnitude is being re-reported "+
+			"rather than consumed, so each channel thaws on the same park", thaws)
 	}
 }
 
