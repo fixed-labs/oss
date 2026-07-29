@@ -80,36 +80,33 @@ type Supervisor struct {
 	// triggers a rewrite otherwise. Optional: nil ⇒ no wg net (tests).
 	RefreshLivePeers func()
 
-	// now is the injected WALL clock (defaults time.Now); monoNow is the injected
-	// MONOTONIC-elapsed source (defaults time.Since(process-start)). The thaw
-	// detector (thaw.go) compares the wall delta (from now, monotonic stripped via
-	// .Round(0)) against the monotonic delta (from monoNow): a Fly RAM-snapshot
-	// resume pauses the monotonic clock while wall-clock jumps, so wallDelta −
-	// monoDelta spikes. They are SEPARATE injectables — NOT one time.Time read via
-	// the .Round(0)/.Sub trick — precisely so a test can make wall and monotonic
-	// DIVERGE: Go exposes no way to build a time.Time whose embedded monotonic
-	// reading differs independently from its wall reading, so a single-clock fake
-	// could never express a suspend. With two clocks a test advances now by a jump
-	// while advancing monoNow by only the poll interval (and, for the no-false-
-	// positive case, advances both together).
-	now     func() time.Time
-	monoNow func() time.Duration
+	// now is the injected WALL clock (defaults time.Now), used solely by
+	// sendHeartbeat to bound its retry window. The heartbeat loop's own timing
+	// uses real time.Now: its arm deadline is handed to the kernel, and the
+	// resume-magnitude figure it logs needs a Time carrying a genuine monotonic
+	// reading (see unaccountedWall).
+	//
+	// FIX-280 removed the companion monoNow injectable. It existed only so a test
+	// could drive wall and monotonic apart for the old sampling detector; the
+	// detector is now event-driven (resumewatch_linux.go) and tests fake the
+	// resumeWatch itself, so a second clock source has no remaining consumer.
+	now func() time.Time
+
+	// newWatch builds the heartbeat loop's wait primitive (resumewatch.go). nil ⇒
+	// newResumeWatch: the Linux timerfd detector, else a plain timer. Tests inject
+	// a fake to drive a resume without CAP_SYS_TIME.
+	newWatch func() resumeWatch
+
+	// thawSpacing is the floor on how often a detected clock step may drive a
+	// thaw (defaults to minThawSpacing). A field only so tests can shrink it —
+	// production never sets it. See minThawSpacing for why the floor exists.
+	thawSpacing time.Duration
 
 	// Tunables (defaulted by Run; overridden in tests).
 	HeartbeatInterval time.Duration
 	PollFloor         time.Duration
 	BackoffMin        time.Duration
 	BackoffMax        time.Duration
-	// ThawPoll is the short monotonic sub-interval the heartbeat loop wakes on to
-	// check for a resume-from-suspend clock jump (default 3s). It is well below
-	// HeartbeatInterval so detection is prompt, and its per-sample wall≈monotonic
-	// delta stays far under ThawThreshold under normal operation (no false
-	// positive). See thaw.go.
-	ThawPoll time.Duration
-	// ThawThreshold is how much unaccounted WALL time (wallDelta − monoDelta)
-	// across one ThawPoll sample marks a warm resume from a Fly RAM snapshot
-	// (default 10s). See thaw.go for the rationale.
-	ThawThreshold time.Duration
 	// DetachedKeepWarm is how long a fully-detached box with a held PTY still
 	// reports interactive liveness (so a detached job keeps the box warm before
 	// it idle-parks). Measured from LastDetachAt. Default ~3h.
@@ -141,15 +138,11 @@ func (s *Supervisor) defaults() {
 	if s.now == nil {
 		s.now = time.Now
 	}
-	if s.monoNow == nil {
-		start := time.Now()
-		s.monoNow = func() time.Duration { return time.Since(start) }
+	if s.newWatch == nil {
+		s.newWatch = func() resumeWatch { return newResumeWatch(s.Log) }
 	}
-	if s.ThawPoll == 0 {
-		s.ThawPoll = 3 * time.Second
-	}
-	if s.ThawThreshold == 0 {
-		s.ThawThreshold = 10 * time.Second
+	if s.thawSpacing == 0 {
+		s.thawSpacing = minThawSpacing
 	}
 }
 
@@ -199,22 +192,148 @@ func (s *Supervisor) Run(ctx context.Context) {
 // heartbeatLoop is one of the two goroutines the agent spawns directly, so for
 // crash containment its body is wrapped in recover(): an unrelated panic here
 // must not exit the whole process (and end every persistent session).
+//
+// The wait between beats is a resumeWatch (resumewatch.go), not a monotonic
+// ticker. A monotonic timer PAUSES across a Fly RAM-snapshot suspend, so it
+// would sit the box out a full interval after a resume — up to 30s during which
+// the cluster cannot flip the row to `running` and attach 409s. The watch instead
+// wakes on either an absolute WALL-clock deadline or, on Linux, the realtime
+// clock STEP the platform performs at resume (FIX-280).
 func (s *Supervisor) heartbeatLoop(ctx context.Context) {
 	defer func() {
 		if r := recover(); r != nil {
 			s.Log.Error("heartbeat loop panic recovered", "panic", r)
 		}
 	}()
+	w := s.newWatch()
+	defer func() { _ = w.Close() }()
+
+	// degrade is the SINGLE disposition for every watch malfunction, whether it
+	// surfaces from Arm or from Wait: swap in the plain timer, once. Detection is
+	// lost until the agent restarts; the heartbeat's cadence is not.
+	//
+	// One policy rather than two on purpose. A per-error-class policy would have
+	// to be right about which failures are transient, and it is not worth being
+	// wrong: a watch that fails permanently would then re-log its ERROR every
+	// interval forever, burying the very line that is supposed to be the alert.
+	//
+	// This must never be reachable from an ordinary clock step — see Arm's
+	// contract, where ECANCELED is a report and not a failure.
+	degrade := func(stage string, err error) {
+		s.Log.Error("resume watch failed, degrading to a plain timer — warm resumes "+
+			"will no longer be detected until the agent restarts",
+			"stage", stage, "err", err)
+		_ = w.Close()
+		w = newTimerWatch()
+	}
+
+	// rearm re-anchors the wake one interval out and reports whether a step was
+	// latched since the last arm or wait.
+	//
+	// It is called AFTER the iteration's work, so the next beat is a full idle
+	// interval away — the same guarantee the pre-FIX-280 loop gave by computing
+	// its deadline after beat(). Anchoring before the work instead would let a
+	// beat that burns its whole retry budget be followed immediately by another.
+	//
+	// Arming after the work is only safe because Arm REPORTS a step it consumes
+	// (timerfd_settime returns ECANCELED and rearms anyway). That report is the
+	// channel covering steps that land while the loop is busy; Wait covers the
+	// rest. Between them there is no window in which a resume is missed — which
+	// matters because the Fly suspend a resume undoes is triggered BY a beat, so
+	// the step lands in the busy window by construction.
+	rearm := func() (stepped bool) {
+		stepped, err := w.Arm(time.Now().Add(s.HeartbeatInterval))
+		if err == nil {
+			return stepped
+		}
+		// An arm that failed leaves nothing to wait on: an unarmed pollable
+		// timerfd never becomes readable, so a Wait on it would return only when
+		// ctx is cancelled — i.e. the box would stop beating for good.
+		degrade("arm", err)
+		_, _ = w.Arm(time.Now().Add(s.HeartbeatInterval)) // timerWatch cannot fail
+		return false
+	}
+
+	// Prime the watch before the first beat so cancel-latching is active: until
+	// the first Arm the kernel does not mark the fd on a clock step at all.
+	armedAt := time.Now()
+	_ = rearm()
+	pendingStep := false
+	// stepSince is the arm the pending step is measured against — necessarily the
+	// arm that was LIVE when the clock moved, which differs per channel (see the
+	// two assignments below).
+	stepSince := armedAt
+	// lastThawAt paces thaws (see thawSpacing). Zero ⇒ never thawed, so the first
+	// step is never delayed.
+	var lastThawAt time.Time
+	// stepChannel records WHICH of the two channels reported the step ("arm" or
+	// "wait"). It rides the log line because the design's expectation — that a
+	// park lands while the loop is busy, so "arm" is the common case — is
+	// otherwise unfalsifiable in production, and because picking the wrong
+	// stepSince for a channel fails silently (it logs ~0 rather than erroring).
+	stepChannel := ""
 	for {
-		s.beat(ctx)
-		// Instead of a single monotonic ticker (which pauses across a Fly RAM-
-		// snapshot suspend, leaving the box up to a full interval before its next
-		// beat), wait on a short sub-poll that also watches the clock. On a warm
-		// resume waitOrThaw returns early having already handled the thaw (immediate
-		// heartbeat + relay/attachment resync), so the loop re-beats at once and the
-		// cluster flips starting → running promptly.
-		if !s.waitOrThaw(ctx) {
+		if pendingStep {
+			pendingStep = false
+			// Rate-limit, NOT a detection threshold: the first step after a quiet
+			// period thaws immediately, so a genuine warm resume pays nothing. Only
+			// a box whose clock is being stepped over and over — a user workload
+			// faking time, an `ntpdate` loop — is held to the floor, and it is held
+			// by waiting rather than by dropping the step.
+			if d := thawDelay(lastThawAt, s.thawSpacing); d > 0 {
+				// Deliberately NOT worded "resume-from-suspend detected": §5's
+				// acceptance greps that exact phrase, and a paced duplicate would
+				// otherwise read as a detection with no magnitude field attached.
+				s.Log.Warn("thaw paced by the minimum spacing floor", "wait", d)
+				t := time.NewTimer(d)
+				select {
+				case <-ctx.Done():
+					t.Stop()
+					return
+				case <-t.C:
+				}
+			}
+			// unaccountedWall is WALL minus MONOTONIC elapsed since that arm — on a
+			// resume that IS the suspend duration, the per-claim figure FIX-280's
+			// prod measurement lacked.
+			s.Log.Info("resume-from-suspend detected",
+				"trigger", "realtime-clock-step",
+				"channel", stepChannel,
+				"unaccounted_wall_ms", unaccountedWall(stepSince).Milliseconds())
+			// thaw's forced beat IS this iteration's beat — it is the whole point
+			// (it flips the row to `running`), so there is no second beat here.
+			s.thaw(ctx)
+			lastThawAt = time.Now()
+			if ctx.Err() != nil {
+				return
+			}
+		} else {
+			s.beat(ctx)
+		}
+
+		// liveArm is the arm that was in force throughout the work just done — the
+		// one a step during that work would have been latched against.
+		liveArm := armedAt
+		armedAt = time.Now()
+		if rearm() {
+			// A resume that landed while we were beating or thawing. Handle it now
+			// rather than waiting out an interval we already know is stale.
+			stepSince, stepChannel = liveArm, "arm"
+			pendingStep = true
+			continue
+		}
+
+		switch w.Wait(ctx) {
+		case wakeCancelled:
 			return
+		case wakeBroken:
+			degrade("wait", nil) // the watch already logged the underlying error
+		case wakeClockStep:
+			// The step landed during the wait we just came out of, so it is measured
+			// against the arm that opened it.
+			stepSince, stepChannel = armedAt, "wait"
+			pendingStep = true
+		case wakeDeadline:
 		}
 	}
 }
@@ -241,8 +360,9 @@ func (s *Supervisor) beat(ctx context.Context) {
 
 // sendHeartbeat sends one heartbeat, retrying a transient failure with the same
 // jittered-exponential backoff the pull loop uses (BackoffMin→BackoffMax). The
-// retry is bounded by a deadline captured ONCE at entry — the shape waitOrThaw
-// uses (now.Add(HeartbeatInterval)) — so retries can never slide into the next
+// retry is bounded by a deadline captured ONCE at entry — the shape the
+// pre-FIX-280 waitOrThaw used (now.Add(HeartbeatInterval)) — so retries can
+// never slide into the next
 // scheduled beat (preserving at-most-one-append-in-flight-per-box). It stops
 // when the next backoff sleep would cross that deadline, logging a DISTINCT
 // "heartbeat retries exhausted" line for recurrence alerting. A ctx cancellation
@@ -266,9 +386,9 @@ func (s *Supervisor) sendHeartbeat(ctx context.Context) {
 		// recovering API (same idiom as pullLoop).
 		jitter := time.Duration(rand.Int63n(int64(backoff) / 2))
 		// Stop before a sleep that would cross the deadline captured at entry —
-		// a retry must not overlap the next scheduled beat. The steady loop's
-		// waitOrThaw then waits its own fresh interval, and INV-R heals the box
-		// on the next successful beat.
+		// a retry must not overlap the next scheduled beat. The loop's work-END
+		// rearm then waits its own fresh interval (INV-5), and INV-R heals the
+		// box on the next successful beat.
 		if s.now().Add(backoff + jitter).After(deadline) {
 			s.Log.Warn("heartbeat retries exhausted", "err", err)
 			return
