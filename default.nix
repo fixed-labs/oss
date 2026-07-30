@@ -66,7 +66,7 @@ let
         pname = "devboxes-agent";
         version = "0.1.0";
         src = ./agent;
-        vendorHash = "sha256-6UlBE+Eqy+n2OG65aZkBiqS9E0h+dc9oXkz21bTBAYE=";
+        vendorHash = "sha256-panH7srPU1vA741UxOtoBlM0xGByjfWKFQ8vqRVK1s4=";
         subPackages = [ "cmd/devboxes-agent" ];
         ldflags = [
           "-s"
@@ -248,6 +248,17 @@ let
   # (cmd/devboxes-agent → binary `devboxes-agent`, the name the base module's
   # systemd unit runs). Both are pure-Go; the vendorHash hashes the vendored
   # dependency sources, so it is independent of the module's own import path.
+  #
+  # Both hashes below cover a set PRUNED to what the source actually imports, so
+  # DELETING Go code can change them even when go.mod/go.sum are untouched —
+  # dropping the last importer of a package drops that package from the vendor
+  # tree. FIX-233 hit exactly this: deleting sessions/agentforward.go (the only
+  # importer of x/crypto/ssh/agent) restaled both hashes with no go.mod diff.
+  # Worse, a local `nix build` will not catch it: a fixed-output derivation is
+  # reused whenever a store path matching its DECLARED hash already exists, so a
+  # machine that built the pre-deletion vendor set keeps silently reusing it and
+  # goes green while CI (cold store) fails. To re-derive a hash honestly, set it
+  # to lib.fakeHash, build, and take the reported "got:".
   packagesFor =
     system:
     let
@@ -259,7 +270,7 @@ let
         version = "0.1.0";
         src = ./cli;
         subPackages = [ "cmd/rift" ];
-        vendorHash = "sha256-YCjc4MqmaRYg0fOkmXkMZgxGc85Hn8x8qD9dKqRlsbQ=";
+        vendorHash = "sha256-dRnejPH7Uf4PpKQxvThfKZWP2P/nagVKSCPNdcxhM7E=";
         # CGO off — the Go deps (wireguard-go netstack, x/crypto) are pure Go,
         # so the inner binary stays static (small closure, no glibc dep).
         env.CGO_ENABLED = "0";
@@ -273,7 +284,7 @@ let
         version = "0.1.0";
         src = ./agent;
         subPackages = [ "cmd/devboxes-agent" ];
-        vendorHash = "sha256-6UlBE+Eqy+n2OG65aZkBiqS9E0h+dc9oXkz21bTBAYE=";
+        vendorHash = "sha256-panH7srPU1vA741UxOtoBlM0xGByjfWKFQ8vqRVK1s4=";
         ldflags = [
           "-s"
           "-w"
