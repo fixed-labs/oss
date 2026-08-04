@@ -22,6 +22,10 @@ type mockAPI struct {
 	heartbeats []heartbeat
 	pulls      []string // cursors received
 	script     []pullResult
+	// calls records every API call IN ORDER ("close-idle" | "beat" | "pull").
+	// thaw's whole correctness is an ordering property — the pool drop has to
+	// land before the first request — so the order is what tests assert on.
+	calls []string
 }
 
 type heartbeat struct {
@@ -39,6 +43,7 @@ func (m *mockAPI) Heartbeat(_ context.Context, live bool, sshSessions int, id ap
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.hbCalls++
+	m.calls = append(m.calls, "beat")
 	if m.hbCalls <= m.hbFails {
 		return fmt.Errorf("api down")
 	}
@@ -50,12 +55,27 @@ func (m *mockAPI) PullConfig(_ context.Context, cursor string) (*api.Config, err
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.pulls = append(m.pulls, cursor)
+	m.calls = append(m.calls, "pull")
 	if len(m.script) == 0 {
 		return nil, api.ErrNotModified
 	}
 	r := m.script[0]
 	m.script = m.script[1:]
 	return r.cfg, r.err
+}
+
+func (m *mockAPI) CloseIdleConnections() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.calls = append(m.calls, "close-idle")
+}
+
+// callsSnapshot copies the ordered call log under the lock — the supervisor's
+// loops run on their own goroutines, so reading m.calls bare would race.
+func (m *mockAPI) callsSnapshot() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.calls...)
 }
 
 type recordingReconciler struct {

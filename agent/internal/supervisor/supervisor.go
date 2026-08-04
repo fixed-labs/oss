@@ -38,6 +38,10 @@ import (
 type API interface {
 	Heartbeat(ctx context.Context, interactiveLive bool, sshSessions int, identity api.Identity) error
 	PullConfig(ctx context.Context, cursor string) (*api.Config, error)
+	// CloseIdleConnections drops pooled keep-alive sockets. It is part of this
+	// interface because only the supervisor knows a resume happened, and the
+	// pool does not survive one (see thaw, and api.CloseIdleConnections).
+	CloseIdleConnections()
 }
 
 // Reconciler applies a pulled desired peer set (wgnet.Net in production).

@@ -31,6 +31,11 @@ type thawMockAPI struct {
 	hbFails int      // fail the first N heartbeats (0 ⇒ never) — exercises beat retry
 	pulls   []string // cursors received, in order
 
+	// calls is every API call IN ORDER ("close-idle" | "beat" | "pull"). thaw's
+	// pool drop is correct only if it lands BEFORE the forced beat, and ordering
+	// is not observable from the per-call counters.
+	calls []string
+
 	steadyCounter int // advances the steady-state cursor "h:1","h:2",…
 
 	// thawPeers is the peer set returned to the empty-cursor (thaw resync) pull.
@@ -41,16 +46,24 @@ func (m *thawMockAPI) Heartbeat(_ context.Context, _ bool, _ int, _ api.Identity
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.hbCalls++
+	m.calls = append(m.calls, "beat")
 	if m.hbCalls <= m.hbFails {
 		return fmt.Errorf("api down")
 	}
 	return nil
 }
 
+func (m *thawMockAPI) CloseIdleConnections() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.calls = append(m.calls, "close-idle")
+}
+
 func (m *thawMockAPI) PullConfig(_ context.Context, cursor string) (*api.Config, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.pulls = append(m.pulls, cursor)
+	m.calls = append(m.calls, "pull")
 	if cursor == "" {
 		// Either the loop's very first poll (index 0) or the thaw's forced
 		// full-resync. Return the thaw config with a fixed non-empty cursor so
@@ -92,6 +105,12 @@ func (m *thawMockAPI) snapshot() (hb int, pulls []string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.hbCalls, append([]string(nil), m.pulls...)
+}
+
+func (m *thawMockAPI) callsSnapshot() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.calls...)
 }
 
 // emptyCursorPullsAfterIndex0 counts PullConfig("") calls after the loop's very
@@ -748,6 +767,71 @@ func TestHeartbeatLoopThawsOncePerSuspend(t *testing.T) {
 	if thaws != 1 {
 		t.Fatalf("thaws=%d for ONE suspend — the magnitude is being re-reported "+
 			"rather than consumed, so each channel thaws on the same park", thaws)
+	}
+}
+
+// T19 — thaw drops the pooled connections BEFORE its forced beat.
+//
+// This is the staging outage of 2026-08-04. Every socket the agent had pooled
+// was torn down by the funnel while the box sat suspended, but a frozen box
+// never sees the FIN, so on resume the pool still looked healthy. thaw's forced
+// beat went out on a dead connection, no response header ever came back, and it
+// died at the client's 35s timeout — as did every call after it, for the 15
+// minutes until the cluster reaped the box as `vm-lost`. Restarting the agent
+// (a fresh transport, nothing else) recovered it in 420ms.
+//
+// So ORDER is the assertion, not merely presence: a drop placed after the beat
+// leaves the one request that matters — the beat that flips the row to running —
+// still going down a dead socket.
+func TestThawDropsIdlePoolBeforeTheForcedBeat(t *testing.T) {
+	m := &thawMockAPI{thawPeers: []api.Peer{{LaptopWgPubkey: "POOL", LaptopWgIP: "fd::4"}}}
+	rec := &recordingReconciler{}
+	s := thawSupervisor(m, rec, &fakeWatch{})
+	// Driving thaw() directly skips Run's default wiring, so freeze the clock the
+	// same way T8 does — sendHeartbeat reads s.now to build its retry deadline.
+	frozen := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	s.now = func() time.Time { return frozen }
+
+	s.thaw(context.Background())
+
+	calls := m.callsSnapshot()
+	if len(calls) == 0 {
+		t.Fatal("thaw made no API calls at all — harness wired wrong")
+	}
+	if calls[0] != "close-idle" {
+		t.Fatalf("thaw's first API call = %q, want %q; full order = %v — a beat sent "+
+			"before the pool is dropped goes down a connection that died during the "+
+			"suspend, and stalls for the client timeout", calls[0], "close-idle", calls)
+	}
+}
+
+// T19b — the pool drop is warm-resume-ONLY: the steady-state loop must never do
+// it. Dropping idle connections on the ordinary cadence would throw away a
+// perfectly good keep-alive and pay a fresh TCP+TLS handshake on every beat, on
+// every box, forever — which is the cost DisableKeepAlives was rejected for.
+//
+// Non-vacuous: T19 trips on the same mock when a thaw does happen.
+func TestSteadyStateLoopNeverDropsIdlePool(t *testing.T) {
+	m := &thawMockAPI{}
+	rec := &recordingReconciler{}
+	// Only ever wakeDeadline, so no thaw can fire (the T6 harness).
+	w := &fakeWatch{wakes: []wake{wakeDeadline}, waitGap: 2 * time.Millisecond}
+	s := thawSupervisor(m, rec, w)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go s.Run(ctx)
+	waitUntil(func() bool { return w.armCount() >= 20 }, 2*time.Second)
+	cancel()
+	waitUntil(func() bool { return false }, 20*time.Millisecond)
+
+	for _, c := range m.callsSnapshot() {
+		if c == "close-idle" {
+			t.Fatalf("the steady-state loop dropped the idle pool; that costs a fresh "+
+				"TCP+TLS handshake on every beat. calls=%v", m.callsSnapshot())
+		}
+	}
+	if hb, _ := m.snapshot(); hb == 0 {
+		t.Fatal("loop never beat at all — harness wired wrong")
 	}
 }
 

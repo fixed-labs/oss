@@ -53,13 +53,44 @@ type Client struct {
 }
 
 func New(baseURL, workspaceID, token string) *Client {
+	// An OWNED transport (a clone of the default, so the tuning is unchanged) so
+	// that CloseIdleConnections evicts THIS client's pool and nothing else. With a
+	// nil Transport the call still works, but it reaches into the process-wide
+	// http.DefaultTransport and would evict connections belonging to any other
+	// user of it. Scoping it is what makes the resume-time drop safe to do
+	// unconditionally.
+	tr := http.DefaultTransport.(*http.Transport).Clone()
 	return &Client{
 		BaseURL:     baseURL,
 		WorkspaceID: workspaceID,
 		Token:       token,
-		HTTP:        &http.Client{Timeout: 35 * time.Second},
+		HTTP:        &http.Client{Timeout: 35 * time.Second, Transport: tr},
 	}
 }
+
+// CloseIdleConnections drops every pooled keep-alive socket, forcing the next
+// request to dial fresh.
+//
+// This exists for ONE caller: the warm-resume path (supervisor.thaw). A Fly
+// suspend freezes the VM wholesale, so every connection the agent had pooled is
+// torn down by the relay/funnel while the box is frozen — but the box never
+// observes the FIN, because it is not running to observe it. On resume the pool
+// still looks full of healthy sockets, so the transport hands one out, the
+// request goes into a black hole, and no response header ever comes back: every
+// call dies at the client's 35s timeout instead, indefinitely.
+//
+// Go's own defence, Transport.IdleConnTimeout, cannot save us here: it is driven
+// by the MONOTONIC clock, and the monotonic clock does not advance across a
+// suspend. That is the same property the resume detector itself relies on — it
+// spots a resume precisely BY the wall clock jumping while the monotonic clock
+// did not (resumewatch.go). So the idle reaper's timer is still counting the
+// microseconds before the snapshot, and never fires.
+//
+// Nothing here is specific to how long the box was suspended: a box that resumes
+// fast enough that the peer has not yet dropped its connections is simply a case
+// where dialing fresh costs one handshake. Cheap insurance, and the alternative
+// (DisableKeepAlives) would pay that handshake on every request forever.
+func (c *Client) CloseIdleConnections() { c.HTTP.CloseIdleConnections() }
 
 func (c *Client) url(leaf string) string {
 	return fmt.Sprintf("%s/api/rift/v1/%s/%s", c.BaseURL, c.WorkspaceID, leaf)

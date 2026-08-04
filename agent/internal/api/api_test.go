@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 )
 
@@ -169,5 +171,75 @@ func TestErrorStatusSurfaces(t *testing.T) {
 	})
 	if err := c.Heartbeat(context.Background(), false, 0, Identity{}); err == nil {
 		t.Fatal("expected error on 401")
+	}
+}
+
+// --- Warm-resume connection hygiene ------------------------------------------
+
+// The client must POOL connections in steady state and DROP them on demand.
+// Both halves matter and they pull in opposite directions, so they are asserted
+// against a real server on one connection-counting harness.
+//
+// Why the drop exists: a Fly suspend freezes the VM, so every pooled socket is
+// torn down by the far end without the box ever seeing the FIN. On resume the
+// pool looks healthy, the transport hands out a corpse, and the request hangs
+// until the 35s client timeout — every call, indefinitely. Transport's own
+// IdleConnTimeout cannot help: it runs on the monotonic clock, which does not
+// advance across a suspend.
+//
+// Why the pooling half is asserted too: the cheap "fix" is DisableKeepAlives,
+// which would pay a fresh TCP+TLS handshake on every heartbeat of every box
+// forever. Reuse-then-drop keeps the steady-state cost and fixes the resume.
+func TestCloseIdleConnectionsForcesAFreshDial(t *testing.T) {
+	var newConns atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	}))
+	srv.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+		if s == http.StateNew {
+			newConns.Add(1)
+		}
+	}
+	t.Cleanup(srv.Close)
+	c := New(srv.URL, "ws-1", "tok")
+	ctx := context.Background()
+
+	pull := func() {
+		t.Helper()
+		if _, err := c.PullConfig(ctx, "cursor"); err != nil {
+			t.Fatalf("pull: %v", err)
+		}
+	}
+
+	// The pull loop is what populates the pool: it decodes the whole body, so its
+	// connection goes back as reusable.
+	pull()
+	pull()
+	if got := newConns.Load(); got != 1 {
+		t.Fatalf("two sequential pulls opened %d connections, want 1 — keep-alive "+
+			"reuse is off, so every poll on every box pays a fresh handshake", got)
+	}
+
+	// And THIS is the mechanism of the resume bug: the pool is per-HOST, not
+	// per-call-site, so the heartbeat rides whatever socket the pull loop left
+	// behind. After a suspend that socket is dead, which is why thaw()'s forced
+	// beat — the one request that flips the row to running — was a casualty and
+	// not just the pull loop.
+	if err := c.Heartbeat(ctx, false, 0, Identity{WgPubkey: "WGPUB"}); err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+	if got := newConns.Load(); got != 1 {
+		t.Fatalf("the heartbeat dialed its own connection (total %d, want 1) — if that "+
+			"is now true by design the resume story changes, because the beat no "+
+			"longer inherits the pull loop's pooled socket", got)
+	}
+
+	c.CloseIdleConnections()
+
+	pull()
+	if got := newConns.Load(); got != 2 {
+		t.Fatalf("after CloseIdleConnections the next request brought the total to %d "+
+			"connections, want 2 — the pooled socket was reused, which after a warm "+
+			"resume means reusing one that died during the suspend", got)
 	}
 }
