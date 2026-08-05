@@ -20,8 +20,9 @@ let
   # init keeps VM PID 1), captures the machine's RIFT_* env to
   # /etc/devboxes/boot-env and its seeded nameservers to
   # /etc/devboxes/boot-resolv.conf before the handoff (systemd in the pidns
-  # never sees machine env, and post-pivot /etc/resolv.conf can be a stale
-  # overlay copy), and forwards `fly machine stop`'s SIGTERM as SIGRTMIN+3 to
+  # never sees machine env; the capture is belt-and-suspenders DNS — the
+  # entrypoint also rm's any stale overlay resolv.conf at its source), and
+  # forwards `fly machine stop`'s SIGTERM as SIGRTMIN+3 to
   # ns-systemd for a clean shutdown. TARGETS x86_64-linux (Fly's arch); on an
   # aarch64 host the system closure builds under binfmt emulation.
   #
@@ -99,10 +100,12 @@ let
       };
       toplevel = baseSystem.config.system.build.toplevel;
 
-      # Capture the DNS the platform seeded into the rootfs. Read pre-pivot
-      # because that is the last point it is trustworthy: everything after the
-      # pivot sees the overlay, whose /etc/resolv.conf may be a stale,
-      # nameserver-less file left on the volume by an earlier boot.
+      # Capture the DNS the platform seeded into the rootfs. Read pre-pivot so
+      # the capture holds INDEPENDENTLY of the upper-cleanup rm in the
+      # entrypoint (FIX-323): with that rm in place the post-pivot view is
+      # Fly's fresh lower copy too, but if the rm — or its assumption that Fly
+      # reseeds every boot — ever regresses, the post-pivot view can again be
+      # a stale volume copy, and this capture must not inherit that failure.
       # devboxes-resolv re-asserts what this captures; the full FIX-321 story
       # is in its comment in nix/devboxes-base/module.nix.
       #
@@ -165,6 +168,43 @@ let
         mountpoint -q /persist
 
         mkdir -p /persist/upper /persist/work /lower /newroot
+
+        # /etc/resolv.conf must never survive in the overlay upper. Fly's init
+        # writes a fresh one into the image root on every boot, but NixOS
+        # stage-2 feeds whatever /etc/resolv.conf it *sees* back into openresolv
+        # (`useHostResolvConf`, which boot.isContainer turns on by default —
+        # nixos/modules/system/boot/stage-2-init.sh), and openresolv then
+        # rewrites the file. That write copies up into /persist/upper, and from
+        # the next boot on the upper copy shadows Fly's, so stage-2 reads back
+        # its own previous output: a feedback loop with the volume as its
+        # memory. dhcpcd never gets a lease on Fly, so the moment the loop
+        # latches onto an empty file it stays empty and ALL DNS is dead —
+        # permanently, on that volume. That is the observed failure.
+        #
+        # Dropping the upper entry here, before the overlay is assembled, lets
+        # Fly's copy show through the lower again; `rm` also clears a whiteout
+        # if some boot deleted the file outright. It runs every boot, so the
+        # loop can never latch, and it repairs volumes already poisoned in the
+        # field rather than only preventing new ones.
+        #
+        # The alternative — re-seeding after pivot, i.e. copying the lower's
+        # file over the overlay's — is strictly weaker: it repairs the upper
+        # only when Fly's copy is present and non-empty, so in exactly the case
+        # that produced the outage it writes nothing and leaves the poison in
+        # place. Making /etc/resolv.conf a bind-mounted tmpfs file would rule
+        # the persistence out structurally, but openresolv installs the file
+        # with rename(2), which returns EBUSY onto a bind-mount target — every
+        # boot would then fail its resolvconf run loudly.
+        #
+        # COMPANION, not competitor, to FIX-321's capture + devboxes-resolv
+        # re-assert (below and in module.nix): FIX-321 out-competes a bad
+        # registration after boot (metric 1100, and it also covers the
+        # capture-side failure mode this rm can't reach); this rm removes the
+        # poison at its source, so stage-2's ordinary host record (metric
+        # 1000) works again, the volume itself heals, and FIX-321's unit is
+        # genuinely a fallback rather than the primary DNS path.
+        rm -f /persist/upper/etc/resolv.conf
+
         mount --make-rprivate / || true
         # Non-recursive bind: the lower view excludes the volume + API mounts.
         mount --bind / /lower
@@ -189,6 +229,22 @@ let
         } > /newroot/etc/devboxes/boot-env
 
         ${captureBootResolv}
+
+        # Back to a sane umask immediately. The 077 above is scoped to the two
+        # /etc/devboxes captures alone — boot-env holds the bearer token and
+        # must stay root-only (boot-resolv.conf just rides the same scope).
+        # umask survives exec, so leaving it set hands 077 to everything
+        # downstream of this script, and the victim is NixOS stage-2: it sets
+        # no umask of its own and runs the entire activation script set
+        # (setup-etc, the users/groups pass, every directory an activation
+        # snippet mkdir's without an explicit chmod) BEFORE it execs systemd.
+        # Those all come out 0700/0600, and the single non-root login user this
+        # box exists for can then neither traverse nor read them. systemd
+        # itself is not at risk — as PID 1 it resets to umask(0) and gives
+        # every unit UMask=0022 no matter what it inherited — which is exactly
+        # why the leak is easy to miss: the box boots fine and only user-facing
+        # permissions are quietly wrong.
+        umask 022
 
         # Carry the API filesystems over (NOT /proc — the pidns child gets
         # a namespace-correct one from --mount-proc).
@@ -243,6 +299,15 @@ let
         done
       '';
       hostPkgs = import nixpkgs { system = hostSystem; };
+      # The registration dump loaded into the image's Nix database (see
+      # includeNixDB below). initScript is the right — and only — root: the
+      # store content this image ships is exactly its closure, because
+      # streamLayeredImage derives the shipped paths from the config JSON,
+      # which references nothing but `Entrypoint = [ initScript ]`. (The
+      # customisation layer's db.sqlite does textually embed every closure
+      # path once this change lands — but those refs ARE initScript's closure,
+      # so the root above stays complete.)
+      imageRegistration = hostPkgs.closureInfo { rootPaths = [ initScript ]; };
     in
     hostPkgs.dockerTools.streamLayeredImage {
       inherit name tag;
@@ -256,6 +321,35 @@ let
       # customization layer), peeling the biggest tail paths into their own
       # blobs so no single layer dominates the push.
       maxLayers = 120;
+      # Ship a POPULATED /nix/var/nix/db. Without a database the ~600 store
+      # paths this image carries do not exist as far as Nix is concerned:
+      # nothing can be substituted against them, nothing can be realized, and
+      # no toplevel can be made a profile generation inside the box.
+      #
+      # `includeNixDB` alone is not enough here, and the shortfall is silent.
+      # nixpkgs builds the database from `closureInfo { rootPaths = contents; }`
+      # (pkgs/build-support/docker/default.nix, `mkDbExtraCommand`) — and this
+      # call site passes no `contents` at all; the system closure rides in
+      # through the config's Entrypoint reference instead. With `contents = [ ]`
+      # the registration is an empty file and the db.sqlite that lands in the
+      # image has ZERO rows in ValidPaths (verified by building such an image
+      # and querying the table). Moving the closure into `contents` is not an
+      # option either: streamLayeredImage symlinkJoins `contents` into the image
+      # root, which would splat the NixOS toplevel's etc/init/sw over /.
+      #
+      # So keep includeNixDB for the scaffolding it does build correctly — the
+      # database schema, the gcroots directories, the registrationTime reset
+      # that keeps the layer reproducible — and append a second load pass over
+      # the closure the image actually ships. nixpkgs PREPENDS its block to
+      # extraCommands, `nix-store --load-db` is additive, and both run in one
+      # shell, so NIX_REMOTE and USER are already exported by the time this
+      # runs.
+      includeNixDB = true;
+      extraCommands = ''
+        ${hostPkgs.lib.getExe' hostPkgs.buildPackages.nix "nix-store"} --load-db < ${imageRegistration}/registration
+        ${hostPkgs.lib.getExe hostPkgs.buildPackages.sqlite} nix/var/nix/db/db.sqlite \
+          "UPDATE ValidPaths SET registrationTime = ''${SOURCE_DATE_EPOCH}"
+      '';
       # The initScript's closure (and through it the whole NixOS system
       # toplevel) rides in via the config reference; no explicit contents.
       #

@@ -11,12 +11,14 @@
 # multi-tenant split.
 #
 # Boot model: Fly's init stays VM PID 1 and runs the image entrypoint
-# (mkDevimage's init script), which assembles the overlay root (image = RO
-# lower, volume upper at /persist), captures the machine's RIFT_* env to
+# (mkDevimage's init script), which removes any stale resolv.conf from the
+# volume upper at its source, assembles the overlay root (image = RO lower,
+# volume upper at /persist), captures the machine's RIFT_* env to
 # /etc/devboxes/boot-env and its seeded nameservers to
-# /etc/devboxes/boot-resolv.conf (systemd-in-a-child-pidns inherits neither the
-# machine env nor a trustworthy /etc/resolv.conf — see devboxes-resolv below),
-# pivots, and execs this system's stage-2 under `unshare --pid --fork
+# /etc/devboxes/boot-resolv.conf (systemd-in-a-child-pidns inherits no machine
+# env, and the DNS capture backstops stage-2's own registration — see
+# devboxes-resolv below), pivots, and execs this system's stage-2 under
+# `unshare --pid --fork
 # --mount-proc` — systemd then runs as ns-PID-1 (getpid()==1 ⇒ real init mode).
 {
   config,
@@ -88,7 +90,15 @@ in
       uid = 1000;
       home = "/home/${cfg.loginUser}";
       shell = cfg.loginShell;
-      extraGroups = [ "wheel" ];
+      extraGroups = [
+        "wheel"
+        # The socket dockerSocket.enable creates below is mode 0660 root:podman
+        # (the podman module pins SocketGroup = "podman"), so without this the
+        # only user who ever logs in cannot open it and the whole point of
+        # exposing /run/docker.sock is lost. This concedes nothing: the same
+        # user already has passwordless sudo and the VM is single-tenant.
+        "podman"
+      ];
     };
     security.sudo.wheelNeedsPassword = false;
 
@@ -101,6 +111,13 @@ in
       git
       curl
     ];
+    # Deliberately NOT in the base: a C/C++ toolchain (gcc/gnumake/binutils/
+    # pkg-config). `pip install` of a wheel-less package, node-gyp, and
+    # cc-based cargo build scripts all need one — but the wrapped gcc alone is
+    # ~310 MiB of closure (~50% of the whole base), so it is a client-layer
+    # choice: add it in your own extraModules if your workflow compiles native
+    # code. (Decided at FIX-323 review; the nix-ld set below still covers
+    # PREBUILT binaries, which need no compiler.)
 
     # Install the terminfo database for every terminal a developer might SSH
     # in from. A devbox doesn't control the client terminal, and modern
@@ -113,6 +130,23 @@ in
     # (see nixos/modules/config/terminfo.nix), so TERM resolves and the warning
     # goes away.
     environment.enableAllTerminfo = true;
+
+    # Give fontconfig something to find. fonts.fontconfig.enable already
+    # defaults to true, so /etc/fonts was being generated all along — but
+    # fonts.packages was empty, so it listed no font directories and every
+    # lookup came back with nothing. Headless tools that rasterize are the
+    # casualties: matplotlib/Pillow chart rendering, HTML-to-PDF converters and
+    # headless Chromium screenshots either raise "cannot find font family" or
+    # silently render tofu. DejaVu is the family the Python plotting stacks
+    # assume by default; Liberation is metric-compatible with
+    # Arial/Times/Courier, which is what PDF and screenshot tools request by
+    # name. About 14 MiB for the pair. CJK and emoji coverage is a consumer's to
+    # add in its own layer — the Noto families for those outweigh this entire
+    # font set several times over.
+    fonts.packages = with pkgs; [
+      dejavu_fonts
+      liberation_ttf
+    ];
 
     # nix-ld shim for generic-linux dynamically-linked ELFs. A devbox is a
     # general-purpose developer machine, and the tools developers reach for
@@ -128,6 +162,15 @@ in
     # prebuilt build tools all need it). Tool-specific FHS /bin shims, when a
     # consumer needs them, belong in that consumer's own extraModules layer,
     # not here.
+    #
+    # This list is MERGED with the nix-ld module's own default set rather than
+    # replacing it — `libraries` is a listOf, and listOf concatenates every
+    # definition — so zstd, curl, libxml2, util-linux, systemd, attr, acl,
+    # libssh and libsodium already arrive from upstream (as do harmless
+    # duplicates of a few entries here that predate this note). Each of the
+    # five entries added below (libxcrypt, libsecret, libkrb5, fontconfig,
+    # freetype) is absent from the upstream set and names the consumer that
+    # fails without it.
     programs.nix-ld = {
       enable = true;
       libraries = with pkgs; [
@@ -140,6 +183,38 @@ in
         bzip2
         readline
         ncurses
+        # libcrypt.so.1. glibc dropped its crypt implementation in 2.28, and
+        # NixOS keeps that SONAME only in libxcrypt's obsolete-API build. It is
+        # on the manylinux ABI whitelist, so wheels and prebuilt interpreters
+        # link it and die at load with "libcrypt.so.1: cannot open shared object
+        # file". Already in the system closure via shadow/PAM — costs nothing.
+        libxcrypt
+        # libsecret-1.so.0. VS Code's Remote-SSH server keeps its tokens in the
+        # secret-service client library, and prebuilt CLIs (gh among them)
+        # dlopen it for credential storage. Note there is no keyring DAEMON on
+        # the box, which is the intended end state: a missing library is a hard
+        # loader error that kills the process, whereas a missing service is a
+        # clean D-Bus failure the caller already handles by falling back to a
+        # plaintext store.
+        libsecret
+        # libgssapi_krb5.so.2. Remote-SSH's kerberos native module loads it for
+        # authenticating proxies, and manylinux database drivers reach it
+        # through libpq. Already in the closure via curl's GSSAPI support.
+        libkrb5
+        # libfontconfig.so.1 / libfreetype.so.6, dlopened by the AWT font
+        # manager of any JDK installed outside Nix (SDKMAN, a Gradle or Maven
+        # toolchain download) the first time anything touches headless
+        # java.awt, and by prebuilt headless renderers generally. Pairs with
+        # fonts.packages above: the loader finds the library, fontconfig finds
+        # a face.
+        fontconfig
+        freetype
+        # Deliberately absent: the Chromium/Electron GUI stack (nss, nspr, atk,
+        # cups, libdrm, gtk3, mesa, the X11 client libraries). An "Electron"
+        # language server is a stdio process that needs none of it, while a real
+        # headless Chromium needs all of it — several hundred MiB of closure on
+        # every box for a tool most never run. That belongs in the consumer's
+        # own extraModules layer.
       ];
     };
 
@@ -200,6 +275,17 @@ in
     virtualisation.podman = {
       enable = true;
       dockerCompat = true;
+      # Put podman's socket at /run/docker.sock as well. dockerCompat only
+      # installs a `docker` → `podman` command alias, which does nothing for a
+      # LIBRARY: testcontainers (every language binding), the Docker SDKs and
+      # docker-compose implementations talk to the API socket directly, probing
+      # DOCKER_HOST then /var/run/docker.sock (a symlink to /run on NixOS) and
+      # failing with "Cannot connect to the Docker daemon" when neither answers.
+      # Podman still supports only one socket, so nixpkgs implements this as a
+      # symlink to the SYSTEM socket — meaning containers created through it are
+      # root-owned and are not the ones `docker ps` (which runs rootless, as the
+      # login user) lists. That split is inherent to podman, not to this line.
+      dockerSocket.enable = true;
     };
 
     # Re-assert the nameservers the image entrypoint captured from the
@@ -214,14 +300,19 @@ in
     # nameserver line, so nothing on the box can resolve the control plane.
     #
     # Two candidate mechanisms, not distinguished on a live box. Re-asserting
-    # AFTER systemd is up is correct under both, which is why it is done here
-    # rather than by restoring the seed earlier and leaning on stage-2:
-    #   1. stage-2 reads /etc/resolv.conf POST-pivot — the overlay. Once a
-    #      nameserver-less file lands in the persisted upper layer, every later
-    #      boot re-registers that empty file and the box is stuck for good.
+    # AFTER systemd is up is correct under both — early seed-restoration alone
+    # (which the entrypoint now also does, see mechanism 1) covers only the
+    # first:
+    #   1. stage-2 reads /etc/resolv.conf POST-pivot — the overlay. A
+    #      nameserver-less file in the persisted upper layer used to make every
+    #      later boot re-register that empty file. mkDevimage's entrypoint now
+    #      rm's the upper copy pre-overlay on EVERY boot (FIX-323), so this
+    #      mechanism self-heals at the source; this unit remains the fallback
+    #      for any boot where that rm's Fly-reseeds-every-boot assumption
+    #      fails.
     #   2. or stage-2's /run/resolvconf state doesn't survive to
     #      resolvconf.service — i.e. its own registration is what failed, which
-    #      restoring the seed earlier would not fix.
+    #      restoring the seed earlier does not fix; only this unit covers it.
     #
     # `resolvconf -a`, not an append: the record is REGISTERED, so later
     # regenerations keep it instead of dropping it again. Idempotent.
