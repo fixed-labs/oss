@@ -13,10 +13,11 @@
 # Boot model: Fly's init stays VM PID 1 and runs the image entrypoint
 # (mkDevimage's init script), which assembles the overlay root (image = RO
 # lower, volume upper at /persist), captures the machine's RIFT_* env to
-# /etc/devboxes/boot-env (systemd-in-a-child-pidns does NOT inherit machine
-# env), pivots, and execs this system's stage-2 under
-# `unshare --pid --fork --mount-proc` — systemd then runs as ns-PID-1
-# (getpid()==1 ⇒ real init mode).
+# /etc/devboxes/boot-env and its seeded nameservers to
+# /etc/devboxes/boot-resolv.conf (systemd-in-a-child-pidns inherits neither the
+# machine env nor a trustworthy /etc/resolv.conf — see devboxes-resolv below),
+# pivots, and execs this system's stage-2 under `unshare --pid --fork
+# --mount-proc` — systemd then runs as ns-PID-1 (getpid()==1 ⇒ real init mode).
 {
   config,
   lib,
@@ -201,10 +202,71 @@ in
       dockerCompat = true;
     };
 
+    # Re-assert the nameservers the image entrypoint captured from the
+    # platform-seeded /etc/resolv.conf (/etc/devboxes/boot-resolv.conf, written
+    # pre-pivot — see mkDevimage's initScript). This is the canonical
+    # explanation of FIX-321; the entrypoint and the test point back here.
+    #
+    # `boot.isContainer` turns on `networking.useHostResolvConf`, so stage-2 runs
+    # `resolvconf -m 1000 -a host </etc/resolv.conf` every boot, and that `host`
+    # record is what normally carries the platform's DNS into the generated file.
+    # On a broken box it is missing or empty and the generated file has NO
+    # nameserver line, so nothing on the box can resolve the control plane.
+    #
+    # Two candidate mechanisms, not distinguished on a live box. Re-asserting
+    # AFTER systemd is up is correct under both, which is why it is done here
+    # rather than by restoring the seed earlier and leaning on stage-2:
+    #   1. stage-2 reads /etc/resolv.conf POST-pivot — the overlay. Once a
+    #      nameserver-less file lands in the persisted upper layer, every later
+    #      boot re-registers that empty file and the box is stuck for good.
+    #   2. or stage-2's /run/resolvconf state doesn't survive to
+    #      resolvconf.service — i.e. its own registration is what failed, which
+    #      restoring the seed earlier would not fix.
+    #
+    # `resolvconf -a`, not an append: the record is REGISTERED, so later
+    # regenerations keep it instead of dropping it again. Idempotent.
+    #
+    # ConditionFileNotEmpty makes a boot that captured nothing a clean skip
+    # rather than a failed unit; a genuine `-a` failure is left to fail the unit,
+    # since swallowing it would put the silent outage right back. Scoped to
+    # systems where resolvconf owns /etc/resolv.conf — a client image that
+    # disables it manages that file some other way.
+    systemd.services.devboxes-resolv = lib.mkIf config.networking.resolvconf.enable {
+      description = "devboxes-resolv — re-assert the boot-captured nameservers";
+      # One pull-in and one ordering edge, each stated once: the agent declares
+      # Wants=, this declares Before=. No wantedBy — the unit exists for the
+      # agent, so it runs exactly when the agent does.
+      before = [ "devboxes-agent.service" ];
+      # Load-bearing, not mere sequencing: openresolv's libc subscriber exits 1
+      # on a signature mismatch for every command except `-u`, so running before
+      # resolvconf.service has normalized /etc/resolv.conf — on the first boot it
+      # is still the platform's raw seed — would fail this unit outright.
+      after = [ "resolvconf.service" ];
+      unitConfig.ConditionFileNotEmpty = "/etc/devboxes/boot-resolv.conf";
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        # Before= makes the agent wait on this, so bound the wait explicitly.
+        TimeoutStartSec = "20s";
+      };
+      # `-m 1100` and the NON-`lo` key are one property: openresolv's key_order
+      # globs `lo.*` to the head of the list before metrics are read, so an `lo.`
+      # key would outrank stage-2's host record (1000) and a client image's own
+      # `networking.nameservers` (metric 1). 1100 makes this a fallback that
+      # decides only when nothing better registered — the broken boot.
+      script = ''
+        ${lib.getExe config.networking.resolvconf.package} -a boot.devboxes -m 1100 \
+          < /etc/devboxes/boot-resolv.conf
+      '';
+    };
+
     systemd.services.devboxes-agent = {
       description = "devboxes-agent — control-plane liaison (wg0, WG-identity SSH, heartbeat, config pull)";
       wantedBy = [ "multi-user.target" ];
       after = [ "network.target" ];
+      # Pulls in the DNS re-assert, under the same condition that defines it.
+      # Wants, not Requires: a box that captured nothing must still get an agent.
+      wants = lib.mkIf config.networking.resolvconf.enable [ "devboxes-resolv.service" ];
       path = with pkgs; [
         wireguard-tools
         iproute2

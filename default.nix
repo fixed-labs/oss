@@ -18,8 +18,10 @@ let
   # the entrypoint runs the overlay-root recipe (image = RO lower, volume upper
   # at /persist; pivot_root; systemd as PID 1 of a child pid namespace — Fly's
   # init keeps VM PID 1), captures the machine's RIFT_* env to
-  # /etc/devboxes/boot-env before the handoff (systemd in the pidns never sees
-  # machine env), and forwards `fly machine stop`'s SIGTERM as SIGRTMIN+3 to
+  # /etc/devboxes/boot-env and its seeded nameservers to
+  # /etc/devboxes/boot-resolv.conf before the handoff (systemd in the pidns
+  # never sees machine env, and post-pivot /etc/resolv.conf can be a stale
+  # overlay copy), and forwards `fly machine stop`'s SIGTERM as SIGRTMIN+3 to
   # ns-systemd for a clean shutdown. TARGETS x86_64-linux (Fly's arch); on an
   # aarch64 host the system closure builds under binfmt emulation.
   #
@@ -96,6 +98,53 @@ let
         ++ extraModules;
       };
       toplevel = baseSystem.config.system.build.toplevel;
+
+      # Capture the DNS the platform seeded into the rootfs. Read pre-pivot
+      # because that is the last point it is trustworthy: everything after the
+      # pivot sees the overlay, whose /etc/resolv.conf may be a stale,
+      # nameserver-less file left on the volume by an earlier boot.
+      # devboxes-resolv re-asserts what this captures; the full FIX-321 story
+      # is in its comment in nix/devboxes-base/module.nix.
+      #
+      # Captured verbatim — a resolvconf record IS a resolv.conf, which is how
+      # stage-2 registers the host record (`resolvconf -a host </etc/resolv.conf`).
+      # The `nameserver` match at column 0 (what glibc and openresolv parse) is
+      # only the decision to overwrite: a boot that yields none keeps the
+      # last-known-good capture on the volume instead of clobbering it.
+      #
+      # Pure bash, so there is no `grep` to resolve from a PATH this script sets
+      # itself; `|| [ -n "$line" ]` catches a final line with no trailing newline.
+      #
+      # `-f` and `|| :` are both load-bearing: errexit is armed inside an `if`
+      # body, so a directory here would abort the entrypoint and a FIFO would
+      # hang it — before the pivot, i.e. a machine that never boots, which is
+      # worse than the unreachable box this fixes. Unlike the `> boot-env` write
+      # above, this path comes from Fly's init, not from this script. The `else`
+      # branch is what lets `fly logs` answer "did the capture fire?" — without
+      # it a boot where this does nothing looks like one that never needed it.
+      #
+      # Hoisted out of initScript (and exposed via the image's passthru) so the
+      # test can run it against fixture resolv.confs — the behaviour, not the
+      # spelling, is what must not regress.
+      captureBootResolv = ''
+        {
+          if [ -f /etc/resolv.conf ]; then
+            seed="" seed_ns=""
+            while IFS= read -r line || [ -n "$line" ]; do
+              seed="$seed$line"$'\n'
+              case $line in
+                nameserver[[:space:]]*) seed_ns=y ;;
+              esac
+            done < /etc/resolv.conf
+          fi
+          if [ -n "''${seed_ns:-}" ]; then
+            printf '%s' "$seed" > /newroot/etc/devboxes/boot-resolv.conf
+          else
+            echo "FIX-321: seeded /etc/resolv.conf carried no nameserver; devboxes-resolv will skip"
+          fi
+        } || :
+      '';
+
       initScript = targetPkgs.writeScript "devimage-init" ''
         #!${targetPkgs.bash}/bin/bash
         # Fly runs this as the machine's main process (under Fly's init,
@@ -138,6 +187,8 @@ let
             printf '%s=%s\n' "$v" "''${!v:-}"
           done
         } > /newroot/etc/devboxes/boot-env
+
+        ${captureBootResolv}
 
         # Carry the API filesystems over (NOT /proc — the pidns child gets
         # a namespace-correct one from --mount-proc).
@@ -228,6 +279,15 @@ let
         chmod -R u+w home/dev/${repoDirName}
         chmod 0700 home/dev
       '';
+      # The entrypoint and the capture snippet ride along so the test can run
+      # the snippet against fixture resolv.confs and check it is still spliced
+      # into the entrypoint. Both are eval-time reads — `.text` on a writeScript
+      # is an ordinary attribute, no build and no import-from-derivation — and
+      # the capture is the load-bearing half of FIX-321, whose loss makes
+      # devboxes-resolv a silent skip rather than a visible failure.
+      passthru = {
+        inherit initScript captureBootResolv;
+      };
       config = {
         Entrypoint = [ "${initScript}" ];
         # The devboxes-base marker. ADVISORY, not a security control: it's a
