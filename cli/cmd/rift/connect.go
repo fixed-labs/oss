@@ -267,8 +267,8 @@ func presenceLoop(ctx context.Context, c *client.Client, id string) {
 	}
 }
 
-// waitRunning starts a stopped box and polls (via the live long-poll) until it
-// reaches running (or a terminal failure).
+// waitRunning starts a box that is at rest and polls (via the live long-poll)
+// until it reaches running (or a terminal failure).
 func waitRunning(ctx context.Context, c *client.Client, id string) (*client.Workspace, error) {
 	gctx, cancel := ctxTimeout(ctx, 30*time.Second)
 	ws, cursor, err := c.Get(gctx, id, "")
@@ -276,14 +276,24 @@ func waitRunning(ctx context.Context, c *client.Client, id string) (*client.Work
 	if err != nil {
 		return nil, err
 	}
-	if ws.Status == "stopped" {
+	// Both rest states auto-start: a parked box is "suspended" on the warm tier
+	// and "stopped" on the cold one, and connect should un-park either.
+	if ws.Status == "stopped" || ws.Status == "suspended" {
 		rctx, rcancel := ctxTimeout(ctx, 30*time.Second)
 		err := c.Start(rctx, id)
 		rcancel()
 		if err != nil {
-			return nil, fmt.Errorf("start: %w", err)
+			// explainStart, NOT a bare wrap: this auto-start races exactly the
+			// producer `rift start`'s own 409 copy exists for (§4.6 row 6's
+			// corrective flips a rest-state row to `stopping` and mirrors
+			// nothing), and the park ladder makes that race common by widening
+			// this branch to `suspended`. A bare wrap renders the raw
+			// `HTTP 409: {"error":"ineligible-status",…}` body that §5 requires
+			// replaced — reaching the user through `connect`/`new` instead of
+			// `start`, but identically unreadable.
+			return nil, explainStart(err, id)
 		}
-		fmt.Printf("%s is stopped — starting…\n", id)
+		fmt.Printf("%s is %s — starting…\n", id, ws.Status)
 	}
 	deadline := time.Now().Add(5 * time.Minute)
 	for ws.Status != "running" {

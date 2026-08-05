@@ -12,7 +12,10 @@
 //
 //	(sessions outlive the connection; a reconnect re-attaches the same one)
 //
-// stop/start/rm/keepalive/resize  lifecycle
+// stop/start/restart/rm/keepalive/resize  lifecycle
+//
+// `restart` is a client-side compose (a cold stop, then a start), not a server
+// operation — see cmdRestart.
 //
 // The connect/new tunnel bring-up (userspace wireguard-go netstack + the SSH
 // bridge) is wired in internal/tunnel; the interactive session rides a Go SSH
@@ -93,6 +96,8 @@ func main() {
 		err = lifecycle(ctx, args, "stop")
 	case "start":
 		err = lifecycle(ctx, args, "start")
+	case "restart":
+		err = cmdRestart(ctx, args)
 	case "suspend":
 		err = fmt.Errorf("rift suspend was renamed — use: rift stop")
 	case "resume":
@@ -147,7 +152,10 @@ func usage() {
 		"  rift sizes\n"+
 		"  rift regions\n"+
 		"  rift connect [--new] [--session NAME] <id>\n"+
-		"  rift stop|start|rm <id>\n"+
+		"  rift stop [--cold] <id>\n"+
+		"  rift start <id>\n"+
+		"  rift restart <id>\n"+
+		"  rift rm <id>\n"+
 		"  rift resize <id> --size S\n"+
 		"  rift keepalive <id> [--for DURATION]\n"+
 		"  rift image ls|pin <sha>|unpin <sha>\n"+

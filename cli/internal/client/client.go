@@ -506,8 +506,25 @@ func (c *Client) simplePost(ctx context.Context, id, leaf string, body any) erro
 	return c.Do(ctx, http.MethodPost, "/api/workspaces/"+url.PathEscape(id)+"/"+leaf, body, nil)
 }
 
-func (c *Client) Stop(ctx context.Context, id string) error {
-	return c.simplePost(ctx, id, "stop", nil)
+// coldStopBody is the stop edges' optional cold-park override body, or nil for
+// a warm stop: the server reads cold iff the parsed body's `cold` is literally
+// true, and treats anything else — including no body at all — as
+// warm-when-eligible.
+//
+// Returning NIL for the warm case is load-bearing, not incidental: a warm stop
+// must post no body whatsoever, which is the wire shape every released rift
+// sends and what the server's absent-or-anything-else default is written
+// against. And it returns a FRESH map each call rather than sharing one
+// package-level value, which would be an aliasing hazard for no benefit.
+func coldStopBody(cold bool) any {
+	if !cold {
+		return nil
+	}
+	return map[string]bool{"cold": true}
+}
+
+func (c *Client) Stop(ctx context.Context, id string, cold bool) error {
+	return c.simplePost(ctx, id, "stop", coldStopBody(cold))
 }
 func (c *Client) Start(ctx context.Context, id string) error {
 	return c.simplePost(ctx, id, "start", nil)
@@ -546,8 +563,10 @@ func (c *Client) machinePost(ctx context.Context, id, leaf string, body any) err
 	return c.Do(ctx, http.MethodPost, "/api/rift/v1/"+url.PathEscape(id)+"/"+leaf, body, nil)
 }
 
-func (c *Client) MachineStop(ctx context.Context, id string) error {
-	return c.machinePost(ctx, id, "stop", nil)
+// MachineStop is Stop's in-VM twin. Both surfaces carry the same override so an
+// in-box stop and a laptop stop decide the same tier (W4).
+func (c *Client) MachineStop(ctx context.Context, id string, cold bool) error {
+	return c.machinePost(ctx, id, "stop", coldStopBody(cold))
 }
 
 func (c *Client) MachineResize(ctx context.Context, id, size string) error {

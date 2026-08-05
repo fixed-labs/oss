@@ -408,7 +408,7 @@ func TestLifecycleVerbsHitRightPaths(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 	})
 	ctx := context.Background()
-	_ = c.Stop(ctx, "ws-1")
+	_ = c.Stop(ctx, "ws-1", false)
 	_ = c.Start(ctx, "ws-1")
 	_ = c.Resize(ctx, "ws-1", "shared-4x")
 	_ = c.Keepalive(ctx, "ws-1", 60000)
@@ -439,7 +439,7 @@ func TestMachineVerbsHitAgentRoutes(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 	})
 	ctx := context.Background()
-	_ = c.MachineStop(ctx, "ws-1")
+	_ = c.MachineStop(ctx, "ws-1", false)
 	_ = c.MachineResize(ctx, "ws-1", "shared-4x")
 	_ = c.MachineKeepalive(ctx, "ws-1", 60000)
 	want := []string{

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/exec"
 	"strconv"
@@ -597,9 +598,12 @@ func explainCreate(err error, repo string) error {
 		Error         string   `json:"error"`
 		AvailableRefs []string `json:"available_refs"`
 		Candidates    []string `json:"candidates"`
+		Limit         int      `json:"limit"`
 	}
 	_ = json.Unmarshal([]byte(ae.Body), &body)
 	switch body.Error {
+	case "workspace-cap-reached":
+		return errors.New(workspaceCapMessage(body.Limit))
 	case "image-not-ready":
 		return fmt.Errorf("no ready image for %s yet — push to the default branch and let CI build it first (new never builds)", repo)
 	case "image-not-ready-for-ref":
@@ -635,6 +639,27 @@ func explainCreate(err error, repo string) error {
 	return err
 }
 
+// workspaceCapMessage renders the per-tenant workspace-cap 429 as prose that
+// says what to do. Nothing deletes a box automatically any more, so a tenant
+// that reaches the quota STAYS there — this refusal is where most users first
+// learn the quota exists, and printing the raw JSON leaves them with no move.
+//
+// It is keyed by its CALLER on the body's `error` string, never on the 429
+// status code: the same edge answers 429 `claim-rejected` for a recovered
+// claim token whose rejection reason is by construction indistinguishable —
+// cap, credit or repo access — so printing this text there would be a guess.
+//
+// The count comes from the body's `limit`; a body without one (an older
+// server) drops the numbers rather than inventing them.
+func workspaceCapMessage(limit int) string {
+	const remedy = "Remove one to make room:\n  rift ls\n  rift rm <id>"
+	if limit <= 0 {
+		return "You have reached your box limit, and boxes are not deleted automatically.\n" + remedy
+	}
+	n := strconv.Itoa(limit)
+	return "You have " + n + " of " + n + " boxes, and boxes are not deleted automatically.\n" + remedy
+}
+
 func cmdConnect(ctx context.Context, args []string) error {
 	var flags struct {
 		New     bool   `name:"new" help:"create a fresh session instead of attaching an existing one"`
@@ -665,41 +690,450 @@ func machineTarget(machineID string, args []string) (string, error) {
 	return "", fmt.Errorf("in-VM, rift may only act on this workspace (%s), not %s", machineID, args[0])
 }
 
+// inVMRefusal is the single wording for "this verb needs a developer login".
+// lifecycle() gates every non-`stop` verb on it (the machine token only opens
+// the self-service agent routes), and cmdRestart mirrors that gate — restart's
+// second half IS `start`, which the same token cannot issue.
+func inVMRefusal(verb string) error {
+	return fmt.Errorf("rift %s is not available in-VM — run it from your laptop (machine tokens may only stop/resize/keepalive their own workspace)", verb)
+}
+
 func lifecycle(ctx context.Context, args []string, verb string) error {
+	// `stop` is the only lifecycle verb with a flag: --cold forces the cold
+	// tier, discarding the RAM image so the next start is a full boot. Parsing
+	// start/rm against a struct that has NO Cold field is what makes
+	// `rift start --cold` an error rather than a silently ignored flag.
+	var id string
+	var cold bool
+	if verb == "stop" {
+		var flags struct {
+			Cold bool   `name:"cold" help:"park cold: discard the RAM image, so the next start is a full boot"`
+			ID   string `arg:"" optional:"" help:"workspace id to stop"`
+		}
+		if err := kongx.Parse(verb, &flags, args); err != nil {
+			return err
+		}
+		id, cold = flags.ID, flags.Cold
+	} else {
+		var flags struct {
+			ID string `arg:"" optional:"" help:"workspace id"`
+		}
+		if err := kongx.Parse(verb, &flags, args); err != nil {
+			return err
+		}
+		id = flags.ID
+	}
+	// machineTarget wants the raw positional args; kong exposes just the single
+	// optional id positional, so reconstruct the equivalent slice.
+	var posArgs []string
+	if id != "" {
+		posArgs = []string{id}
+	}
+
 	c, cfg, err := authedClient()
 	if err != nil {
 		return err
 	}
 	rctx, cancel := ctxTimeout(ctx, 30*time.Second)
 	defer cancel()
-	var id string
 	if cfg.MachineWorkspaceID != "" {
 		// In-VM: the machine token only opens the self-service agent routes.
 		if verb != "stop" {
-			return fmt.Errorf("rift %s is not available in-VM — run it from your laptop (machine tokens may only stop/resize/keepalive their own workspace)", verb)
+			return inVMRefusal(verb)
 		}
-		if id, err = machineTarget(cfg.MachineWorkspaceID, args); err != nil {
+		if id, err = machineTarget(cfg.MachineWorkspaceID, posArgs); err != nil {
 			return err
 		}
-		err = c.MachineStop(rctx, id)
+		err = c.MachineStop(rctx, id, cold)
 	} else {
-		if len(args) < 1 {
+		if id == "" {
+			if verb == "stop" {
+				return fmt.Errorf("usage: rift stop [--cold] <id>")
+			}
 			return fmt.Errorf("usage: rift %s <id>", verb)
 		}
-		id = args[0]
 		switch verb {
 		case "stop":
-			err = c.Stop(rctx, id)
+			err = c.Stop(rctx, id, cold)
 		case "start":
-			err = c.Start(rctx, id)
+			err = explainStart(c.Start(rctx, id), id)
 		case "rm":
 			err = c.Destroy(rctx, id)
 		}
 	}
 	if err == nil {
-		fmt.Printf("%s: %s\n", id, verb)
+		if cold {
+			fmt.Printf("%s: stop (cold)\n", id)
+		} else {
+			fmt.Printf("%s: %s\n", id, verb)
+		}
 	}
 	return err
+}
+
+// explainStart DELIBERATELY does not wrap with %w. Wrapping would make the
+// underlying *client.APIError reachable via errors.As — but main renders a
+// returned error verbatim, so it would also append ": HTTP 409: {…}" to every
+// line below, which is precisely the raw body §4.3 requires these messages to
+// replace. The unwrapping is the point, not an oversight.
+//
+// explainStart maps `rift start`'s 409 onto copy a user can act on, and is
+// keyed on the body's stable `error` code rather than on the status.
+//
+// The one that matters is `ineligible-status`: a start can race the un-park
+// callback's corrective, which flips a rest-state row to `stopping` and
+// deliberately mirrors NOTHING — so `rift ls` still shows the box at rest while
+// the module answers `ineligible-status`. Copy along the lines of "the box is
+// not stopped" would read as a lie against the list the user just looked at;
+// the truth is that the box is mid-transition and the same command works a few
+// seconds later. `running` and the three teardown statuses get their own wording
+// so the mid-transition line is never printed over a box that is not in one.
+// Everything else — including the pre-ready statuses (`provisioning`,
+// `provisioned`, `starting`) and `resizing` — takes the mid-transition line.
+// That is exact for a park/resume race and approximate for a box coming up for
+// the first time, where the box is mid-SOMETHING and the retry advice holds
+// either way; sharpening it would mean naming five more statuses in copy whose
+// whole point is to stop enumerating them at the user.
+func explainStart(err error, id string) error {
+	code, detail, ok := lifecycleConflict(err)
+	if !ok || code != "ineligible-status" {
+		// Not a 409, or one of the other lifecycle rejections the un-park can
+		// answer with (no-healthy-relay, superseded) — those are real answers
+		// about capacity, not a race, and must not be dressed as one.
+		return err
+	}
+	// The edge's detail is "workspace status: <status>"; the status is worth
+	// showing, but its absence must not cost the guidance.
+	status := strings.TrimSpace(strings.TrimPrefix(detail, "workspace status:"))
+	switch status {
+	case "running":
+		return fmt.Errorf("%s is already running", id)
+	case "ending", "destroying", "done":
+		return fmt.Errorf("%s is %s — it is being torn down and cannot be started", id, status)
+	}
+	if status == "" || status == detail {
+		return fmt.Errorf("%s is mid-transition — a park or resume is still settling. Retry in a few seconds: rift start %s", id, id)
+	}
+	return fmt.Errorf("%s is mid-transition (the server sees %s) — a park or resume is still settling. Retry in a few seconds: rift start %s", id, status, id)
+}
+
+// --- restart -------------------------------------------------------------
+//
+// `rift restart` is a CLIENT-SIDE COMPOSE — a cold stop, then a start — not a
+// server operation. A restart that was a bare `start` would resume the very RAM
+// snapshot a restart exists to discard (the provider invalidates a snapshot
+// only when the machine is *stopped*), so the cold stop is the load-bearing
+// half; the server has no `restart` verb and gains none.
+//
+// The compose reads the box's status once and dispatches on it. The dispatch
+// table is total over every status a row can hold: `running`/`suspended`/
+// `stopped` dispatch immediately, the four park transients and the three
+// pre-ready states poll to a settled status first, and the three teardown
+// states error — a teardown wins over a revival.
+
+// restartTerminalStates abort EVERY poll phase, not just the pre-dispatch
+// ones: a concurrent `rift rm` can take a box out of a park transient, out of
+// pre-ready, or out of `stopped` while this compose waits to start it, and a
+// poll set that does not name these three burns its whole deadline waiting for
+// a settle that will never come.
+var restartTerminalStates = map[string]bool{"ending": true, "destroying": true, "done": true}
+
+// restartSettledStates are the statuses the two pre-dispatch phases wait for —
+// and exactly the statuses the table dispatches on. The rest-state members are
+// what keeps the pre-ready phase honest: the bring-up-deadline park takes a box
+// that never came up to `stopping` → `stopped`, so a `running`-or-terminal poll
+// set would hang on precisely that cohort.
+var restartSettledStates = map[string]bool{"running": true, "stopped": true, "suspended": true}
+
+// restartWaitStates are the seven statuses the compose WAITS OUT instead of
+// dispatching on. Two rationales, one behavior — and one map, because nothing
+// reads them apart:
+//   - the four park/realization transients (stopping, suspending, resuming,
+//     resizing) settle on their own, so dispatching now buys only a 409;
+//   - the three pre-ready states (provisioning, provisioned, starting) are a box
+//     still coming up, and there is no partly-booted state to restart FROM.
+//
+// Either way the compose polls to learn where the box lands, then dispatches on
+// that.
+var restartWaitStates = map[string]bool{
+	"stopping": true, "suspending": true, "resuming": true, "resizing": true,
+	"provisioning": true, "provisioned": true, "starting": true,
+}
+
+// restartPhaseDeadline bounds each of the four poll phases independently, and
+// restartPollHold is one cursor long-poll iteration (waitRunning's shape).
+//
+// These are `var` rather than `const` so a test can shorten them to
+// milliseconds. That is not a cosmetic choice: as constants, the deadline
+// give-up branch is unreachable from any test — no case can wait five minutes —
+// and the requirement §4.3 states by name (a give-up in the stop phase must
+// print `rift stop --cold <id>`, NEVER `rift start <id>`, which 409s by the same
+// guard and sends the user in a circle) would be pinned only on the 409-twice
+// path, while the deadline is the likelier give-up in production.
+var (
+	restartPhaseDeadline = 5 * time.Minute
+	restartPollHold      = 40 * time.Second
+)
+
+const (
+	// restartLegAttempts is one dispatch plus ONE re-entry after a 409. Each
+	// leg has its own racing producer — an automatic park can flip
+	// `running → stopping` under the stop, and the un-park corrective can flip
+	// a rest-state row to `stopping` under the start — so each leg carries its
+	// own budget. On the second 409 the compose gives up printing the box's
+	// actual status, never the raw transport error.
+	restartLegAttempts = 2
+)
+
+func cmdRestart(ctx context.Context, args []string) error {
+	var flags struct {
+		ID string `arg:"" optional:"" help:"workspace id to restart"`
+	}
+	if err := kongx.Parse("restart", &flags, args); err != nil {
+		return err
+	}
+	c, cfg, err := authedClient()
+	if err != nil {
+		return err
+	}
+	// Refused in-VM, mirroring lifecycle()'s gate: restart's second half is
+	// `start`, which a machine token may not issue. A box that cold-stopped
+	// itself is restarted from a laptop.
+	if cfg.MachineWorkspaceID != "" {
+		return inVMRefusal("restart")
+	}
+	if flags.ID == "" {
+		return fmt.Errorf("usage: rift restart <id>")
+	}
+	return restart(ctx, c, flags.ID)
+}
+
+// restart runs the compose. Each iteration resolves the current status to one
+// the table dispatches on (polling when it is a transient or pre-ready state),
+// then issues one leg. The loop is bounded by the two per-leg 409 budgets: every
+// iteration either spends one of them or completes a leg.
+func restart(ctx context.Context, c *client.Client, id string) error {
+	status, err := restartStatus(ctx, c, id)
+	if err != nil {
+		return err
+	}
+	stopLeft, startLeft := restartLegAttempts, restartLegAttempts
+	for {
+		// Phase 1 — resolve to a dispatchable status.
+		switch {
+		case restartTerminalStates[status]:
+			return restartTornDown(id, status)
+		case restartWaitStates[status]:
+			// Nothing has been dispatched yet, so the give-up line is the whole
+			// command: re-running it re-enters the table from wherever the box
+			// then is.
+			if status, err = restartPoll(ctx, c, id, restartSettledStates, "a settled state", "rift restart "+id); err != nil {
+				return err
+			}
+		case restartSettledStates[status]:
+			// Dispatchable as-is.
+		default:
+			return restartNoMove(id, status)
+		}
+
+		// Phase 2 — dispatch one leg.
+		switch status {
+		case "running", "suspended":
+			// From `suspended` this is the cold-DOWN: the wedged snapshot can
+			// only be discarded by a stop, so an already-parked box still takes
+			// this leg.
+			rctx, cancel := ctxTimeout(ctx, 30*time.Second)
+			err = c.Stop(rctx, id, true)
+			cancel()
+			if isIneligibleStatus(err) {
+				// An automatic park won the race between the status read and
+				// this call, and no park is accepted from a park transient.
+				stopLeft--
+				if stopLeft <= 0 {
+					return restartConflict(ctx, c, id, "cold stop", "rift stop --cold "+id)
+				}
+				if status, err = restartStatus(ctx, c, id); err != nil {
+					return err
+				}
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			fmt.Printf("%s: stopping (cold — the RAM image is discarded)…\n", id)
+			// The target is `stopped` EXACTLY, never "a rest state":
+			// `suspended` is one, and starting from it would resume the very
+			// snapshot this restart is discarding. The give-up line is
+			// `rift stop --cold`, NOT `rift start` — the un-park guard admits
+			// only rest states, so a start issued into a park transient 409s.
+			if status, err = restartPoll(ctx, c, id, map[string]bool{"stopped": true}, "stopped", "rift stop --cold "+id); err != nil {
+				return err
+			}
+		case "stopped":
+			rctx, cancel := ctxTimeout(ctx, 30*time.Second)
+			err = c.Start(rctx, id)
+			cancel()
+			if isIneligibleStatus(err) {
+				// The un-park corrective flips a rest-state row to `stopping`
+				// while mirroring nothing, so the status read above (and
+				// `rift ls`) can still say `stopped` while the module refuses
+				// the start. It settles within one provider round-trip, after
+				// which the same start succeeds.
+				startLeft--
+				if startLeft <= 0 {
+					return restartConflict(ctx, c, id, "start", "rift start "+id)
+				}
+				if status, err = restartStatus(ctx, c, id); err != nil {
+					return err
+				}
+				continue
+			}
+			if err != nil {
+				// Everything else — 402 out of credit, 404, transport — is the
+				// server's answer and is surfaced as-is. Note the box is
+				// already cold-parked by the time a credit refusal arrives:
+				// stopping is what stops the spend, so the stop leg is never
+				// credit-gated.
+				return err
+			}
+			fmt.Printf("%s: starting…\n", id)
+			if _, err = restartPoll(ctx, c, id, map[string]bool{"running": true}, "running", "rift start "+id); err != nil {
+				return err
+			}
+			fmt.Printf("%s: restarted\n", id)
+			return nil
+		default:
+			// Unreachable: phase 1 leaves only restartSettledStates, which is
+			// exactly the two cases above. Here so a later edit that widens one
+			// set without the other errors instead of spinning.
+			return restartNoMove(id, status)
+		}
+	}
+}
+
+// restartStatus reads the box's status (a snapshot read, no cursor).
+func restartStatus(ctx context.Context, c *client.Client, id string) (string, error) {
+	rctx, cancel := ctxTimeout(ctx, 30*time.Second)
+	defer cancel()
+	ws, _, err := c.Get(rctx, id, "")
+	if err != nil {
+		return "", err
+	}
+	return ws.Status, nil
+}
+
+// restartPoll drives one poll phase to a definite outcome: it returns the
+// status once it is in want, aborts on a teardown, and on the phase deadline
+// gives up printing the box's ACTUAL status plus the command that retries the
+// phase that failed (retryCmd — which is why the stop phase passes
+// `rift stop --cold`, never `rift start`).
+//
+// It copies waitRunning's cursor long-poll shape — a snapshot read for the
+// cursor, then a hold per iteration — but NOT its exit set, which is not total
+// for these phases.
+func restartPoll(ctx context.Context, c *client.Client, id string, want map[string]bool, wantDesc, retryCmd string) (string, error) {
+	gctx, cancel := ctxTimeout(ctx, 30*time.Second)
+	ws, cursor, err := c.Get(gctx, id, "")
+	cancel()
+	if err != nil {
+		return "", err
+	}
+	status := ws.Status
+	deadline := time.Now().Add(restartPhaseDeadline)
+	for {
+		if want[status] {
+			return status, nil
+		}
+		if restartTerminalStates[status] {
+			return "", restartTornDown(id, status)
+		}
+		if time.Now().After(deadline) {
+			return "", fmt.Errorf("workspace %s did not reach %s within %s — it is %s. Retry with: %s",
+				id, wantDesc, restartPhaseDeadline, status, retryCmd)
+		}
+		pctx, pcancel := ctxTimeout(ctx, restartPollHold)
+		next, ncursor, err := c.Get(pctx, id, cursor)
+		pcancel()
+		if err != nil {
+			return "", err
+		}
+		// A hold that timed out with no change returns an empty workspace and
+		// the same cursor — re-poll, don't overwrite the status with a zero.
+		if next.WorkspaceID != "" {
+			status = next.Status
+		}
+		cursor = ncursor
+	}
+}
+
+// restartConflict renders the give-up after a dispatched leg was refused
+// twice. It re-reads the box so the user sees its ACTUAL status and the command
+// that finishes the job, rather than the raw `HTTP 409: {…}` body.
+//
+// The status is labelled as what the SERVER now reports, not as what `rift ls`
+// shows — those are different reads, and in this exact race they disagree. The
+// re-read below is GET /api/workspaces/{id}, i.e. the $$workspaces row; `rift ls`
+// renders the $$user-workspaces mirror. Row 6's corrective flips the row to
+// `stopping` while mirroring nothing, so the row says `stopping` while the list
+// still says `stopped`. Printing the row under an "rift ls shows" label would
+// send the user to look at something that says otherwise.
+//
+// A FAILED re-read is its own branch and carries the error. Folding it into the
+// "still settling" line asserts the one thing this function cannot know when the
+// read is what broke — and it is wrong for every interesting cause: a 404 from a
+// concurrent `rift rm`, a 401 from an expired token, and a dropped connection all
+// render as "retry in a few seconds", advice that cannot succeed.
+func restartConflict(ctx context.Context, c *client.Client, id, leg, retryCmd string) error {
+	status, err := restartStatus(ctx, c, id)
+	switch {
+	case err != nil:
+		return fmt.Errorf("workspace %s refused the %s twice, and re-reading its status failed: %w — once that is resolved, finish with: %s", id, leg, err, retryCmd)
+	case status == "":
+		// Reachable only from a degenerate server: a 200 whose body carries no
+		// workspace object decodes to the zero value, and restartStatus cannot
+		// tell that from a real empty status. Without this branch that case falls
+		// to the default and renders "(the server now reports: )" with nothing
+		// after the colon. Pinned by TestRestartConflictCopyEdgeCases.
+		return fmt.Errorf("workspace %s refused the %s twice — it is still settling a park or resume. Retry in a few seconds with: %s", id, leg, retryCmd)
+	default:
+		return fmt.Errorf("workspace %s refused the %s twice — it is still settling a park or resume (the server now reports: %s). Retry in a few seconds with: %s", id, leg, status, retryCmd)
+	}
+}
+
+// restartNoMove is the dispatch table's total-ness backstop, shared by both
+// switches so their wording cannot drift apart.
+func restartNoMove(id, status string) error {
+	return fmt.Errorf("workspace %s is %s — rift restart has no move from that state; check `rift ls`", id, status)
+}
+
+func restartTornDown(id, status string) error {
+	return fmt.Errorf("workspace %s is %s — it is being torn down, so it cannot be restarted", id, status)
+}
+
+// lifecycleConflict decodes a lifecycle 409 — the shared
+// `{"error":<stable code>,"detail":<prose>}` body every lifecycle op answers a
+// dropped op with. ok is false for anything that is not a 409.
+func lifecycleConflict(err error) (code, detail string, ok bool) {
+	var ae *client.APIError
+	if err == nil || !asAPIError(err, &ae) || ae.Status != http.StatusConflict {
+		return "", "", false
+	}
+	var body struct {
+		Error  string `json:"error"`
+		Detail string `json:"detail"`
+	}
+	_ = json.Unmarshal([]byte(ae.Body), &body)
+	return body.Error, body.Detail, true
+}
+
+// isIneligibleStatus reports whether err is the ONE 409 the compose can lose a
+// race to: the row was mid-transition when the call landed. The other
+// rejections a lifecycle op can answer with — no-healthy-relay, superseded,
+// not-idle, size-unchanged — are answers about the world, not races, so they
+// surface unretried.
+func isIneligibleStatus(err error) bool {
+	code, _, ok := lifecycleConflict(err)
+	return ok && code == "ineligible-status"
 }
 
 func cmdResize(ctx context.Context, args []string) error {

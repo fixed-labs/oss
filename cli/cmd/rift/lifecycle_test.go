@@ -79,6 +79,61 @@ func TestRetiredVerbsHintAndHitNoRoute(t *testing.T) {
 	}
 }
 
+// TestRestartVerbIsReachableFromTheCLI pins the one thing 800-odd lines of
+// restart_test.go cannot: that `restart` is WIRED INTO main()'s dispatch switch.
+// Every other test in this package calls restart()/cmdRestart() as a function,
+// so deleting `case "restart":` leaves the whole suite green while
+// `rift restart <id>` becomes `unknown command`, exit 2 — a total outage of this
+// PR's headline verb, shipping green.
+//
+// It asserts through the IN-VM REFUSAL rather than a happy path, because that is
+// the one restart outcome reachable with no control plane at all: cmdRestart
+// checks MachineWorkspaceID before it builds a client. The recording server then
+// proves the same thing it proves for the retired verbs above — the verb was
+// dispatched and refused, not quietly routed somewhere else.
+func TestRestartVerbIsReachableFromTheCLI(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	}))
+	defer srv.Close()
+
+	cmd := exec.Command(os.Args[0], "restart", "ws-1")
+	cmd.Env = []string{
+		"RIFT_TEST_RUN_MAIN=1",
+		"RIFT_LOG_FILE=" + filepath.Join(t.TempDir(), "rift.log"),
+		"XDG_CONFIG_HOME=" + t.TempDir(),
+		"HOME=" + t.TempDir(),
+		"RIFT_WORKSPACE_ID=ws-1",
+		"RIFT_API_URL=" + srv.URL,
+		"RIFT_TOKEN=machine-tok",
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if err == nil {
+		t.Fatalf("rift restart in-VM: expected a non-zero exit, got success (stderr %q)", stderr.String())
+	}
+	if _, ok := err.(*exec.ExitError); !ok {
+		t.Fatalf("rift restart: expected an ExitError, got %v", err)
+	}
+	got := stderr.String()
+	// `unknown command` is the exact symptom of the missing switch arm, and it is
+	// asserted against by name so a future copy change to the refusal cannot let
+	// that failure mode pass as "well, some error occurred".
+	if strings.Contains(got, "unknown command") {
+		t.Fatalf("rift restart is not wired into main()'s dispatch switch: stderr = %q", got)
+	}
+	if !strings.Contains(got, "not available in-VM") {
+		t.Fatalf("rift restart in-VM: stderr = %q, want the in-VM refusal", got)
+	}
+	if hits != 0 {
+		t.Fatalf("rift restart in-VM must hit NO HTTP route (it refuses before building a client), but the server recorded %d request(s)", hits)
+	}
+}
+
 // machineEnv puts lifecycle() in machine (in-VM) mode: XDG_CONFIG_HOME/HOME
 // point at an empty temp dir so config.Load() finds no saved login, and
 // RIFT_WORKSPACE_ID flags machine mode. The caller sets RIFT_API_URL +
