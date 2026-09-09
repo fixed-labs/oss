@@ -192,7 +192,11 @@ func TestErrorStatusSurfaces(t *testing.T) {
 // forever. Reuse-then-drop keeps the steady-state cost and fixes the resume.
 func TestCloseIdleConnectionsForcesAFreshDial(t *testing.T) {
 	var newConns atomic.Int64
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// UNSTARTED, so ConnState is installed BEFORE any connection can be accepted.
+	// Assigning srv.Config.ConnState after httptest.NewServer has already begun
+	// serving races net/http.(*conn).setState — a real -race failure, not a
+	// theoretical one.
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 	}))
 	srv.Config.ConnState = func(_ net.Conn, s http.ConnState) {
@@ -200,6 +204,7 @@ func TestCloseIdleConnectionsForcesAFreshDial(t *testing.T) {
 			newConns.Add(1)
 		}
 	}
+	srv.Start()
 	t.Cleanup(srv.Close)
 	c := New(srv.URL, "ws-1", "tok")
 	ctx := context.Background()

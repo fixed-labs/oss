@@ -59,7 +59,33 @@ func New(baseURL, workspaceID, token string) *Client {
 	// http.DefaultTransport and would evict connections belonging to any other
 	// user of it. Scoping it is what makes the resume-time drop safe to do
 	// unconditionally.
+	//
+	// The clone also keeps ForceAttemptHTTP2, and the control plane speaks h2, so
+	// EVERY call this client makes — the config long-poll, the heartbeat POST, the
+	// sessions POST — multiplexes onto ONE *http2ClientConn. That is
+	// what makes CloseIdleConnections insufficient on its own: it reaches
+	// http2ClientConn.closeIfIdle, which returns early while len(cc.streams) > 0,
+	// and the long-poll holds a stream essentially always. So at resume time the
+	// drop is a NO-OP, and nothing else evicts that ClientConn either — it is
+	// never idle (so IdleConnTimeout has nothing to reap) and the peer's FIN was
+	// never observed (see CloseIdleConnections below). Every LATER request, freshly issued, is therefore handed
+	// the same corpse and dies at the 35s Client.Timeout — permanently, until the
+	// process is restarted. Measured on staging after a 90-minute park: the thaw
+	// heartbeat, then a config pull a minute later, then another heartbeat, each
+	// failing at exactly 35s, while curl against the same host succeeded
+	// throughout.
+	//
+	// The health-check pings are what let the transport notice. With no frame
+	// received on the connection for SendPingTimeout it sends a PING, and if no
+	// response arrives within PingTimeout it closes the ClientConn — failing every
+	// stream on it with "http2: client connection lost" and taking it out of the
+	// pool, so the next request dials fresh. At 5s/5s the dead connection is
+	// detected in ~10s worst case, instead of never.
 	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.HTTP2 = &http.HTTP2Config{
+		SendPingTimeout: 5 * time.Second,
+		PingTimeout:     5 * time.Second,
+	}
 	return &Client{
 		BaseURL:     baseURL,
 		WorkspaceID: workspaceID,

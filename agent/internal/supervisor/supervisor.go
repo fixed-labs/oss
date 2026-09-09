@@ -4,7 +4,9 @@
 //   - pull-reconcile: long-poll GET agent-config with a cursor; reconcile
 //     wg0's peer set on EVERY successful pull (steady-state self-heal);
 //     jittered exponential backoff on errors; a poll-rate
-//     floor so a server that answers instantly can't busy-loop the agent.
+//     floor so a server that answers instantly can't busy-loop the agent. It is
+//     the SOLE reconciler, and each poll runs under a per-request context the
+//     warm-resume hook cancels to force an immediate re-poll (thaw.go).
 //   - heartbeat: every 30s, reporting the box-observed interactive liveness
 //     (open SSH sessions + held/attached PTYs; drives idle-tiering) AND the
 //     machine's identity (s.Identity). A persistent session that is currently
@@ -26,6 +28,7 @@ import (
 	"errors"
 	"log/slog"
 	"math/rand"
+	"sync"
 	"time"
 
 	"github.com/fixed-labs/oss/agent/internal/api"
@@ -114,6 +117,25 @@ type Supervisor struct {
 	// the figure GATES the thaw rather than merely being logged, the seam has to
 	// exist or the gate is untestable.
 	divergence func(since time.Time) time.Duration
+
+	// pullMu is the resume interlock between the two goroutines. It is held by
+	// pullLoop while it mints the per-request context for a poll (i.e. it must be
+	// ACQUIRED before any poll is issued), and by thaw across cancel +
+	// CloseIdleConnections. That is what orders the two — see
+	// cancelPollAndDropPool for why hoping for the right order is not enough.
+	//
+	// It guards pullCancel, and nothing else: it is NOT a lock over the reconcile
+	// or over any peer state.
+	pullMu sync.Mutex
+	// pullDone is closed when the in-flight poll's PullConfig has RETURNED (nil
+	// before the first poll). Cancelling is not the same as finished — see
+	// cancelPollAndDropPool — so the drop waits on this, not on cancel().
+	pullDone chan struct{}
+	// pullCancel cancels the config poll currently in flight (nil before the
+	// first one). It is the handle thaw pulls to wake pullLoop; see pullOnce.
+	// Calling it after the poll has already returned is a no-op, which is what
+	// makes thaw safe to fire whatever the loop happens to be doing.
+	pullCancel context.CancelFunc
 
 	// Tunables (defaulted by Run; overridden in tests).
 	HeartbeatInterval time.Duration
@@ -438,17 +460,136 @@ func (s *Supervisor) pauseAbsorb(ctx context.Context, lastAbsorbAt time.Time) bo
 	}
 }
 
+// thawFirstRetry is the first backoff the WARM-RESUME beat uses, before handing
+// back to the ordinary BackoffMin ladder.
+//
+// The ordinary ladder is sized for a control plane under load: wait 2s, then 4s,
+// then 8s, so a fleet of agents does not pile onto a recovering API. A resume's
+// first heartbeat failure is a different animal — the socket it went down was
+// killed while the box was frozen, and the retry is a fresh dial. There is no
+// server to be gentle with, and the beat is the single write that flips the row
+// to `running`, so every millisecond it is late is a millisecond attach 409s.
+// So the first retry waits ~200ms instead of BackoffMin (2s): a resume whose
+// first beat dies on a stale socket becomes attachable roughly 1.8s sooner. It
+// is not a saving of 200ms — 200ms is the new wait. A beat whose first attempt
+// SUCCEEDS pays nothing at all; on the failing path the shorter first rung may
+// fit one extra attempt inside the HeartbeatInterval deadline. If that retry
+// also fails, the failure is plausibly the server's after all and the 2s ladder
+// takes over unchanged.
+const thawFirstRetry = 200 * time.Millisecond
+
+// pollReturnWait bounds how long the resume path waits for a cancelled poll to
+// actually return before dropping the pool anyway. Overrunning it costs a no-op
+// drop — the pre-fix behaviour — not a hang, and the beat that makes the box
+// attachable must not queue behind a poll that will not come back.
+const pollReturnWait = 250 * time.Millisecond
+
+// streamCleanupSettle gives net/http's cleanupWriteRequest a moment to land. It
+// runs on the request's own goroutine AFTER RoundTrip returns, and it is what
+// calls forgetStreamID — so without this pause closeIfIdle still sees a
+// connection carrying a stream and declines to close it. Measured: 0/5 evictions
+// without it, 5/5 with it. See cancelPollAndDropPool.
+const streamCleanupSettle = 25 * time.Millisecond
+
 // beat sends one heartbeat (retrying a transient failure, §4.1 Lever 1) and
-// fires the piggybacked session/peer refreshes. It is the loop body factored out
-// so the thaw hook can force one out of cadence — the retry lives HERE so the
-// warm-resume thaw-forced beat (thaw() calls s.beat) is covered for free.
+// fires the piggybacked session/peer refreshes. It is the steady-cadence loop
+// body factored out; the warm-resume variant is thawBeat.
 func (s *Supervisor) beat(ctx context.Context) {
-	s.sendHeartbeat(ctx)
+	s.sendHeartbeat(ctx, s.BackoffMin)
 	// SyncSessions piggybacks the heartbeat cadence (the Manager also fires it on
 	// attach/detach). A snapshot of all live sessions, no terminal bytes. Fires
 	// once, after the retry loop settles.
 	if s.SyncSessions != nil {
 		s.SyncSessions()
+	}
+}
+
+// thawBeat is beat's warm-resume variant. Two deliberate differences from the
+// cadence beat, both about the resume critical path:
+//
+//   - the first retry is thawFirstRetry rather than BackoffMin (see there);
+//   - the session sync is fired asynchronously rather than inline.
+//
+// The retry itself stays INSIDE the beat — a forced beat that gave up on its
+// first transient failure would leave the box unattachable for a whole
+// HeartbeatInterval, which is the entire cost thaw exists to avoid.
+func (s *Supervisor) thawBeat(ctx context.Context) {
+	s.sendHeartbeat(ctx, thawFirstRetry)
+	s.syncSessionsAsync()
+}
+
+// syncSessionsAsync fires the session snapshot on its own goroutine.
+//
+// SyncSessions contributes nothing to readiness and nothing to the peer set: it
+// is a projection of box-side session metadata that the control plane self-heals
+// on the next 30s beat anyway. In production it is sessions.Manager.SyncNow — a
+// POST on its own 15s budget — so running it inline on the resume path put up to
+// 15s of a measured 85s thaw in front of work that actually mattered. The
+// Manager already fires the same call from a goroutine on attach and on detach,
+// so this is the established shape rather than a new one.
+//
+// This POST does hold an h2 stream while it is in flight, and a held stream is
+// what makes CloseIdleConnections a no-op — so a sync overlapping a LATER
+// resume's pool drop would blunt that drop. It is deliberately not gated for
+// that, because a gate here could not deliver the property: sessions.Manager
+// spawns the very same SyncNow from touchAttach and touchDetach, on attach and
+// detach — i.e. exactly around a connect — so a stream can be held across a drop
+// through a door the supervisor does not own. The drop is best-effort by
+// construction; what actually guarantees a dead connection goes away is the
+// HTTP/2 health-check ping config on the transport (see api.New). Adding a gate
+// that narrows one of several doors would buy the appearance of an invariant
+// rather than the invariant.
+//
+// The goroutine carries a recover() for the same crash-containment reason
+// heartbeatLoop does: a panic in a side goroutine the agent spawns must not take
+// the process — and every persistent session — down with it.
+func (s *Supervisor) syncSessionsAsync() {
+	sync := s.SyncSessions
+	if sync == nil {
+		return
+	}
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				s.Log.Error("thaw session sync panic recovered", "panic", r)
+			}
+		}()
+		start := time.Now()
+		sync()
+		// sync_ms lives on its own line rather than on thaw's, because after this
+		// restructure it is no longer a component of the thaw's duration — that is
+		// the point of firing it here.
+		s.Log.Info("thaw session sync complete", "sync_ms", time.Since(start).Milliseconds())
+	}()
+}
+
+// jittered spreads a backoff so a fleet of agents recovering from the same API
+// blip does not thundering-herd it. Returns the TOTAL wait (backoff + jitter),
+// because every caller needs the same figure twice — once to log or to test
+// against a deadline, once to sleep — and computing it twice would make the
+// logged number a lie.
+//
+// The guard is not decorative: rand.Int63n panics on a non-positive bound, so a
+// backoff configured below 2ns would take the process down from inside the error
+// path. Nothing configures one today; this makes that unable to matter.
+func jittered(backoff time.Duration) time.Duration {
+	half := int64(backoff) / 2
+	if half <= 0 {
+		return backoff
+	}
+	return backoff + time.Duration(rand.Int63n(half))
+}
+
+// sleepCtx waits for d, reporting false if the context ended first (in which
+// case the caller must unwind rather than continue).
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
 	}
 }
 
@@ -461,14 +602,18 @@ func (s *Supervisor) beat(ctx context.Context) {
 // when the next backoff sleep would cross that deadline, logging a DISTINCT
 // "heartbeat retries exhausted" line for recurrence alerting. A ctx cancellation
 // during a backoff sleep returns promptly via the select on ctx.Done().
-func (s *Supervisor) sendHeartbeat(ctx context.Context) {
+//
+// firstBackoff is the FIRST retry's wait; every retry after it climbs the
+// ordinary BackoffMin→BackoffMax ladder. The cadence beat passes BackoffMin, so
+// its behaviour is bit-for-bit what it was; thaw passes thawFirstRetry.
+func (s *Supervisor) sendHeartbeat(ctx context.Context, firstBackoff time.Duration) {
 	// interactive_live folds session liveness (attached clients, or a held PTY
 	// within the keep-warm window) — the box-observed signal driving idle-suspend.
 	// ssh_sessions rides along as the raw authorized-connection count (the api
 	// re-folds it defensively). Every beat also re-asserts s.Identity so the
 	// cluster can flip the row to running (provisioned/starting) idempotently.
 	deadline := s.now().Add(s.HeartbeatInterval)
-	backoff := s.BackoffMin
+	backoff := firstBackoff
 	for {
 		ssh := s.SSHSessions()
 		err := s.API.Heartbeat(ctx, s.interactiveLive(), ssh, s.Identity)
@@ -476,68 +621,217 @@ func (s *Supervisor) sendHeartbeat(ctx context.Context) {
 			return
 		}
 		s.Log.Warn("heartbeat failed", "err", err)
-		// Jitter the re-arm so a fleet of agents doesn't thundering-herd a
-		// recovering API (same idiom as pullLoop).
-		jitter := time.Duration(rand.Int63n(int64(backoff) / 2))
+		wait := jittered(backoff)
 		// Stop before a sleep that would cross the deadline captured at entry —
 		// a retry must not overlap the next scheduled beat. The loop's work-END
 		// rearm then waits its own fresh interval (INV-5), and INV-R heals the
 		// box on the next successful beat.
-		if s.now().Add(backoff + jitter).After(deadline) {
+		if s.now().Add(wait).After(deadline) {
 			s.Log.Warn("heartbeat retries exhausted", "err", err)
 			return
 		}
-		select {
-		case <-ctx.Done():
+		if !sleepCtx(ctx, wait) {
 			return
-		case <-time.After(backoff + jitter):
 		}
-		backoff = min(backoff*2, s.BackoffMax)
+		// Climb the ordinary ladder. The max() is what makes a sub-BackoffMin
+		// first retry (thawFirstRetry) hand back to it rather than doubling its
+		// own way up from 200ms: 200ms → 2s → 4s → 8s. On the cadence path backoff
+		// starts at BackoffMin, so backoff*2 always wins the max and this is
+		// exactly the pre-existing min(backoff*2, BackoffMax).
+		backoff = min(max(backoff*2, s.BackoffMin), s.BackoffMax)
 	}
+}
+
+// pullOnce issues ONE config poll, under the resume interlock.
+//
+// The per-request context is a child of the run context, and its cancel handle
+// is published on the Supervisor so thaw can reach it. That is what turns "the
+// box resumed" into "the poll that has been asleep since before the freeze ends
+// NOW" — see cancelPollAndDropPool, and thaw for why the stale poll would
+// otherwise sit there for the balance of its 35s client timeout.
+//
+// pullMu is acquired BEFORE the request is issued and released before blocking
+// on it, so a thaw holding the lock cannot be starved by a 25s long-poll, and a
+// poll cannot be issued while a thaw is mid-drop. If a cancel lands in the gap
+// between the unlock and the call, the request context is already Done when
+// PullConfig runs: net/http's Transport.roundTrip checks ctx.Done() at the top
+// of its loop and returns before it ever reaches the connection pool, so no
+// stream is opened on the doomed ClientConn either way.
+func (s *Supervisor) pullOnce(ctx context.Context, cursor string) (*api.Config, error) {
+	s.pullMu.Lock()
+	reqCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	s.pullCancel, s.pullDone = cancel, done
+	s.pullMu.Unlock()
+	// close(done) AFTER PullConfig has returned. That is the signal
+	// cancelPollAndDropPool waits on: a cancelled request is not finished when
+	// cancel() returns, and the pool cannot be dropped until it is.
+	defer func() { cancel(); close(done) }()
+	return s.API.PullConfig(reqCtx, cursor)
+}
+
+// cancelPollAndDropPool is thaw's first act, and it is ONE act: cancel the
+// in-flight config poll, then drop the idle connection pool, with pullLoop
+// locked out in between.
+//
+// Three steps, and the order is fixed. The drop is what evicts the sockets that
+// died while the box was frozen; the cancel is what lets the drop work at all,
+// because Transport.CloseIdleConnections reaches http2ClientConn.closeIfIdle,
+// which bails out while the conn still carries streams — and the long-poll holds
+// one essentially always (see thaw).
+//
+// The third step is the one that is easy to omit, and omitting it silently
+// undoes the other two. **Cancelling a request does not synchronously remove its
+// stream.** net/http's roundTrip aborts the stream and returns, but the stream is
+// unregistered by forgetStreamID inside cleanupWriteRequest, which runs on the
+// request's own goroutine AFTER RoundTrip has already returned. A drop issued on
+// the next line therefore still sees len(cc.streams) > 0 and is a no-op. Measured
+// on a real h2 server: cancel-then-drop evicted the connection in 0 of 5 runs,
+// and so did waiting merely for PullConfig to return; waiting for the poll to
+// return AND letting the cleanup settle evicted it in 5 of 5. On a 1-vCPU box
+// (GOMAXPROCS=1) the bad case is near-deterministic, not a narrow race: close(ctx.done)
+// only enqueues the waiter while this goroutine runs straight on into the drop.
+// So: cancel, wait for the poll to actually return, let the cleanup land, then
+// drop. TestThawForcedBeatLandsOnAFreshConnection is the end-to-end proof, and it
+// counts connections server-side because that is the only observation that can
+// distinguish a working drop from a no-op.
+//
+// The interlock is the part that is easy to get wrong. cancel() wakes pullLoop
+// on a DIFFERENT goroutine, and pullLoop's whole job on waking is to re-poll
+// immediately. If it wins that race it opens a new stream on the very
+// ClientConn we are about to drop, closeIfIdle sees len(cc.streams) > 0, and the
+// drop is a no-op again — the exact bug, restored, with the added insult that we
+// caused it ourselves. Holding pullMu across both calls makes the sequence a
+// guarantee rather than a hope: the woken loop blocks in pullOnce until
+// CloseIdleConnections has returned.
+//
+// One thing this does NOT do is shorten a sleep. If pullLoop happens to be in
+// its backoff or poll-floor wait rather than in a request, there is nothing in
+// flight to cancel and the kick lands whenever that wait ends. Deliberate: the
+// long-poll holds the connection essentially always — that is precisely what
+// makes the pool drop a no-op in the first place — and correctness is unaffected
+// either way, since the next poll is issued after the drop and so dials fresh.
+func (s *Supervisor) cancelPollAndDropPool() {
+	s.pullMu.Lock()
+	defer s.pullMu.Unlock()
+	// pullCancel and pullDone are published together under pullMu, so they are
+	// nil together — one guard covers both.
+	if s.pullCancel != nil {
+		s.pullCancel()
+		// Bounded: a poll that will not return must not hold up the beat that
+		// makes the box attachable. Overrunning this costs a no-op drop, which is
+		// the pre-fix behaviour, not a hang.
+		select {
+		case <-s.pullDone:
+		case <-time.After(pollReturnWait):
+		}
+		// And the settle for cleanupWriteRequest, which runs after RoundTrip
+		// returns and is what actually calls forgetStreamID.
+		time.Sleep(streamCleanupSettle)
+	}
+	s.API.CloseIdleConnections()
 }
 
 // pullLoop is the config-pull reconcile loop: long-poll, reconcile on every
 // 200 (idempotent full replacement — also the steady-state self-heal), keep
 // the cursor on 304, back off jittered on errors, and never poll faster than
 // the floor.
+//
+// It is also the SOLE owner of peer reconciliation. thaw used to reconcile too,
+// from the heartbeat goroutine, with nothing synchronising the two — see thaw
+// for what that cost.
 func (s *Supervisor) pullLoop(ctx context.Context) {
 	cursor := ""
 	backoff := s.BackoffMin
 	for {
 		start := time.Now()
-		cfg, err := s.API.PullConfig(ctx, cursor)
+		cfg, err := s.pullOnce(ctx, cursor)
 		switch {
 		case err == nil:
-			cursor = cfg.Cursor
 			if rerr := s.Reconcile.Reconcile(cfg.Peers); rerr != nil {
-				s.Log.Error("peer reconcile failed", "err", rerr)
-			} else {
-				s.Log.Info("peers reconciled", "count", len(cfg.Peers), "cursor", cursor)
+				// HOLD the cursor, and PACE the retry. Both halves are required.
+				//
+				// Holding it: the cursor is the server's content hash, so advancing
+				// it after a reconcile that did not happen asserts "I am holding
+				// this state" when the box is not. The server would then 304 every
+				// later poll and the failure would never be retried — and since a
+				// failed pass can leave a peer wholly absent from wg0 (see
+				// wgnet.Reconcile), that is a durable strand, exactly the class this
+				// change set exists to remove.
+				//
+				// Pacing it: a held cursor means the server no longer long-polls at
+				// all. livepoll returns 200 the instant the supplied cursor differs
+				// from the rendered content, which it always does while we hold a
+				// stale one. So without a sleep here the loop would run
+				// pull→reconcile→PollFloor→repeat at ~1 Hz forever on any box whose
+				// `wg` calls keep failing — re-running the whole fork/exec sequence
+				// each pass, against a control plane serving the whole fleet, in
+				// exactly the memory-pressured conditions that caused the failure.
+				// The retry therefore rides the same jittered ladder a pull error
+				// uses, so a persistent failure costs ~1 request per BackoffMax.
+				// Written out rather than routed through this package's jittered/
+				// sleepCtx helpers ON PURPOSE. Those are introduced by the PR below
+				// this one in the stack; calling them from here would mean reverting
+				// that PR alone no longer compiles, and the rollout explicitly
+				// promises it is independently revertible. A few duplicated lines
+				// are cheaper than a revert that breaks the build at 3am.
+				half := int64(backoff) / 2
+				wait := backoff
+				if half > 0 {
+					wait += time.Duration(rand.Int63n(half))
+				}
+				s.Log.Error("peer reconcile failed; holding the cursor so the next poll re-applies",
+					"err", rerr, "backoff", wait)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(wait):
+				}
+				backoff = min(backoff*2, s.BackoffMax)
+				continue
 			}
+			cursor = cfg.Cursor
+			s.Log.Info("peers reconciled", "count", len(cfg.Peers), "cursor", cursor)
 			backoff = s.BackoffMin
 		case errors.Is(err, api.ErrNotModified):
 			backoff = s.BackoffMin
 		case ctx.Err() != nil:
+			// The RUN context ended: shut down. This case MUST be tested before
+			// the context.Canceled one below, because a cancelled run context
+			// cancels the per-request child too, so the error the poll returns at
+			// shutdown is indistinguishable from a resume kick by inspecting the
+			// error alone. Reading ctx (the run context) is what tells them apart.
+			// Get this backwards and the loop re-polls forever at shutdown, at
+			// whatever rate the cancelled context returns — a spin, not a loop.
 			return
+		case errors.Is(err, context.Canceled):
+			// A resume cancelled this poll (cancelPollAndDropPool) while the run
+			// context is still live. The cancel IS the kick: the whole point is to
+			// replace a snapshot taken before the freeze with a fresh one NOW, so
+			// re-poll with neither a backoff sleep (this is not a failure — nothing
+			// is wrong with the server) nor the poll-rate floor (the floor exists to
+			// stop a fast-answering server busy-looping the agent, and a resume is
+			// neither fast nor frequent: thawSpacing already bounds it).
+			//
+			// The cursor is deliberately KEPT. It is the loop's own, threaded from
+			// its last successful pull; re-polling with it asks the right question
+			// ("anything newer?"), and a 304 answer is a correct answer.
+			s.Log.Info("config poll cancelled by a resume; re-polling immediately")
+			backoff = s.BackoffMin
+			continue
 		default:
-			// Jitter the re-arm so a fleet of agents doesn't thundering-herd a
-			// recovering API.
-			jitter := time.Duration(rand.Int63n(int64(backoff) / 2))
-			s.Log.Warn("config pull failed", "err", err, "backoff", backoff+jitter)
-			select {
-			case <-ctx.Done():
+			wait := jittered(backoff)
+			s.Log.Warn("config pull failed", "err", err, "backoff", wait)
+			if !sleepCtx(ctx, wait) {
 				return
-			case <-time.After(backoff + jitter):
 			}
 			backoff = min(backoff*2, s.BackoffMax)
 		}
 		// Poll-rate floor: a long-poll that answers instantly (empty config,
 		// dead-poll server bug) must not become a busy loop.
 		if elapsed := time.Since(start); elapsed < s.PollFloor {
-			select {
-			case <-ctx.Done():
+			if !sleepCtx(ctx, s.PollFloor-elapsed) {
 				return
-			case <-time.After(s.PollFloor - elapsed):
 			}
 		}
 	}

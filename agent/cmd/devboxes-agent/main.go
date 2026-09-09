@@ -23,6 +23,8 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -84,6 +86,81 @@ func (m multiReconciler) Reconcile(peers []api.Peer) error {
 	return nil
 }
 
+// serialReconciler makes reconciliation a serialized, monotonic operation: at
+// most one reconcile runs at a time, and a reconcile carrying an older desired
+// set can never land on top of a newer one. It wraps the WHOLE fan-out, so the
+// SSH table and wg0 move together as one indivisible step and keep their
+// table-first ordering (see the wiring in main).
+//
+// Two distinct hazards, both closed here:
+//
+//   - Overlap. wgnet.Reconcile is a read-then-mutate sequence of `wg`
+//     shell-outs (read the live peer set, then add/remove/re-add against what
+//     it read); two of those interleaved race on state that lives in the
+//     kernel, where a mutex cannot reach. sshserver.Table.Replace is
+//     individually safe but is only coherent with wg0 if the two move in step.
+//   - Stale overwrite. A reconcile with an EMPTY peer set is a full wipe:
+//     wgnet removes every peer, tableReconciler deauthorizes every laptop. The
+//     resulting strand is durable rather than self-healing, because the pull
+//     loop's cursor already hashes the peer set it last saw — the server then
+//     answers 304 forever and nothing re-drives the reconcile. It presents as
+//     "connect hangs; ctrl-C and retry works".
+//
+// This is belt-and-braces, honestly labelled: since thaw stopped doing its own
+// pull, the pull loop is the sole caller of Reconcile and calls it from one
+// goroutine, so there is no live bug for this to fix today. The point is that
+// "no two reconciles overlap, and the newest desired set wins" should be a
+// property the code ENFORCES, not one the current call graph happens to have —
+// a second caller added later then inherits the guarantee instead of
+// rediscovering the hazard.
+type serialReconciler struct {
+	inner supervisor.Reconciler
+
+	// issued hands out generation numbers at call ENTRY, outside the mutex. That
+	// placement is the whole mechanism: it records the order in which callers
+	// ARRIVED — the freshness order, since a caller reconciles what it has just
+	// pulled — which is precisely the ordering the mutex destroys, because
+	// waiters acquire it in no guaranteed relation to when they queued.
+	issued atomic.Uint64
+
+	mu sync.Mutex
+	// seen is the newest generation ADMITTED. It is what fences stale callers,
+	// and it advances at admission rather than on success — see Reconcile.
+	// Guarded by mu.
+	seen uint64
+}
+
+func (s *serialReconciler) Reconcile(peers []api.Peer) error {
+	return s.reconcileGen(s.issued.Add(1), peers)
+}
+
+// reconcileGen applies `peers` unless a newer generation already landed. Split
+// out from Reconcile purely as a test seam: it lets a test state an
+// out-of-order arrival outright, rather than trying to provoke one out of the
+// scheduler and hoping it shows up.
+func (s *serialReconciler) reconcileGen(gen uint64, peers []api.Peer) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if gen <= s.seen {
+		// A newer desired set landed while this call waited for the lock, so
+		// this one is stale and applying it would move wg0 and the SSH table
+		// BACKWARDS. Reporting success is right: the caller's actual intent —
+		// "wg0 and the SSH table reflect the freshest config" — holds, and an
+		// error here would have the pull loop log a failure and back off over
+		// what is, in effect, a no-op.
+		return nil
+	}
+	// Advance the fence at ADMISSION, not on success. If it only advanced when
+	// the inner reconcile succeeded, a failed gen 5 would leave the fence at 3 —
+	// and gen 4, older and possibly carrying the empty wipe, would then pass the
+	// guard above and be applied on top. That is the exact hazard this type
+	// exists to stop, and it is reachable precisely when `wg` shell-outs are
+	// failing. A caller whose reconcile failed still gets the error, and under
+	// guard 2 (supervisor.pullLoop) holds its cursor and retries.
+	s.seen = gen
+	return s.inner.Reconcile(peers)
+}
+
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "sftp-subsystem" {
 		runSFTPSubsystem()
@@ -118,7 +195,12 @@ func main() {
 	// connection arrive — before the auth table is populated, and the
 	// ConnCallback gate would refuse it. Table-first closes that window (and on
 	// removal, deauthorizing before tearing down the peer is the safe order too).
-	reconcilers := multiReconciler{tableReconciler{table}, net}
+	//
+	// Wrapped so the pair is applied serially and monotonically: the ordering
+	// above is only meaningful if one reconcile finishes before the next starts,
+	// and if an older desired set can never land after a newer one (see
+	// serialReconciler).
+	reconcilers := &serialReconciler{inner: multiReconciler{tableReconciler{table}, net}}
 
 	// Boot reconcile (the monotonic gen-epoch mechanism): on a fresh process
 	// bump the gen-epoch BEFORE reporting (a crash mid-write still advances it,

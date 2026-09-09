@@ -12,24 +12,29 @@ import (
 	"github.com/fixed-labs/oss/agent/internal/api"
 )
 
-// --- The cursor-discriminator mock (shared harness) ---------------------------
+// --- The thaw-discriminator mock (shared harness) -----------------------------
 //
-// The steady-state pullLoop emits PullConfig("") on EVERY poll while its cursor
-// is "" (an ErrNotModified reply leaves the cursor empty), so "an empty-cursor
-// pull happened" does NOT by itself distinguish a thaw. To make the empty-cursor
-// pull a UNIQUE thaw signal, thawMockAPI returns a NON-EMPTY, ADVANCING cursor
-// ("h:1", "h:2", …) on every steady-state pull — the loop threads that cursor,
-// so the ONLY PullConfig("") after index 0 is thaw()'s forced full-resync (it
-// calls PullConfig(ctx, "") with an empty cursor). The mock is cursor-AWARE: a
-// non-empty cursor gets the next steady-state config (advancing cursor + a
-// distinct peer set); an empty cursor (the thaw resync) gets the thaw config
-// (a fixed cursor + the thaw peer set) so thaw() reaches Reconcile(peers).
+// A thaw is no longer identifiable by a pull it makes, because it makes none:
+// cancelling the in-flight poll IS the kick, and the fresh peer set is fetched
+// and reconciled by pullLoop alone (see thaw). What marks a thaw uniquely is
+// CloseIdleConnections — thaw is its only caller in the agent, and the
+// steady-state loops must never make it (that would pay a fresh TCP+TLS
+// handshake on every beat forever, the cost DisableKeepAlives was rejected for).
+// TestSteadyStateLoopNeverDropsIdlePool pins that other half, so counting
+// "close-idle" entries in the ordered call log IS the thaw count.
+//
+// The mock still hands back a NON-EMPTY, ADVANCING cursor ("h:1", "h:2", …) on
+// every poll, and the loop threads it. That keeps the OLD discriminator alive as
+// a negative: after index 0 (the loop's own first poll) a PullConfig("") can
+// only be a full-resync somebody performed out of band, and there must never be
+// one again — see emptyCursorPullsAfterIndex0.
 type thawMockAPI struct {
 	mu sync.Mutex
 
-	hbCalls int      // total Heartbeat invocations
-	hbFails int      // fail the first N heartbeats (0 ⇒ never) — exercises beat retry
-	pulls   []string // cursors received, in order
+	hbCalls int         // total Heartbeat invocations
+	hbFails int         // fail the first N heartbeats (0 ⇒ never) — exercises beat retry
+	hbAt    []time.Time // when each Heartbeat attempt landed (retry-spacing tests)
+	pulls   []string    // cursors received, in order
 
 	// calls is every API call IN ORDER ("close-idle" | "beat" | "pull"). thaw's
 	// pool drop is correct only if it lands BEFORE the forced beat, and ordering
@@ -37,15 +42,13 @@ type thawMockAPI struct {
 	calls []string
 
 	steadyCounter int // advances the steady-state cursor "h:1","h:2",…
-
-	// thawPeers is the peer set returned to the empty-cursor (thaw resync) pull.
-	thawPeers []api.Peer
 }
 
 func (m *thawMockAPI) Heartbeat(_ context.Context, _ bool, _ int, _ api.Identity) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.hbCalls++
+	m.hbAt = append(m.hbAt, time.Now())
 	m.calls = append(m.calls, "beat")
 	if m.hbCalls <= m.hbFails {
 		return fmt.Errorf("api down")
@@ -64,16 +67,6 @@ func (m *thawMockAPI) PullConfig(_ context.Context, cursor string) (*api.Config,
 	defer m.mu.Unlock()
 	m.pulls = append(m.pulls, cursor)
 	m.calls = append(m.calls, "pull")
-	if cursor == "" {
-		// Either the loop's very first poll (index 0) or the thaw's forced
-		// full-resync. Return the thaw config with a fixed non-empty cursor so
-		// the loop starts threading from there, and carry the thaw peer set so
-		// thaw() reaches Reconcile(thawPeers).
-		return &api.Config{Cursor: "thaw:1", Peers: m.thawPeers}, nil
-	}
-	// Steady-state poll on a threaded cursor: hand back the next advancing
-	// cursor and a distinct (single-peer) set so ordinary reconciles are
-	// visibly different from the thaw's peer set.
 	m.steadyCounter++
 	return &api.Config{
 		Cursor: nextCursor(m.steadyCounter),
@@ -113,9 +106,33 @@ func (m *thawMockAPI) callsSnapshot() []string {
 	return append([]string(nil), m.calls...)
 }
 
+func (m *thawMockAPI) heartbeatTimes() []time.Time {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]time.Time(nil), m.hbAt...)
+}
+
+// thaws counts the thaws the supervisor performed. thaw is the agent's ONLY
+// caller of CloseIdleConnections (TestSteadyStateLoopNeverDropsIdlePool pins the
+// converse), so the count of "close-idle" entries is the count of thaws.
+func (m *thawMockAPI) thaws() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, c := range m.calls {
+		if c == "close-idle" {
+			n++
+		}
+	}
+	return n
+}
+
 // emptyCursorPullsAfterIndex0 counts PullConfig("") calls after the loop's very
-// first poll (index 0). Under the cursor discriminator that count is exactly the
-// number of thaw-forced resyncs.
+// first poll (index 0). The mock threads a non-empty advancing cursor, so the
+// loop itself can never produce one; anything counted here is a full-resync
+// performed out of band. Since FIX-354 that count must always be ZERO — thaw's
+// own PullConfig("") + Reconcile is exactly what was deleted (see thaw for the
+// unsynchronised-full-wipe race it caused).
 func emptyCursorPullsAfterIndex0(pulls []string) int {
 	n := 0
 	for i, c := range pulls {
@@ -269,15 +286,17 @@ func waitUntil(cond func() bool, within time.Duration) bool {
 	return cond()
 }
 
-// T5 — a wakeClockStep drives the full thaw: an out-of-cadence heartbeat, exactly
-// one empty-cursor full-resync (which reaches Reconcile with the THAW peer set),
-// and a SyncSessions.
+// T5 — a wakeClockStep drives the full thaw: exactly one pool drop, an
+// out-of-cadence heartbeat, and a SyncSessions.
+//
+// Updated for FIX-354. The old form asserted a thaw-forced empty-cursor resync
+// that reached Reconcile with a distinct peer set; that behaviour is gone on
+// purpose (thaw's own pull + reconcile raced pullLoop's — see thaw), so the
+// discriminator moved to the pool drop and the resync is now asserted ABSENT.
+// The kick that replaces it is proved in pullcancel_test.go, which needs a mock
+// whose poll actually blocks.
 func TestHeartbeatLoopThawsOnClockStepWake(t *testing.T) {
-	thawPeers := []api.Peer{
-		{LaptopWgPubkey: "THAW-A", LaptopWgIP: "fd::a"},
-		{LaptopWgPubkey: "THAW-B", LaptopWgIP: "fd::b"},
-	}
-	m := &thawMockAPI{thawPeers: thawPeers}
+	m := &thawMockAPI{}
 	rec := &recordingReconciler{}
 	// One step, then ordinary cadence forever.
 	w := &fakeWatch{wakes: []wake{wakeClockStep, wakeDeadline}, waitGap: 5 * time.Millisecond}
@@ -290,36 +309,34 @@ func TestHeartbeatLoopThawsOnClockStepWake(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	go s.Run(ctx)
 
-	ok := waitUntil(func() bool {
-		_, pulls := m.snapshot()
-		return emptyCursorPullsAfterIndex0(pulls) >= 1
-	}, 2*time.Second)
+	ok := waitUntil(func() bool { return m.thaws() >= 1 }, 2*time.Second)
+	// The thaw's session sync is fired asynchronously, so observe it before
+	// shutting the loop down (waiting on it is also what keeps the goroutine from
+	// outliving the test).
+	syncSeen := waitUntil(func() bool {
+		syncMu.Lock()
+		defer syncMu.Unlock()
+		return syncs > 0
+	}, time.Second)
 	cancel()
 	waitUntil(func() bool { return false }, 20*time.Millisecond)
 
 	if !ok {
-		_, pulls := m.snapshot()
-		t.Fatalf("thaw resync (empty-cursor pull after index 0) never fired; pulls=%v", pulls)
+		t.Fatalf("thaw never fired; calls=%v", m.callsSnapshot())
 	}
 
 	hb, pulls := m.snapshot()
 
-	// Exactly ONE forced resync — more would mean a repeated/mis-detected thaw.
-	if got := emptyCursorPullsAfterIndex0(pulls); got != 1 {
-		t.Fatalf("empty-cursor pulls after index 0 = %d, want exactly 1; pulls=%v", got, pulls)
+	// Exactly ONE thaw — more would mean a repeated/mis-detected step.
+	if got := m.thaws(); got != 1 {
+		t.Fatalf("thaws = %d, want exactly 1; calls=%v", got, m.callsSnapshot())
 	}
 
-	rec.mu.Lock()
-	var sawThaw bool
-	for _, set := range rec.sets {
-		if peersEqual(set, thawPeers) {
-			sawThaw = true
-			break
-		}
-	}
-	rec.mu.Unlock()
-	if !sawThaw {
-		t.Fatalf("no Reconcile received the thaw peer set %v; got %v", thawPeers, reconcileSets(rec))
+	// And the thaw did NOT resync on its own: no out-of-band empty-cursor pull.
+	if got := emptyCursorPullsAfterIndex0(pulls); got != 0 {
+		t.Fatalf("thaw performed %d full-resync pull(s) of its own; pulls=%v — that "+
+			"reconcile races pullLoop's with nothing synchronising them, and the loser "+
+			"wipes the laptop's peer", got, pulls)
 	}
 
 	// An out-of-cadence beat: with a 10s HeartbeatInterval, cadence alone
@@ -327,21 +344,17 @@ func TestHeartbeatLoopThawsOnClockStepWake(t *testing.T) {
 	if hb < 2 {
 		t.Fatalf("expected an out-of-cadence heartbeat (hbCalls >= 2), got %d", hb)
 	}
-
-	syncMu.Lock()
-	gotSyncs := syncs
-	syncMu.Unlock()
-	if gotSyncs == 0 {
+	if !syncSeen {
 		t.Fatal("SyncSessions never fired")
 	}
 }
 
 // T6 — no thaw without a step. Only wakeDeadline is ever returned, so the loop
-// must beat on cadence and never force a resync. The negative signal is ZERO
-// empty-cursor pulls after index 0 — NOT SyncSessions absence (it rides the
-// normal beat too). Non-vacuous because the same harness trips in T5.
+// must beat on cadence and never thaw. The negative signal is ZERO pool drops —
+// NOT SyncSessions absence (it rides the normal beat too). Non-vacuous because
+// the same harness trips in T5.
 func TestHeartbeatLoopNoThawOnDeadlineWake(t *testing.T) {
-	m := &thawMockAPI{thawPeers: []api.Peer{{LaptopWgPubkey: "THAW", LaptopWgIP: "fd::z"}}}
+	m := &thawMockAPI{}
 	rec := &recordingReconciler{}
 	w := &fakeWatch{wakes: []wake{wakeDeadline}, waitGap: 2 * time.Millisecond}
 	s := thawSupervisor(m, rec, w)
@@ -358,10 +371,10 @@ func TestHeartbeatLoopNoThawOnDeadlineWake(t *testing.T) {
 	cancel()
 	waitUntil(func() bool { return false }, 20*time.Millisecond)
 
-	hb, pulls := m.snapshot()
+	hb, _ := m.snapshot()
 
-	if got := emptyCursorPullsAfterIndex0(pulls); got != 0 {
-		t.Fatalf("false positive: %d empty-cursor pulls after index 0; pulls=%v", got, pulls)
+	if got := m.thaws(); got != 0 {
+		t.Fatalf("false positive: %d thaw(s) with no clock step; calls=%v", got, m.callsSnapshot())
 	}
 	if hb == 0 {
 		t.Fatal("loop never beat at all")
@@ -422,8 +435,7 @@ func TestHeartbeatLoopPrimesWatchBeforeFirstBeat(t *testing.T) {
 // The loop must also NOT wait out an interval first: with a 10s HeartbeatInterval
 // against a 2s budget here, a thaw deferred to the next wake would never show up.
 func TestHeartbeatLoopThawsOnArmReportedStep(t *testing.T) {
-	thawPeers := []api.Peer{{LaptopWgPubkey: "THAW-ARM", LaptopWgIP: "fd::c"}}
-	m := &thawMockAPI{thawPeers: thawPeers}
+	m := &thawMockAPI{}
 	rec := &recordingReconciler{}
 	// arms[0] is the prime; arms[1] is the one after the first beat — report the
 	// step there. Wait never reports a step, so a thaw can ONLY come from Arm.
@@ -436,31 +448,13 @@ func TestHeartbeatLoopThawsOnArmReportedStep(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go s.Run(ctx)
-	ok := waitUntil(func() bool {
-		_, pulls := m.snapshot()
-		return emptyCursorPullsAfterIndex0(pulls) >= 1
-	}, 2*time.Second)
+	ok := waitUntil(func() bool { return m.thaws() >= 1 }, 2*time.Second)
 	cancel()
 	waitUntil(func() bool { return false }, 20*time.Millisecond)
 
 	if !ok {
-		_, pulls := m.snapshot()
-		t.Fatalf("a step reported by Arm did not drive a thaw; pulls=%v — a resume "+
-			"landing during a beat would be lost", pulls)
-	}
-
-	rec.mu.Lock()
-	var sawThaw bool
-	for _, set := range rec.sets {
-		if peersEqual(set, thawPeers) {
-			sawThaw = true
-			break
-		}
-	}
-	rec.mu.Unlock()
-	if !sawThaw {
-		t.Fatalf("Arm-reported step thawed but no Reconcile got the thaw peer set %v; got %v",
-			thawPeers, reconcileSets(rec))
+		t.Fatalf("a step reported by Arm did not drive a thaw; calls=%v — a resume "+
+			"landing during a beat would be lost", m.callsSnapshot())
 	}
 }
 
@@ -523,25 +517,27 @@ func TestHeartbeatLoopAnchorsIntervalAfterTheBeat(t *testing.T) {
 }
 
 // T8 — the thaw-forced beat inherits the retry (warm-resume path). Because the
-// retry lives INSIDE beat() (thaw() calls s.beat directly), thaw()'s forced
+// retry lives INSIDE sendHeartbeat (thawBeat calls it directly), thaw()'s forced
 // heartbeat retries a transient failure exactly as the steady loop's beat does.
 // This guards against a future refactor hoisting the retry up into
 // heartbeatLoop, which would silently drop retry on resume.
+//
+// The first retry waits thawFirstRetry rather than BackoffMin, so this test
+// spends ~200ms in that first sleep; the ladder after it is the harness's
+// ms-scale one. TestThawForcedBeatRetriesFastBeforeTheLadder is what pins the
+// spacing itself.
 //
 // Injection: s.now is frozen, so sendHeartbeat's deadline (now + interval) is
 // never approached and the K retries run to the mock's success.
 func TestThawForcedBeatInheritsRetry(t *testing.T) {
 	const K = 3
-	m := &thawMockAPI{
-		hbFails:   K,
-		thawPeers: []api.Peer{{LaptopWgPubkey: "THAW", LaptopWgIP: "fd::z"}},
-	}
+	m := &thawMockAPI{hbFails: K}
 	rec := &recordingReconciler{}
 	s := thawSupervisor(m, rec, &fakeWatch{})
 	frozen := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	s.now = func() time.Time { return frozen }
 
-	// Drive the thaw hook directly: thaw() → s.beat() → sendHeartbeat(), which
+	// Drive the thaw hook directly: thaw() → thawBeat() → sendHeartbeat(), which
 	// must retry the transient failures.
 	s.thaw(context.Background())
 
@@ -619,7 +615,7 @@ func TestHeartbeatLoopDegradesOnBrokenWatch(t *testing.T) {
 // Here EVERY Arm reports a step, i.e. the worst case. Thaws must be paced by
 // thawSpacing rather than by network RTT.
 func TestHeartbeatLoopDoesNotSpinOnRepeatedSteps(t *testing.T) {
-	m := &thawMockAPI{thawPeers: []api.Peer{{LaptopWgPubkey: "SPIN", LaptopWgIP: "fd::9"}}}
+	m := &thawMockAPI{}
 	rec := &recordingReconciler{}
 	w := &fakeWatch{wakes: []wake{wakeDeadline}, alwaysStepOnArm: true}
 	s := thawSupervisor(m, rec, w)
@@ -633,8 +629,7 @@ func TestHeartbeatLoopDoesNotSpinOnRepeatedSteps(t *testing.T) {
 	cancel()
 	waitUntil(func() bool { return false }, 30*time.Millisecond)
 
-	_, pulls := m.snapshot()
-	thaws := emptyCursorPullsAfterIndex0(pulls)
+	thaws := m.thaws()
 	if thaws == 0 {
 		t.Fatal("no thaw at all — the harness never drove a step")
 	}
@@ -649,7 +644,7 @@ func TestHeartbeatLoopDoesNotSpinOnRepeatedSteps(t *testing.T) {
 // is what keeps T14's rate limit from becoming a detection threshold: a genuine
 // warm resume must still thaw immediately.
 func TestHeartbeatLoopFirstStepThawsWithoutDelay(t *testing.T) {
-	m := &thawMockAPI{thawPeers: []api.Peer{{LaptopWgPubkey: "FIRST", LaptopWgIP: "fd::8"}}}
+	m := &thawMockAPI{}
 	rec := &recordingReconciler{}
 	w := &fakeWatch{wakes: []wake{wakeClockStep, wakeDeadline}, waitGap: 2 * time.Millisecond}
 	s := thawSupervisor(m, rec, w)
@@ -659,10 +654,7 @@ func TestHeartbeatLoopFirstStepThawsWithoutDelay(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go s.Run(ctx)
-	ok := waitUntil(func() bool {
-		_, pulls := m.snapshot()
-		return emptyCursorPullsAfterIndex0(pulls) >= 1
-	}, 2*time.Second)
+	ok := waitUntil(func() bool { return m.thaws() >= 1 }, 2*time.Second)
 	cancel()
 	waitUntil(func() bool { return false }, 20*time.Millisecond)
 
@@ -685,7 +677,7 @@ func TestHeartbeatLoopFirstStepThawsWithoutDelay(t *testing.T) {
 // moves — which is what a clock set is. Zero thaws is the whole assertion. T14 is
 // the same harness with divergence advancing, so this is not vacuous.
 func TestHeartbeatLoopAbsorbsClockSetsThatMoveNoWallTime(t *testing.T) {
-	m := &thawMockAPI{thawPeers: []api.Peer{{LaptopWgPubkey: "SET", LaptopWgIP: "fd::7"}}}
+	m := &thawMockAPI{}
 	rec := &recordingReconciler{}
 	w := &fakeWatch{wakes: []wake{wakeClockStep}, alwaysStepOnArm: true}
 	s := thawSupervisor(m, rec, w)
@@ -699,8 +691,7 @@ func TestHeartbeatLoopAbsorbsClockSetsThatMoveNoWallTime(t *testing.T) {
 	cancel()
 	waitUntil(func() bool { return false }, 30*time.Millisecond)
 
-	_, pulls := m.snapshot()
-	if thaws := emptyCursorPullsAfterIndex0(pulls); thaws != 0 {
+	if thaws := m.thaws(); thaws != 0 {
 		t.Fatalf("thaws=%d — a clock set carrying no wall discontinuity was treated "+
 			"as a resume; on Fly that is every few seconds on every box", thaws)
 	}
@@ -711,7 +702,7 @@ func TestHeartbeatLoopAbsorbsClockSetsThatMoveNoWallTime(t *testing.T) {
 // shorter than a 10s threshold going undetected entirely. 250ms is 40x below that
 // threshold and must sail through.
 func TestHeartbeatLoopThawsOnSubSecondSuspend(t *testing.T) {
-	m := &thawMockAPI{thawPeers: []api.Peer{{LaptopWgPubkey: "SHORT", LaptopWgIP: "fd::6"}}}
+	m := &thawMockAPI{}
 	rec := &recordingReconciler{}
 	w := &fakeWatch{wakes: []wake{wakeClockStep, wakeDeadline}, waitGap: 2 * time.Millisecond}
 	s := thawSupervisor(m, rec, w)
@@ -721,10 +712,7 @@ func TestHeartbeatLoopThawsOnSubSecondSuspend(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go s.Run(ctx)
-	ok := waitUntil(func() bool {
-		_, pulls := m.snapshot()
-		return emptyCursorPullsAfterIndex0(pulls) >= 1
-	}, 2*time.Second)
+	ok := waitUntil(func() bool { return m.thaws() >= 1 }, 2*time.Second)
 	cancel()
 	waitUntil(func() bool { return false }, 20*time.Millisecond)
 
@@ -742,7 +730,7 @@ func TestHeartbeatLoopThawsOnSubSecondSuspend(t *testing.T) {
 // channel repeated the same 465254ms magnitude the wait channel had just thawed
 // on. The accumulator consumes what it reports, so the second channel sees zero.
 func TestHeartbeatLoopThawsOncePerSuspend(t *testing.T) {
-	m := &thawMockAPI{thawPeers: []api.Peer{{LaptopWgPubkey: "ONCE", LaptopWgIP: "fd::5"}}}
+	m := &thawMockAPI{}
 	rec := &recordingReconciler{}
 	// One suspend, then a clock that never moves again — but a step reported at
 	// every opportunity, both channels, forever.
@@ -759,8 +747,7 @@ func TestHeartbeatLoopThawsOncePerSuspend(t *testing.T) {
 	cancel()
 	waitUntil(func() bool { return false }, 30*time.Millisecond)
 
-	_, pulls := m.snapshot()
-	thaws := emptyCursorPullsAfterIndex0(pulls)
+	thaws := m.thaws()
 	if thaws == 0 {
 		t.Fatal("the suspend never thawed at all")
 	}
@@ -784,7 +771,7 @@ func TestHeartbeatLoopThawsOncePerSuspend(t *testing.T) {
 // leaves the one request that matters — the beat that flips the row to running —
 // still going down a dead socket.
 func TestThawDropsIdlePoolBeforeTheForcedBeat(t *testing.T) {
-	m := &thawMockAPI{thawPeers: []api.Peer{{LaptopWgPubkey: "POOL", LaptopWgIP: "fd::4"}}}
+	m := &thawMockAPI{}
 	rec := &recordingReconciler{}
 	s := thawSupervisor(m, rec, &fakeWatch{})
 	// Driving thaw() directly skips Run's default wiring, so freeze the clock the
@@ -835,20 +822,190 @@ func TestSteadyStateLoopNeverDropsIdlePool(t *testing.T) {
 	}
 }
 
-func peersEqual(a, b []api.Peer) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
 func reconcileSets(rec *recordingReconciler) [][]api.Peer {
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
 	return append([][]api.Peer(nil), rec.sets...)
+}
+
+// directThawSupervisor wires a Supervisor for the tests that call thaw() by hand
+// rather than through Run. Run's defaults() never happens on that path, and
+// sendHeartbeat reads s.now to build its retry deadline, so the clock is frozen
+// here exactly as T8 and T19 do it — frozen means the deadline is never
+// approached, so a retry ladder runs to completion instead of being truncated.
+func directThawSupervisor(m API, rec Reconciler) *Supervisor {
+	s := thawSupervisor(m, rec, &fakeWatch{})
+	s.now = func() time.Time { return time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC) }
+	return s
+}
+
+// T20 — thaw performs NO pull and NO reconcile of its own.
+//
+// This is the FIX-354 deletion, asserted directly. thaw ran on the heartbeat
+// goroutine and pullLoop on the main one with nothing synchronising them, and
+// both sides of the reconcile are full REPLACEMENTS — wgnet removes every
+// current peer absent from the desired set, the SSH table Replaces wholesale —
+// so whichever landed second won outright. A stale result carrying fewer peers
+// deleted the laptop's peer and deauthorised it, durably: pullLoop's cursor
+// already hashed the good content, so the server 304s forever afterwards.
+// Observed landing 291-749ms apart in 3/3 staging runs.
+//
+// (The ticket's own argument for this race — that thaw's pull was "structurally
+// guaranteed" to read a pre-attach snapshot — was disproven; thaw's pull
+// returned count=2, post-attach. The missing synchronisation is the reason, not
+// the ordering of the snapshot.)
+//
+// No pull loop runs here, so every pull and every reconcile the mocks see would
+// have to be thaw's own.
+func TestThawPerformsNoPullOrReconcileOfItsOwn(t *testing.T) {
+	m := &thawMockAPI{}
+	rec := &recordingReconciler{}
+	s := directThawSupervisor(m, rec)
+
+	s.thaw(context.Background())
+
+	if _, pulls := m.snapshot(); len(pulls) != 0 {
+		t.Fatalf("thaw pulled config itself (%d time(s), cursors=%v) — that pull's "+
+			"reconcile races pullLoop's, and the loser's peer set wins", len(pulls), pulls)
+	}
+	if sets := reconcileSets(rec); len(sets) != 0 {
+		t.Fatalf("thaw reconciled peers itself (%d time(s): %v) — pullLoop is the sole "+
+			"reconciler by design", len(sets), sets)
+	}
+}
+
+// T21 — exactly ONE session sync per resume.
+//
+// beat already fires SyncSessions, and thaw used to fire it a second time on top
+// (thaw.go's own s.SyncSessions() call), so every resume shipped the whole
+// session snapshot twice. The duplicate is a defect the ticket never named.
+//
+// The join is on the test's own SyncSessions stub, which runs INSIDE the spawned
+// goroutine — so receiving from it proves the sync happened, deterministically
+// and without a sleep.
+func TestThawFiresExactlyOneSessionSync(t *testing.T) {
+	m := &thawMockAPI{}
+	s := directThawSupervisor(m, &recordingReconciler{})
+
+	var syncs atomic.Int32
+	fired := make(chan struct{}, 4)
+	s.SyncSessions = func() { syncs.Add(1); fired <- struct{}{} }
+
+	s.thaw(context.Background())
+	// Join on the stub itself rather than on a flag: the stub runs INSIDE the
+	// spawned sync, so receiving here proves the sync ran to completion.
+	select {
+	case <-fired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("thaw's session sync never fired")
+	}
+
+	if got := syncs.Load(); got != 1 {
+		t.Fatalf("SyncSessions fired %d times for one resume, want exactly 1 — the "+
+			"beat's piggyback and thaw's own call are duplicates of each other", got)
+	}
+}
+
+// T22 — the session sync is OFF the resume critical path.
+//
+// It contributes nothing to readiness and nothing to the peer set, but in
+// production it is sessions.Manager.SyncNow — a POST on its own 15s budget — and
+// it used to sit inline between the beat and the pull. That put up to 15s of a
+// measured 85s thaw in front of work that actually mattered.
+//
+// The probe: a sync that takes far longer than the thaw's whole budget. thaw
+// must return without it, and the sync must still happen exactly once.
+func TestThawSessionSyncIsOffTheResumeCriticalPath(t *testing.T) {
+	const syncDuration = 400 * time.Millisecond
+	m := &thawMockAPI{}
+	s := directThawSupervisor(m, &recordingReconciler{})
+
+	var syncs atomic.Int32
+	done := make(chan struct{})
+	s.SyncSessions = func() {
+		time.Sleep(syncDuration)
+		syncs.Add(1)
+		close(done)
+	}
+
+	start := time.Now()
+	s.thaw(context.Background())
+	elapsed := time.Since(start)
+
+	if elapsed >= syncDuration {
+		t.Fatalf("thaw took %v with a %v session sync — the sync is still inline on "+
+			"the resume path, where it delays nothing but the user", elapsed, syncDuration)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the async session sync never completed")
+	}
+	if got := syncs.Load(); got != 1 {
+		t.Fatalf("async SyncSessions fired %d times, want exactly 1 — off the critical "+
+			"path must not mean dropped", got)
+	}
+}
+
+// T23 — the thaw-forced beat retries FAST first (~thawFirstRetry), then hands
+// back to the ordinary ladder.
+//
+// A resume's first heartbeat failure is a stale socket, not an overloaded
+// server: the connection it went down was killed while the box was frozen, and
+// the retry is a fresh dial. The 2s ladder exists to be kind to a recovering
+// API, and there is no recovering API here — meanwhile the beat is the single
+// write that flips the row to `running`, so every millisecond it is late is a
+// millisecond attach 409s.
+//
+// BackoffMin is set an order of magnitude above thawFirstRetry so the two are
+// separable even with the 50% jitter: a fast first retry lands in
+// [200ms, 300ms), a BackoffMin one in [600ms, 900ms).
+func TestThawForcedBeatRetriesFastBeforeTheLadder(t *testing.T) {
+	m := &thawMockAPI{hbFails: 1}
+	s := directThawSupervisor(m, &recordingReconciler{})
+	s.BackoffMin = 600 * time.Millisecond
+	s.BackoffMax = 2 * time.Second
+	s.HeartbeatInterval = time.Hour // the retry deadline must not truncate the ladder
+
+	s.thaw(context.Background())
+
+	at := m.heartbeatTimes()
+	if len(at) != 2 {
+		t.Fatalf("heartbeat attempts = %d, want 2 (one failure then a retry)", len(at))
+	}
+	gap := at[1].Sub(at[0])
+	if gap >= s.BackoffMin {
+		t.Fatalf("the thaw beat's first retry waited %v (>= BackoffMin %v) — a resume's "+
+			"first failure is a dead socket, not an overloaded server, and the box is "+
+			"unattachable for the whole wait", gap, s.BackoffMin)
+	}
+	if gap < thawFirstRetry/2 {
+		t.Fatalf("the thaw beat's first retry waited only %v, well under thawFirstRetry "+
+			"%v — it is not retrying, it is hammering", gap, thawFirstRetry)
+	}
+}
+
+// T23b — the CADENCE beat's retry spacing is unchanged: its first retry still
+// waits BackoffMin. thawFirstRetry is a resume-path concession, and letting it
+// leak into the 30s loop would make every agent in the fleet retry a struggling
+// control plane five times faster than the ladder intends.
+//
+// Non-vacuous against T23: same mock, same BackoffMin, opposite expectation.
+func TestCadenceBeatFirstRetryStillUsesBackoffMin(t *testing.T) {
+	m := &thawMockAPI{hbFails: 1}
+	s := directThawSupervisor(m, &recordingReconciler{})
+	s.BackoffMin = 600 * time.Millisecond
+	s.BackoffMax = 2 * time.Second
+	s.HeartbeatInterval = time.Hour
+
+	s.beat(context.Background())
+
+	at := m.heartbeatTimes()
+	if len(at) != 2 {
+		t.Fatalf("heartbeat attempts = %d, want 2 (one failure then a retry)", len(at))
+	}
+	if gap := at[1].Sub(at[0]); gap < s.BackoffMin {
+		t.Fatalf("the cadence beat's first retry waited %v, want >= BackoffMin %v — "+
+			"the warm-resume fast retry has leaked into the steady-state loop", gap, s.BackoffMin)
+	}
 }

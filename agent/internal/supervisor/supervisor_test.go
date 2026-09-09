@@ -495,7 +495,7 @@ func TestSendHeartbeatExhaustionLogsDistinctly(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		s.sendHeartbeat(context.Background())
+		s.sendHeartbeat(context.Background(), s.BackoffMin)
 		close(done)
 	}()
 	select {
@@ -548,7 +548,7 @@ func TestSendHeartbeatCtxCancelNoExhaustionLog(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		s.sendHeartbeat(ctx)
+		s.sendHeartbeat(ctx, s.BackoffMin)
 		close(done)
 	}()
 	// Let the first attempt fail and enter the backoff sleep, then cancel.
