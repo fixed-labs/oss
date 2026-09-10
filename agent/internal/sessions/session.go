@@ -283,7 +283,10 @@ func (s *Session) fanout(chunk []byte) {
 func (s *Session) waitLoop() {
 	code := waitExitCode(s.cmd)
 	// Reap the whole process group: a `setsid`/`nohup` child can hold the slave
-	// open after the shell exits.
+	// open after the shell exits. Under bootstrap nsenter routing this pgid is
+	// the agent-namespace group (nsenter and whatever shares its group);
+	// in-target processes that moved to their own group are not reaped here —
+	// accepted edge-case weakening.
 	if s.pgid > 0 {
 		_ = syscall.Kill(-s.pgid, syscall.SIGHUP)
 		_ = syscall.Kill(-s.pgid, syscall.SIGKILL)

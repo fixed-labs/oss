@@ -50,6 +50,14 @@ type Client struct {
 	Token       string
 	// HTTP must outlive the server's ≤25s long-poll hold.
 	HTTP *http.Client
+	// ClientSystem, when non-nil, supplies the client_system heartbeat value —
+	// the client-system health field the promote gate reads (rift-image-model
+	// §3.7): "recovery" | "unrealized" | "realizing" | "healthy". Wired ONLY in
+	// bootstrap mode (RIFT_BOOTSTRAP=1). nil, or a "" return, keeps the key
+	// entirely ABSENT from the heartbeat payload: absent = a pre-bootstrap
+	// agent, which the server's compat arm promotes — legacy in-system agents
+	// must never send the field.
+	ClientSystem func() string
 }
 
 func New(baseURL, workspaceID, token string) *Client {
@@ -177,15 +185,26 @@ func (c *Client) ReportFailed(ctx context.Context, errorMessage string) error {
 // along as the raw count (diagnostic; the api re-folds it defensively). The
 // identity facts drive the cluster's provisioned/starting → running flip (no
 // separate ready event).
+//
+// In bootstrap mode (ClientSystem wired) the payload additionally carries
+// client_system, evaluated fresh per POST so retries and later beats report the
+// current state. The server parses heartbeats leniently, so pre-gate servers
+// simply ignore the extra key.
 func (c *Client) Heartbeat(ctx context.Context, interactiveLive bool, sshSessions int, id Identity) error {
-	return c.post(ctx, "heartbeat", map[string]any{
+	m := map[string]any{
 		"interactive_live": interactiveLive,
 		"ssh_sessions":     sshSessions,
 		"ssh_host":         id.SSHHost,
 		"resolved_commit":  id.ResolvedCommit,
 		"wg_pubkey":        id.WgPubkey,
 		"ssh_host_pubkey":  id.SSHHostPubkey,
-	})
+	}
+	if c.ClientSystem != nil {
+		if cs := c.ClientSystem(); cs != "" {
+			m["client_system"] = cs
+		}
+	}
+	return c.post(ctx, "heartbeat", m)
 }
 
 // SessionMeta is one session's entry in a SyncSessions snapshot — the box-side

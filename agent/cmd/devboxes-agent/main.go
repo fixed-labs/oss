@@ -31,6 +31,7 @@ import (
 	"github.com/fixed-labs/oss/agent/internal/api"
 	"github.com/fixed-labs/oss/agent/internal/config"
 	"github.com/fixed-labs/oss/agent/internal/identity"
+	"github.com/fixed-labs/oss/agent/internal/nsexec"
 	"github.com/fixed-labs/oss/agent/internal/sessions"
 	"github.com/fixed-labs/oss/agent/internal/sshserver"
 	"github.com/fixed-labs/oss/agent/internal/supervisor"
@@ -176,9 +177,34 @@ func main() {
 		os.Exit(1)
 	}
 
+	// ns is the bootstrap-mode router/monitor (rift-image-model §3.6/§3.7).
+	// With RIFT_BOOTSTRAP unset (legacy in-system mode) every one of its hooks
+	// is a strict no-op and behavior is byte-for-byte today's.
+	ns := nsexec.FromEnv(log)
+
 	client := api.New(cfg.APIBaseURL, cfg.WorkspaceID, cfg.Token)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
+
+	if ns.Bootstrap {
+		// The client_system heartbeat field (the promote gate's input) is
+		// emitted iff bootstrap mode; legacy agents leave the key entirely
+		// absent (the server's compat arm).
+		client.ClientSystem = ns.Status
+		// The recovery driver waits for the client system's health and, on
+		// timeout, signals the supervisor (SIGUSR1 → the agent's parent — Fly's
+		// init is VM PID 1, never the target) for a recovery boot.
+		go ns.RunRecoveryDriver(ctx)
+		// Self-copy the agent binary to /persist/rift/agent so the sftp re-exec
+		// resolves inside the client system (rung 1's volume-store bind hides
+		// the image store). Non-fatal: sessions and exec still work without it.
+		if perr := ns.EnsurePersistAgent(); perr != nil {
+			log.Warn("bootstrap: agent self-copy for in-target sftp failed; sftp into the client system will not work",
+				"path", ns.PersistAgentPath, "err", perr)
+		}
+		log.Info("bootstrap mode: client-system monitor active",
+			"health_timeout", ns.HealthTimeout)
+	}
 
 	id, err := identity.Ensure(cfg.StateDir, identity.ExecWgKeygen{})
 	if err != nil {
@@ -231,6 +257,7 @@ func main() {
 		Home:     home,
 		Login:    login,
 		Cred:     cred,
+		NS:       ns,
 		API:      client,
 		GenEpoch: genEpoch,
 		Log:      log,
@@ -267,6 +294,7 @@ func main() {
 			Table:      table,
 			SFTPExec:   self,
 			Sessions:   mgr,
+			NS:         ns,
 			Log:        log,
 		}
 		if serr := sshSrv.Start(); serr != nil {

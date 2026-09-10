@@ -38,6 +38,7 @@ import (
 	"time"
 
 	"github.com/creack/pty"
+	"github.com/fixed-labs/oss/agent/internal/nsexec"
 	"github.com/fixed-labs/oss/agent/internal/sessions"
 	"github.com/gliderlabs/ssh"
 	"github.com/pkg/sftp"
@@ -131,7 +132,10 @@ type Server struct {
 	// so shells outlive the connection. When nil the server falls back to the
 	// legacy per-connection pty.Start shell (tests that don't exercise sessions).
 	Sessions *sessions.Manager
-	Log      *slog.Logger
+	// NS routes exec/shell/sftp spawns into the client system in bootstrap mode
+	// (nsenter + runuser, see nsexec). nil ⇒ legacy in-system spawn, untouched.
+	NS  *nsexec.NS
+	Log *slog.Logger
 
 	// activeConns gauges authorized SSH connections currently open — the box's
 	// interactive-liveness signal in the heartbeat. Interactive liveness is now
@@ -346,12 +350,34 @@ func (s *Server) handleSession(sess ssh.Session) {
 	// human or older client still gets a shell that
 	// outlives the connection (regression-tested). A pty'd EXEC
 	// (`ssh box -t cmd`) keeps the legacy one-shot path below.
+	// (The Manager routes its own shell spawn through nsexec, so that path is
+	// covered without touching it here.)
 	if isPty && len(sess.Command()) == 0 && s.Sessions != nil {
 		s.attachDefault(sess, ptyReq, winCh)
 		return
 	}
+	// Route the spawn through nsexec (§3.6): legacy mode returns `cmd` (the
+	// exactly-today spawn) untouched; bootstrap mode enters the client system
+	// via nsenter + runuser, or falls back to `cmd` with a banner when the
+	// client system is not running (on a recovery boot the banner rides the
+	// nsenter path too). TERM is appended before routing so the
+	// legacy env is byte-for-byte today's (same position, isPty only) and the
+	// nsenter path carries it too (runuser -l keeps only TERM).
+	var nsEnv []string
 	if isPty {
 		cmd.Env = append(cmd.Env, "TERM="+ptyReq.Term)
+		nsEnv = []string{"TERM=" + ptyReq.Term}
+	}
+	command := ""
+	if len(sess.Command()) > 0 {
+		command = sess.RawCommand()
+	}
+	sp := s.NS.Route(nsexec.Spec{Login: login, Command: command, Env: nsEnv, Legacy: cmd})
+	cmd = sp.Cmd
+	if isPty {
+		if sp.Banner != "" {
+			_, _ = io.WriteString(sess, sp.Banner)
+		}
 		f, perr := pty.Start(cmd)
 		if perr != nil {
 			fmt.Fprintf(sess.Stderr(), "rift: pty: %v\n", perr)
@@ -382,6 +408,11 @@ func (s *Server) handleSession(sess ssh.Session) {
 		return
 	}
 
+	if sp.Banner != "" {
+		// Non-PTY exec: the banner goes to stderr so stdout stays clean for the
+		// command's own output.
+		_, _ = io.WriteString(sess.Stderr(), sp.Banner)
+	}
 	cmd.Stdout = sess
 	cmd.Stderr = sess.Stderr()
 	stdin, serr := cmd.StdinPipe()
@@ -400,6 +431,12 @@ func (s *Server) handleSession(sess ssh.Session) {
 	_ = sess.Exit(waitExitCode(cmd))
 }
 
+// forwardSignals relays the SSH client's signal requests to the spawned
+// process. Under bootstrap nsenter routing the target is the nsenter parent
+// in the agent's namespace — nsenter does not proxy signals to the in-target
+// child, so a non-PTY exec's INT/TERM may never reach the command inside the
+// client system (PTY sessions still get ^C etc. through the line discipline).
+// Accepted edge-case weakening.
 func forwardSignals(sess ssh.Session, cmd *exec.Cmd) {
 	sigs := make(chan ssh.Signal, 1)
 	sess.Signals(sigs)
@@ -638,6 +675,23 @@ func (s *Server) handleSFTP(sess ssh.Session) {
 	cmd.Env = append(os.Environ(), "HOME="+home, "USER="+peer.LoginUser)
 	if cred != nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: cred}
+	}
+	// Route the re-exec through nsexec (§3.6): in bootstrap mode sftp must
+	// enter the client system too, so file paths and ownership match the user's
+	// environment. The in-target command is the SELF-COPIED /persist/rift/agent
+	// (nsexec.EnsurePersistAgent), NOT s.SFTPExec: rung 1 binds the volume store
+	// over the image store, so the agent's own image-store path is invisible
+	// after nsenter -m, while the /persist bind is visible in both namespaces
+	// (PR 7 revisits in-box store composition).
+	sp := s.NS.Route(nsexec.Spec{
+		Login:   peer.LoginUser,
+		Command: s.NS.InTargetSFTPCommand(),
+		Legacy:  cmd,
+	})
+	cmd = sp.Cmd
+	if sp.Banner != "" {
+		// stderr only — stdout carries the sftp protocol and must stay clean.
+		_, _ = io.WriteString(sess.Stderr(), sp.Banner)
 	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

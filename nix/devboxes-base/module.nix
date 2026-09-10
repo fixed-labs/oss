@@ -75,6 +75,26 @@ in
     };
   };
 
+  options.rift.internal = {
+    agentInSystem = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      internal = true;
+      description = ''
+        INTERNAL platform knob — not part of the client contract. Whether
+        this system ships the devboxes-agent systemd unit. Default true so
+        every existing client system keeps today's in-system agent
+        byte-compatibly — a client who runs `nix flake update` before
+        migrating must not break (rift image-model design, §5 step 5).
+        The BOOTSTRAP image builds its baked system with this false: there
+        the agent runs OUTSIDE the client system, started directly by the
+        image init as a sibling of the pidns handoff (INV-5), and a
+        recovery boot must not run two agents for one workspace. Removed —
+        together with the unit itself — in the design's cleanup PR.
+      '';
+    };
+  };
+
   config = {
     # OCI/Fly boot: no kernel/initrd/bootloader of our own (Fly's microVM
     # kernel + our pidns systemd). isContainer trims NixOS to exactly that
@@ -351,7 +371,15 @@ in
       '';
     };
 
-    systemd.services.devboxes-agent = {
+    # Absent entirely when rift.internal.agentInSystem = false (the bootstrap
+    # image's baked system): the agent then runs OUTSIDE this system, started
+    # by the image init (INV-5). Same attrsOf-mkIf pattern as devboxes-resolv
+    # above — a false condition removes the attr, it does not leave an empty
+    # unit. devboxes-resolv's `before = devboxes-agent.service` edge dangles
+    # harmlessly then (systemd ignores ordering against non-existent units),
+    # and with the agent's `wants` gone nothing pulls devboxes-resolv in at
+    # all — which is right: that unit exists for the in-system agent.
+    systemd.services.devboxes-agent = lib.mkIf config.rift.internal.agentInSystem {
       description = "devboxes-agent — control-plane liaison (wg0, WG-identity SSH, heartbeat, config pull)";
       wantedBy = [ "multi-user.target" ];
       after = [ "network.target" ];

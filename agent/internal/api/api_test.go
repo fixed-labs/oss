@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 )
@@ -171,6 +173,139 @@ func TestErrorStatusSurfaces(t *testing.T) {
 	})
 	if err := c.Heartbeat(context.Background(), false, 0, Identity{}); err == nil {
 		t.Fatal("expected error on 401")
+	}
+}
+
+// --- client_system heartbeat key (rift-image-model §3.7) ----------------------
+//
+// The promote gate reads this key at the WIRE, so the assertions parse the raw
+// serialized JSON body captured server-side — never the in-memory map the
+// client built. Absent (not empty, not null) is the legacy-compat contract:
+// pre-bootstrap agents must never send the field.
+
+// rawBodyClient returns a client whose server records every POST's raw body
+// bytes; decoded() parses each captured body fresh.
+func rawBodyClient(t *testing.T) (*Client, func() []map[string]any) {
+	t.Helper()
+	var mu sync.Mutex
+	var raws [][]byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		raws = append(raws, b)
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	}))
+	t.Cleanup(srv.Close)
+	c := New(srv.URL, "ws-1", "tok")
+	decoded := func() []map[string]any {
+		mu.Lock()
+		defer mu.Unlock()
+		out := make([]map[string]any, len(raws))
+		for i, rb := range raws {
+			var m map[string]any
+			if err := json.Unmarshal(rb, &m); err != nil {
+				t.Fatalf("body %d not JSON: %v (%q)", i, err, rb)
+			}
+			out[i] = m
+		}
+		return out
+	}
+	return c, decoded
+}
+
+// heartbeatIdentity is the shared identity fixture; the resulting six core
+// fields are asserted identically in every case (positive anchor for the
+// key-absence negatives, and "the other six fields unchanged").
+func heartbeatIdentity() Identity {
+	return Identity{SSHHost: "1.2.3.4", ResolvedCommit: "abc123",
+		WgPubkey: "WGPUB", SSHHostPubkey: "ssh-ed25519 HOST"}
+}
+
+func assertHeartbeatCoreFields(t *testing.T, m map[string]any) {
+	t.Helper()
+	want := map[string]any{
+		"interactive_live": true,
+		"ssh_sessions":     float64(3),
+		"ssh_host":         "1.2.3.4",
+		"resolved_commit":  "abc123",
+		"wg_pubkey":        "WGPUB",
+		"ssh_host_pubkey":  "ssh-ed25519 HOST",
+	}
+	for k, v := range want {
+		if m[k] != v {
+			t.Fatalf("body[%q] = %v, want %v", k, m[k], v)
+		}
+	}
+}
+
+// Hook unset, and hook returning "": the serialized object LACKS the key
+// entirely. Armed by TestHeartbeatClientSystemKeyPresent, which shares this
+// exact call shape with only the hook return varied.
+func TestHeartbeatClientSystemKeyAbsentForLegacy(t *testing.T) {
+	c, decoded := rawBodyClient(t)
+	if err := c.Heartbeat(context.Background(), true, 3, heartbeatIdentity()); err != nil {
+		t.Fatal(err)
+	}
+	c.ClientSystem = func() string { return "" }
+	if err := c.Heartbeat(context.Background(), true, 3, heartbeatIdentity()); err != nil {
+		t.Fatal(err)
+	}
+	bodies := decoded()
+	if len(bodies) != 2 {
+		t.Fatalf("captured %d bodies, want 2", len(bodies))
+	}
+	for i, m := range bodies {
+		assertHeartbeatCoreFields(t, m) // the beat really carried its payload
+		if v, ok := m["client_system"]; ok {
+			t.Fatalf("body %d carries client_system (%v) — legacy compat is ABSENT, not empty/null", i, v)
+		}
+	}
+}
+
+func TestHeartbeatClientSystemKeyPresent(t *testing.T) {
+	c, decoded := rawBodyClient(t)
+	c.ClientSystem = func() string { return "healthy" }
+	if err := c.Heartbeat(context.Background(), true, 3, heartbeatIdentity()); err != nil {
+		t.Fatal(err)
+	}
+	bodies := decoded()
+	if len(bodies) != 1 {
+		t.Fatalf("captured %d bodies, want 1", len(bodies))
+	}
+	if bodies[0]["client_system"] != "healthy" {
+		t.Fatalf("client_system = %v, want healthy", bodies[0]["client_system"])
+	}
+	assertHeartbeatCoreFields(t, bodies[0]) // the other six fields unchanged
+}
+
+// Freshness: the hook is evaluated per POST — a cache-once implementation
+// would freeze a box at "realizing" and wedge the promote gate while both
+// static cases above stay green. Two beats, two different hook values, each
+// serialized body carries its own.
+func TestHeartbeatClientSystemFreshPerPOST(t *testing.T) {
+	c, decoded := rawBodyClient(t)
+	vals := []string{"realizing", "healthy"}
+	calls := 0
+	c.ClientSystem = func() string {
+		v := vals[calls]
+		if calls < len(vals)-1 {
+			calls++
+		}
+		return v
+	}
+	for range 2 {
+		if err := c.Heartbeat(context.Background(), true, 3, heartbeatIdentity()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bodies := decoded()
+	if len(bodies) != 2 {
+		t.Fatalf("captured %d bodies, want 2", len(bodies))
+	}
+	if bodies[0]["client_system"] != "realizing" || bodies[1]["client_system"] != "healthy" {
+		t.Fatalf("client_system per beat = %v / %v, want realizing then healthy",
+			bodies[0]["client_system"], bodies[1]["client_system"])
 	}
 }
 

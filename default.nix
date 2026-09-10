@@ -26,6 +26,17 @@ let
   # ns-systemd for a clean shutdown. TARGETS x86_64-linux (Fly's arch); on an
   # aarch64 host the system closure builds under binfmt emulation.
   #
+  # WHAT boots is resolved at RUNTIME via a two-rung ladder (rift image-model
+  # §3.5) — the volume profile /persist/nix/var/nix/profiles/system when its
+  # toplevel actually resolves under /persist, else the toplevel baked at
+  # image build — under a two-stage supervisor (§3.7) that starts the child
+  # ONCE, propagates its real exit status to Fly, and on the agent's SIGUSR1
+  # recovery request tears the client system down and boots the baked
+  # bootstrap in its place. With `bootstrap = true` the image additionally
+  # gains the realizer stage (substitute $SYSTEM_PATH onto the volume from
+  # the tenant cache and set the profile) and starts the agent OUTSIDE the
+  # client system as a sibling of the pidns handoff (INV-5).
+  #
   # Hoisted into this `let` (rather than defined inline as `lib.mkDevimage`) so
   # the sibling `lib.mkRift` below can call it by bare name — attrset values
   # don't see each other's keys without `rec`.
@@ -55,6 +66,22 @@ let
       # `extra-platforms = x86_64-linux` + binfmt in the daemon config to build
       # the x86 system closure).
       hostSystem ? "x86_64-linux",
+      # Build the BOOTSTRAP image variant (rift image-model §3.5/§3.7): adds
+      # the realizer init stage — substitute $SYSTEM_PATH onto the /persist
+      # volume from the tenant cache and set the volume profile — and starts
+      # the agent OUTSIDE the client system as a direct child of the image
+      # init (INV-5; the baked system also gets
+      # rift.internal.agentInSystem = mkDefault false, so the in-system unit
+      # and the outside agent can never both run). false (the default) is the
+      # classic client/base image: no nix in the closure, no realizer, the
+      # agent in-system.
+      bootstrap ? false,
+      # Extra Nix binary-cache public keys the realizer trusts beside
+      # cache.nixos.org's — the platform signing keys (rift image-model
+      # §3.12), baked into the init at image build so a pinned bootstrap can
+      # verify tenant-cache paths. require-sigs stays true on the box. Only
+      # consulted when bootstrap = true.
+      cacheTrustedPublicKeys ? [ ],
     }:
     let
       targetSystem = "x86_64-linux";
@@ -96,9 +123,31 @@ let
         ++ nixpkgs.lib.optional (imageCommit != null) {
           environment.etc."devboxes/image-commit".text = imageCommit;
         }
+        # A bootstrap image starts the agent OUTSIDE the client system from
+        # its init (INV-5); shipping the in-system unit too would run two
+        # agents for one workspace on a recovery boot. bootstrap = true is the
+        # sole writer of this today; mkDefault so an extraModules definition
+        # could still override cleanly if one ever needs to.
+        ++ nixpkgs.lib.optional bootstrap {
+          rift.internal.agentInSystem = nixpkgs.lib.mkDefault false;
+        }
         ++ extraModules;
       };
       toplevel = baseSystem.config.system.build.toplevel;
+
+      # Config facts of the BAKED system the bootstrap init needs at runtime,
+      # resolved from that system's own module eval so they cannot drift from
+      # what module.nix's in-system agent unit would have exported.
+      baseCfg = baseSystem.config.rift.devboxes-base;
+
+      # The realizer's signature trust set: a substituted path must carry a
+      # signature by one of these — require-sigs stays true on the box (rift
+      # image-model §3.12). cache.nixos.org's well-known key serves the
+      # public paths the builder deliberately does not copy into the tenant
+      # prefix; cacheTrustedPublicKeys carries the platform signing keys.
+      realizerTrustedKeys = nixpkgs.lib.concatStringsSep " " (
+        [ "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=" ] ++ cacheTrustedPublicKeys
+      );
 
       # Capture the DNS the platform seeded into the rootfs. Read pre-pivot so
       # the capture holds INDEPENDENTLY of the upper-cleanup rm in the
@@ -167,6 +216,22 @@ let
         # The volume must already be mounted by Fly's init.
         mountpoint -q /persist
 
+        # --- Recovery flag: unlink-on-read, at the very top of every boot ---
+        # /persist/rift/recovery-inflight is the ONE-SHOT flag the SIGUSR1
+        # trap below persists before killing a failed client system (rift
+        # image-model §3.7). Consuming it here — unlink immediately on read —
+        # scopes its effect to exactly one boot: it forces THIS boot onto
+        # ladder rung 2 (the baked bootstrap) and suppresses exit-status
+        # propagation for THIS boot only. Left unclearable, a machine that
+        # recovery-booted once would permanently lose exit-code propagation —
+        # the very mechanism the two-stage supervisor exists to restore.
+        mkdir -p /persist/rift
+        RECOVERY_BOOT=0
+        if [ -e /persist/rift/recovery-inflight ]; then
+          rm -f /persist/rift/recovery-inflight
+          RECOVERY_BOOT=1
+        fi
+
         mkdir -p /persist/upper /persist/work /lower /newroot
 
         # /etc/resolv.conf must never survive in the overlay upper. Fly's init
@@ -218,15 +283,35 @@ let
         chmod 1777 /newroot/tmp
         mount --bind /persist /newroot/persist
 
-        # Capture the machine's RIFT_* env for the agent unit — systemd
-        # in the child pidns does NOT inherit machine env. Root-only: the
-        # bearer token lives here.
+        # Capture the machine's RIFT_* env for the agent — systemd in the
+        # child pidns does NOT inherit machine env. Root-only: the bearer
+        # token (and the cache read credential) live here.
+        #
+        # The name list is the §3.5 boot-env allowlist (the design's boot-env
+        # contract table), stated as a hardcoded loop deliberately: every new
+        # value is an explicit edit here. The launch-event producers for the
+        # SYSTEM_PATH / RIFT_BK / RIFT_REVOKE_EPOCH / RIFT_CACHE_* /
+        # RIFT_REPO_* rows land in the design's PR 7 — until then those are
+        # absent from the machine env and written EMPTY, which every consumer
+        # treats as unset. Values must stay shell-assignment-safe (no spaces,
+        # quotes, or expansions): the file is parsed both by systemd
+        # EnvironmentFile= and by bash `.`-sourcing under `set -a` in the
+        # agent-start block below.
         umask 077
+        # `set +x` around the writer: xtrace would print each iteration's
+        # expanded printf — the bearer token and the cache read secret —
+        # into `fly logs` (same hazard and same bracketing as the agent-start
+        # block below).
+        set +x
         {
-          for v in RIFT_WORKSPACE_ID RIFT_API_URL RIFT_TOKEN RIFT_WG_IP RIFT_RELAY_ENDPOINT; do
+          for v in RIFT_WORKSPACE_ID RIFT_API_URL RIFT_TOKEN RIFT_WG_IP RIFT_RELAY_ENDPOINT \
+            SYSTEM_PATH RIFT_BK RIFT_REVOKE_EPOCH \
+            RIFT_CACHE_ENDPOINT RIFT_CACHE_PREFIX RIFT_CACHE_KEY_ID RIFT_CACHE_SECRET \
+            RIFT_REPO_URL RIFT_REPO_REF RIFT_REPO_COMMIT RIFT_REPO_DIR; do
             printf '%s=%s\n' "$v" "''${!v:-}"
           done
         } > /newroot/etc/devboxes/boot-env
+        set -x
 
         ${captureBootResolv}
 
@@ -274,29 +359,347 @@ let
         umount -R /sys/fs/cgroup 2>/dev/null || true
         mount -t cgroup2 cgroup2 /sys/fs/cgroup
 
+        # /run/rift — the supervisor's runtime handshake surface: the
+        # recovery-boot marker (this boot is a recovery boot), sd-pid (the
+        # client system's PID-1 host pid, what sessions nsenter through —
+        # rift image-model §3.6), boot-rung (which ladder rung the running
+        # child was started on), and the realizer's failure status. Created
+        # post-pivot so it lands in the final root's /run regardless of
+        # whether Fly gave us a /run tmpfs to rbind above.
+        mkdir -p /run/rift
+        # Boot-scoped only if /run is a tmpfs: without one these land in the
+        # overlay upper and persist to /persist/upper/run/rift across machine
+        # boots (same overlay-upper persistence as the resolv.conf rm above),
+        # so clear last boot's markers before this boot writes its own.
+        rm -f /run/rift/recovery-boot /run/rift/sd-pid /run/rift/realization-status /run/rift/boot-rung
+        if [ "$RECOVERY_BOOT" = 1 ]; then
+          # Marker: THIS boot is a recovery boot. The agent reads it to
+          # report client_system="recovery" and to banner sessions that land
+          # in the bootstrap rather than a normal box.
+          touch /run/rift/recovery-boot
+        fi
+
+        # Rung 2 of the boot ladder: the toplevel baked at image-build time.
+        # This interpolation was the ONLY boot path before the ladder existed
+        # (which is exactly why a cold restart reverted to bare base — §3.5);
+        # it is now the explicit fallback.
+        BOOTSTRAP_SYSTEM=${toplevel}
+
+        ${nixpkgs.lib.optionalString bootstrap ''
+          # --- Realizer (§3.5): substitute the client system onto the volume.
+          # An init STAGE — after pivot_root (so /persist is the volume and
+          # the final root is assembled) and BEFORE the boot ladder — not a
+          # systemd unit and not an agent subcommand: it must complete before
+          # the ladder resolves, and both alternatives run after something
+          # already booted. Two no-ops, by design:
+          #   (a) $SYSTEM_PATH empty — no system was requested (no launch
+          #       producer yet, or a legacy launch);
+          #   (b) the profile already resolves to $SYSTEM_PATH — the
+          #       cold-restart case: a restart re-runs this init, finds the
+          #       profile correct, and boots it needing no network and no
+          #       still-valid cache credential (R5's credential-free
+          #       survival).
+          # On failure or the 10-minute realization budget: the profile stays
+          # UNSET — rung 1 then fails its existence check and the box boots
+          # the bare bootstrap — and the reason lands in
+          # /run/rift/realization-status for the agent to report. It must
+          # NEVER silently boot bare base *pretending* to be the client
+          # system; the unset profile plus the agent's report ARE that
+          # guarantee (§3.5 "Interrupted realization").
+          if [ -n "''${SYSTEM_PATH:-}" ]; then
+            profile_now=$(readlink -f /persist/nix/var/nix/profiles/system 2>/dev/null || true)
+            if [ "$profile_now" = "$SYSTEM_PATH" ] && [ -d "/persist$SYSTEM_PATH" ]; then
+              echo "realizer: profile already at $SYSTEM_PATH (cold restart); nothing to do"
+            else
+              # Substituters: the tenant cache (when the launch env supplied
+              # one) ahead of cache.nixos.org, which still serves the public
+              # paths the builder deliberately does not copy into the tenant
+              # prefix (§3.12). Producer contract (design PR 7):
+              # RIFT_CACHE_ENDPOINT is the substituter base URL — an
+              # s3://bucket?endpoint=… form keeps its query string — and
+              # RIFT_CACHE_PREFIX is the (Context, RepoId) path spliced into
+              # its path part.
+              subs="https://cache.nixos.org"
+              if [ -n "''${RIFT_CACHE_ENDPOINT:-}" ]; then
+                tenant="$RIFT_CACHE_ENDPOINT"
+                if [ -n "''${RIFT_CACHE_PREFIX:-}" ]; then
+                  case $tenant in
+                    *\?*) tenant="''${tenant%%\?*}/$RIFT_CACHE_PREFIX?''${tenant#*\?}" ;;
+                    *) tenant="$tenant/$RIFT_CACHE_PREFIX" ;;
+                  esac
+                fi
+                subs="$tenant $subs"
+              fi
+
+              # Ensure the volume store exists. It is a CHROOT store —
+              # local?root=/persist: physical /persist/nix/store, logical
+              # /nix/store — which is exactly what lets rung 1 bind it over
+              # /nix/store and exec logical store paths unchanged.
+              mkdir -p /persist/nix/store /persist/nix/var/nix/profiles /root
+
+              # NIX_REMOTE= is LOAD-BEARING (§3.5 amendment 2026-08-05):
+              # boot.isContainer sets NIX_REMOTE=daemon in the system env and
+              # there is no nix-daemon here — this runs before any systemd
+              # exists — so it is cleared explicitly rather than inherited
+              # from whatever the image env carries; every substitution would
+              # otherwise hang against a socket that never appears. The cache
+              # credential rides the default AWS env-provider chain. The CA
+              # bundle points at the store copy because the FHS
+              # /etc/ssl/certs materializes only at stage-2 activation, which
+              # has not run yet. HOME=/root keeps nix's own state somewhere
+              # real. `timeout 600` is the realization budget: a substitution
+              # that cannot finish must not hold boot hostage.
+              realize_rc=0
+              # `set +x` around the invocation: xtrace would print the
+              # expanded AWS_SECRET_ACCESS_KEY=… prefix — the cache read
+              # credential — into `fly logs` (same hazard and same bracketing
+              # as the boot-env writer and the agent-start block).
+              set +x
+              NIX_REMOTE= HOME=/root \
+                NIX_SSL_CERT_FILE=${targetPkgs.cacert}/etc/ssl/certs/ca-bundle.crt \
+                AWS_ACCESS_KEY_ID="''${RIFT_CACHE_KEY_ID:-}" \
+                AWS_SECRET_ACCESS_KEY="''${RIFT_CACHE_SECRET:-}" \
+                timeout 600 ${targetPkgs.nix}/bin/nix-store \
+                --store 'local?root=/persist' \
+                --option require-sigs true \
+                --option substituters "$subs" \
+                --option trusted-public-keys '${realizerTrustedKeys}' \
+                --realise "$SYSTEM_PATH" || realize_rc=$?
+              set -x
+
+              if [ "$realize_rc" -eq 0 ]; then
+                # Success ⇒ set the profile — the single fact the ladder
+                # trusts: "profile set" ≡ "realization completed".
+                if NIX_REMOTE= HOME=/root ${targetPkgs.nix}/bin/nix-env \
+                  --store 'local?root=/persist' \
+                  --profile /persist/nix/var/nix/profiles/system \
+                  --set "$SYSTEM_PATH"; then
+                  echo "realizer: profile set to $SYSTEM_PATH"
+                else
+                  echo "reason=profile-set-failed" > /run/rift/realization-status
+                fi
+              elif [ "$realize_rc" -eq 124 ]; then
+                echo "reason=realization-budget-exceeded" > /run/rift/realization-status
+              else
+                echo "reason=substitution-failed" > /run/rift/realization-status
+              fi
+            fi
+          fi
+
+          # --- The agent, OUTSIDE the client system (INV-5) ---
+          # A direct background child of this supervisor and a SIBLING of the
+          # client-system unshare below — NOT inside it — so it survives
+          # exactly the failure that used to be invisible (a broken client
+          # system, §3.7) and can drive the SIGUSR1 recovery request. The
+          # baked system carries rift.internal.agentInSystem = false, so this
+          # is the only agent on the box. Environment mirrors module.nix's
+          # in-system unit — the boot-env capture (sourced), the state dir,
+          # and the login user/shell, resolved from the BAKED system's own
+          # config at image build so they cannot drift — plus RIFT_BOOTSTRAP=1
+          # (the agent's "I am outside" flag) and a PATH carrying util-linux
+          # for the nsenter every session/exec now performs (§3.6) beside the
+          # wg/ip/proc tools the in-system unit's path= supplied. `set +x`
+          # first: -x would trace the sourced boot-env line by line, printing
+          # the bearer token into `fly logs`.
+          (
+            set +x
+            set -a
+            . /etc/devboxes/boot-env
+            set +a
+            export RIFT_BOOTSTRAP=1
+            export RIFT_STATE_DIR=/var/lib/devboxes
+            export RIFT_LOGIN_USER=${nixpkgs.lib.escapeShellArg baseCfg.loginUser}
+            export RIFT_LOGIN_SHELL=${baseCfg.loginShell}/bin/${baseCfg.loginShell.meta.mainProgram or "bash"}
+            export PATH=${
+              nixpkgs.lib.makeBinPath (
+                with targetPkgs;
+                [
+                  coreutils
+                  util-linux
+                  procps
+                  wireguard-tools
+                  iproute2
+                ]
+              )
+            }
+            exec ${agentBin}/bin/devboxes-agent
+          ) &
+          echo "started devboxes-agent outside the client system (pid $!)"
+        ''}
+
+        # --- The boot ladder (§3.5): two rungs, each existence-checked ---
+        # Rung 1 — the volume profile, iff its toplevel actually resolves in
+        # /persist/nix. Rung 2 — $BOOTSTRAP_SYSTEM, baked above. There is
+        # deliberately NO $SYSTEM_PATH rung: "the env var is set at launch
+        # whether or not realization succeeded, so checking it first would
+        # boot a half-realized closure" (§3.5). The profile is the sole
+        # source of truth — "profile set" ≡ "realization completed" — and the
+        # operator escape hatch is the realizer honoring SYSTEM_PATH (which
+        # sets the profile), not a direct boot of it. A recovery boot (flag
+        # consumed at the top) forces rung 2: after a teardown the ladder
+        # would just re-resolve the same broken system (§3.7).
+        BOOT_RUNG=bootstrap
+        BOOT_TARGET="$BOOTSTRAP_SYSTEM"
+        if [ "$RECOVERY_BOOT" != 1 ] && [ -L /persist/nix/var/nix/profiles/system ]; then
+          # readlink -f walks the generation links to the profile's target.
+          # A chroot store records the LOGICAL /nix/store/… path (which -f
+          # returns unchanged: the image's /nix/store exists, and -f needs
+          # only the dirname to resolve); a physical /persist/nix/store/…
+          # form is normalized to logical too, in case a nix version records
+          # real paths. The existence check is always the PHYSICAL path.
+          profile_target=$(readlink -f /persist/nix/var/nix/profiles/system 2>/dev/null || true)
+          case $profile_target in
+            /persist/nix/store/*) profile_target="/nix/store/''${profile_target#/persist/nix/store/}" ;;
+          esac
+          case $profile_target in
+            /nix/store/*)
+              if [ -d "/persist$profile_target" ]; then
+                BOOT_RUNG=profile
+                BOOT_TARGET="$profile_target"
+              fi
+              ;;
+          esac
+        fi
+
+        # --- Two-stage supervisor (§3.7) ---
         # Handoff: systemd as PID 1 of a child pid namespace — a directly-
         # exec'd systemd sees getpid()!=1 under Fly's init and bails, so run
         # it under a fresh pidns. --kill-child ties systemd's life to this
-        # supervisor; the trap forwards Fly's stop signal as SIGRTMIN+3
-        # (halt.target) for a clean unit shutdown.
-        chroot . ${targetPkgs.util-linux}/bin/unshare \
-          --pid --fork --mount-proc --kill-child ${toplevel}/init &
-        UNSHARE_PID=$!
-
-        forward_shutdown() {
+        # supervisor; the TERM/INT trap forwards Fly's stop signal as
+        # SIGRTMIN+3 (halt.target) for a clean unit shutdown.
+        #
+        # Rung 1 boots the volume-resident toplevel by binding the volume
+        # store over /nix/store INSIDE the child's own mount namespace
+        # (--mount-proc implies --mount, and the early --make-rprivate keeps
+        # the bind child-only) before exec'ing its init. The bash doing the
+        # bind is a store-path binary already mapped into memory, so it
+        # survives the image store vanishing under it; this supervisor and
+        # the agent keep the image-store view. Rung 2 execs the baked
+        # bootstrap directly — exactly the pre-ladder handoff.
+        UNSHARE_PID=""
+        start_system() {
+          if [ "$1" = profile ]; then
+            chroot . ${targetPkgs.util-linux}/bin/unshare \
+              --pid --fork --mount-proc --kill-child \
+              ${targetPkgs.bash}/bin/bash -c \
+              "${targetPkgs.util-linux}/bin/mount --bind /persist/nix/store /nix/store && exec $2/init" &
+          else
+            chroot . ${targetPkgs.util-linux}/bin/unshare \
+              --pid --fork --mount-proc --kill-child "$2"/init &
+          fi
+          UNSHARE_PID=$!
+          # Publish the rung this child was started on — the literal rung
+          # name, `profile` or `bootstrap`. $1, NOT $BOOT_RUNG: the recovery
+          # second stage starts `bootstrap` while BOOT_RUNG still holds what
+          # the ladder first chose. The agent reads it to arm its
+          # health-deadline timeoutAction only when the boot took rung
+          # `profile` — a bare-bootstrap boot has no client system to recover.
+          printf '%s\n' "$1" > /run/rift/boot-rung
+          # Publish the client system's PID-1 host pid (§3.6): the handoff
+          # file the agent's sessions nsenter through, replacing per-session
+          # pgrep re-derivation. Same retry the shutdown forwarder always
+          # used — the fork inside unshare is not instantaneous.
           local sd=""
           for _ in 1 2 3 4 5; do
             sd=$(pgrep -P "$UNSHARE_PID" | head -n1 || true)
             [ -n "$sd" ] && break
             sleep 0.2
           done
+          if [ -n "$sd" ]; then
+            printf '%s\n' "$sd" > /run/rift/sd-pid
+          else
+            : > /run/rift/sd-pid
+          fi
+        }
+
+        forward_shutdown() {
+          local sd=""
+          if [ -s /run/rift/sd-pid ]; then
+            sd=$(cat /run/rift/sd-pid)
+          fi
+          if [ -z "$sd" ]; then
+            sd=$(pgrep -P "$UNSHARE_PID" | head -n1 || true)
+          fi
           [ -n "$sd" ] && kill -RTMIN+3 "$sd" || true
         }
-        trap forward_shutdown TERM INT
 
-        while kill -0 "$UNSHARE_PID" 2>/dev/null; do
-          wait "$UNSHARE_PID" || true
-        done
+        request_recovery() {
+          # SIGUSR1 = the agent's recovery request (§3.7): the client system
+          # failed its health deadline. Persist the one-shot flag FIRST —
+          # crash-safe ordering: if this supervisor dies before the in-place
+          # recovery below runs, the next machine boot consumes the flag and
+          # recovery-boots anyway. Then take the client system down: a clean
+          # halt via the forwarded SIGRTMIN+3, a FIXED 10 s grace, then TERM
+          # to the unshare (--kill-child SIGKILLs the pidns on its way out).
+          # The grace is fixed, not early-exiting: this handler runs inside
+          # wait_child's interrupted `wait`, so an exited child stays a
+          # zombie of this shell until that wait resumes and reaps it —
+          # kill -0 keeps succeeding on the zombie, the early return below
+          # never fires, and the loop always runs its full 10 s. That is
+          # acceptable (recovery is already a slow path); the trailing TERM
+          # is then a harmless no-op on an already-dead child.
+          touch /persist/rift/recovery-inflight
+          forward_shutdown
+          for _ in $(seq 1 20); do
+            kill -0 "$UNSHARE_PID" 2>/dev/null || return 0
+            sleep 0.5
+          done
+          kill -TERM "$UNSHARE_PID" 2>/dev/null || true
+        }
+
+        # Single-attempt supervision (§3.7): the child is started ONCE per
+        # stage and its REAL exit status captured — the old
+        # `while kill -0 …; wait || true` swallowed it, so a failed client
+        # system exited 0 and Fly's on-failure policy never fired. The loop
+        # is NOT a restart loop: it re-waits only when a trap interrupted the
+        # wait (bash returns >128 from `wait` on a caught signal) while the
+        # child is still alive; the final re-wait covers the trap firing in
+        # the same instant the child died — bash then still remembers the
+        # real status, and a wait on an already-reaped child is idempotent.
+        wait_child() {
+          status=0
+          while :; do
+            if wait "$UNSHARE_PID"; then status=0; else status=$?; fi
+            kill -0 "$UNSHARE_PID" 2>/dev/null || break
+          done
+          if [ "$status" -gt 128 ]; then
+            if wait "$UNSHARE_PID"; then status=0; else status=$?; fi
+          fi
+          # The published PID-1 went down with its system.
+          : > /run/rift/sd-pid
+        }
+
+        trap forward_shutdown TERM INT
+        trap request_recovery USR1
+
+        start_system "$BOOT_RUNG" "$BOOT_TARGET"
+        wait_child
+
+        if [ "$RECOVERY_BOOT" = 1 ]; then
+          # This whole boot was a recovery boot (flag consumed at the top):
+          # exit-status propagation is suppressed for exactly this boot, so
+          # the machine parks cleanly instead of handing Fly's restart policy
+          # a recovery loop.
+          exit 0
+        fi
+
+        if [ -e /persist/rift/recovery-inflight ]; then
+          # The agent requested recovery THIS boot (SIGUSR1 above): in-place
+          # recovery — boot the baked bootstrap as a second, FINAL child so
+          # the box stays reachable for diagnosis. The flag stays on the
+          # volume: it suppresses exit propagation now, and the NEXT machine
+          # boot's unlink-on-read both restores propagation and forces that
+          # boot onto rung 2.
+          touch /run/rift/recovery-boot
+          start_system bootstrap "$BOOTSTRAP_SYSTEM"
+          wait_child
+          exit 0
+        fi
+
+        # §3.7's fix for the swallowed exit status: a failed client system
+        # now exits non-zero, so Fly's on-failure restart policy fires and
+        # `fly machine exec` has something to report.
+        exit "$status"
       '';
       hostPkgs = import nixpkgs { system = hostSystem; };
       # The registration dump loaded into the image's Nix database (see
@@ -379,8 +782,17 @@ let
       # is an ordinary attribute, no build and no import-from-derivation — and
       # the capture is the load-bearing half of FIX-321, whose loss makes
       # devboxes-resolv a silent skip rather than a visible failure.
+      #
+      # baseSystem is a TEST SEAM (eval-only, like the other two): the
+      # bootstrap structure test (oss/cli/cmd/rift/bootstrap_eval_test.go,
+      # FIX-324 T17c) reads `.baseSystem.config.systemd.units` to prove the
+      # real `bootstrap = true ⇒ rift.internal.agentInSystem = false` wiring
+      # removes the in-system devboxes-agent unit from the BAKED system (and
+      # that the default keeps it) — a second agent inside the client system
+      # would race the outside one on every recovery boot (INV-5). Nothing at
+      # runtime reads it.
       passthru = {
-        inherit initScript captureBootResolv;
+        inherit initScript captureBootResolv baseSystem;
       };
       config = {
         Entrypoint = [ "${initScript}" ];

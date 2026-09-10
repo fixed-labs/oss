@@ -34,6 +34,7 @@ import (
 
 	"github.com/creack/pty"
 	"github.com/fixed-labs/oss/agent/internal/api"
+	"github.com/fixed-labs/oss/agent/internal/nsexec"
 	"golang.org/x/sys/unix"
 )
 
@@ -72,6 +73,7 @@ type Manager struct {
 	home  string              // login home dir
 	login string              // login name for the shell's USER= env ("" → derive from home)
 	cred  *syscall.Credential // setuid credential for the shell (nil = no setuid)
+	ns    *nsexec.NS          // bootstrap-mode spawn router (nil ⇒ legacy in-system spawn)
 
 	api      SessionAPI
 	genEpoch int64
@@ -88,8 +90,11 @@ type Config struct {
 	Home  string
 	// Login is the authoritative login name (main.go's resolved login user) used
 	// for the shell's USER= env. Empty falls back to deriving the name from Home.
-	Login    string
-	Cred     *syscall.Credential
+	Login string
+	Cred  *syscall.Credential
+	// NS routes shell spawns into the client system in bootstrap mode
+	// (nsenter + runuser, see nsexec). nil ⇒ legacy in-system spawn, untouched.
+	NS       *nsexec.NS
 	API      SessionAPI
 	GenEpoch int64
 	Log      *slog.Logger
@@ -109,6 +114,7 @@ func NewManager(c Config) *Manager {
 		home:     c.Home,
 		login:    c.Login,
 		cred:     c.Cred,
+		ns:       c.NS,
 		api:      c.API,
 		genEpoch: c.GenEpoch,
 		log:      log,
@@ -160,10 +166,17 @@ func (m *Manager) List() (genEpoch int64, entries []ListEntry) {
 // startShell spawns a login shell on a fresh PTY. PTY mechanics by design:
 // set ONLY SysProcAttr.Credential and let pty.Start own Setsid/Setctty; read
 // the pgid AFTER start for kill(-pgid).
-func (m *Manager) startShell() (master *os.File, cmd *exec.Cmd, pgid int, err error) {
-	cmd = exec.Command(m.shell, "-l")
-	cmd.Dir = m.home
-	cmd.Env = append(os.Environ(),
+//
+// The spawn routes through nsexec: legacy mode gets exactly the historical
+// in-namespace shell; bootstrap mode nsenter+runusers into the client system,
+// or falls back to the in-namespace shell with a banner (returned for the
+// caller to seed into the session's scrollback) when the client system is not
+// running. On a recovery boot even the nsenter path carries the banner — the
+// target is the second-stage bootstrap system, not the user's environment.
+func (m *Manager) startShell() (master *os.File, cmd *exec.Cmd, pgid int, banner string, err error) {
+	legacy := exec.Command(m.shell, "-l")
+	legacy.Dir = m.home
+	legacy.Env = append(os.Environ(),
 		"HOME="+m.home,
 		"USER="+m.userEnv(),
 		"TERM=xterm-256color",
@@ -171,11 +184,17 @@ func (m *Manager) startShell() (master *os.File, cmd *exec.Cmd, pgid int, err er
 	if m.cred != nil {
 		// Only the Credential — pty.Start adds Setsid + Setctty itself; setting
 		// them here would conflict.
-		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: m.cred}
+		legacy.SysProcAttr = &syscall.SysProcAttr{Credential: m.cred}
 	}
+	sp := m.ns.Route(nsexec.Spec{
+		Login:  m.userEnv(),
+		Env:    []string{"TERM=xterm-256color"}, // runuser -l keeps only TERM
+		Legacy: legacy,
+	})
+	cmd = sp.Cmd
 	master, err = pty.Start(cmd)
 	if err != nil {
-		return nil, nil, 0, err
+		return nil, nil, 0, "", err
 	}
 	// The session leader's pgid == its pid (pty.Start did Setsid). Read it after
 	// start so kill(-pgid) reaps a setsid/nohup child holding the slave.
@@ -183,7 +202,7 @@ func (m *Manager) startShell() (master *os.File, cmd *exec.Cmd, pgid int, err er
 	if perr != nil {
 		pgid = cmd.Process.Pid
 	}
-	return master, cmd, pgid, nil
+	return master, cmd, pgid, sp.Banner, nil
 }
 
 // userEnv is the login name for the shell's USER env. main.go computes the
@@ -297,7 +316,7 @@ func (m *Manager) newSessionLocked(name string) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	master, cmd, pgid, err := m.startShell()
+	master, cmd, pgid, banner, err := m.startShell()
 	if err != nil {
 		return nil, err
 	}
@@ -314,6 +333,12 @@ func (m *Manager) newSessionLocked(name string) (*Session, error) {
 		ring:      newRing(ringSize),
 		mgr:       m,
 		log:       m.log,
+	}
+	if banner != "" {
+		// Client system absent (bootstrap fallback, §3.6): seed the scrollback
+		// with the banner BEFORE the readLoop starts, so every attach replays it
+		// ahead of any shell output.
+		s.ring.append([]byte(banner))
 	}
 	m.sessions[id] = s
 	m.byName[name] = id
